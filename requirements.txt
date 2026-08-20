@@ -5,3 +5,4 @@ pandas
 numpy
 google-genai
 requests
+yfinance
