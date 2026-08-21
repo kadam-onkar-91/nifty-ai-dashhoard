@@ -7,7 +7,7 @@ def get_upstox_access_token():
     API_SECRET = "t1k768tlei"
     
     # ✅ YAHAN TERA LIVE STREAMLIT APP KA LINK HAI
-    REDIRECT_URI = "https://kadam-onkar-91-nifty-ai-dashboard.streamlit.app" 
+    REDIRECT_URI = "https://nifty-ai-dashboard-lnqfy2ddk5gkxcoxcerklr.streamlit.app"
     
     st.sidebar.subheader("🔐 Upstox Live Authentication")
     
