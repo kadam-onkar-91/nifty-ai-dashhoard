@@ -14,6 +14,7 @@ import global_markets
 import smart_money
 import market_breadth
 from hybrid_ai_engine import HybridAIEngine
+from alert_manager import AlertManager  # 🔔 Added Telegram Alert Manager
 
 # Page Configuration
 st.set_page_config(page_title="Nifty 50 Real-Time AI Predictor", page_icon="⚡", layout="wide")
@@ -47,6 +48,14 @@ except Exception as e:
     st.stop()
 
 ai_engine = HybridAIEngine(api_key=GEMINI_API_KEY)
+
+# Initialize Telegram Alert System securely using Secrets
+try:
+    TELEGRAM_BOT_TOKEN = st.secrets["TELEGRAM_BOT_TOKEN"]
+    TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
+    alert_sys = AlertManager(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+except Exception as e:
+    alert_sys = None
 
 # Auto-refresh setup: 30 seconds (30000 ms)
 st_autorefresh(interval=30000, key="datarefresh")
@@ -222,6 +231,16 @@ if df is not None and not df.empty:
 
     # Save to Database
     database.log_prediction_to_db(live_price, signal_code, sl, t1, t2)
+
+    # 🔔 Send Telegram Alert on High Conviction Signals (Confidence >= 68)
+    if alert_sys and signal_code != 0 and confluence_score >= 68:
+        alert_sys.send_trade_alert(
+            signal_type=final_signal_text,
+            confidence=confluence_score,
+            price=live_price,
+            sentiment=f"Global Score: {global_sentiment_score}%",
+            logic="Institutional Confluence Score >= 68 + Volatility Filter Passed"
+        )
 
     # Step 4: Show Core Metrics with Confluence Accuracy Score
     col1, col2, col3 = st.columns(3)
