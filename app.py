@@ -18,6 +18,27 @@ from hybrid_ai_engine import HybridAIEngine
 # Page Configuration
 st.set_page_config(page_title="Nifty 50 Real-Time AI Predictor", page_icon="⚡", layout="wide")
 
+# -------------------------------------------------------------
+# 📱 MOBILE-RESPONSIVE CSS (Desktop untouched, Mobile optimized)
+# -------------------------------------------------------------
+st.markdown("""
+    <style>
+    @media (max-width: 768px) {
+        .main .block-container {
+            padding-left: 0.5rem !important;
+            padding-right: 0.5rem !important;
+            padding-top: 1rem !important;
+        }
+        h1 { font-size: 1.4rem !important; }
+        h2 { font-size: 1.1rem !important; }
+        div[data-testid="stDataFrame"], div[data-testid="stTable"] {
+            width: 100% !important;
+        }
+    }
+    </style>
+""", unsafe_allow_html=True)
+# -------------------------------------------------------------
+
 # Secure Gemini API Key Configuration using Streamlit Secrets
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
