@@ -5,7 +5,11 @@ import urllib.parse
 def get_upstox_access_token():
     API_KEY = "f3a1cf39-d058-44ed-893f-6cb875cd9d4b"
     API_SECRET = "t1k768tlei"
-    REDIRECT_URI = "http://localhost:8501"
+    
+    # ⚠️ YAHAN DHYAAN DE: 
+    # Niche wale link ki jagah apne Streamlit Cloud dashboard ka LIVE link daalna!
+    # Jaise: "https://teri-app-ka-naam.streamlit.app"
+    REDIRECT_URI = "http://localhost:8501" 
     
     st.sidebar.subheader("🔐 Upstox Live Authentication")
     
@@ -42,12 +46,7 @@ def get_upstox_access_token():
     encoded_redirect = urllib.parse.quote(REDIRECT_URI, safe='')
     login_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={API_KEY}&redirect_uri={encoded_redirect}"
     
-    st.sidebar.markdown(f"""
-        <a href="{login_url}" target="_self">
-            <button style="background-color:#7B2CBF; color:white; padding:10px 20px; border:none; border-radius:5px; cursor:pointer; font-weight:bold; width:100%;">
-                Login with Upstox 🚀
-            </button>
-        </a>
-    """, unsafe_allow_html=True)
+    # ✅ YAHAN MAINE HTML HATA KAR NAYA SECURE BUTTON LAGA DIYA HAI
+    st.sidebar.link_button("🚀 Login with Upstox", login_url)
     
     return None
