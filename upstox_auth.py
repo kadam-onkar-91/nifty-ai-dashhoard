@@ -6,10 +6,8 @@ def get_upstox_access_token():
     API_KEY = "f3a1cf39-d058-44ed-893f-6cb875cd9d4b"
     API_SECRET = "t1k768tlei"
     
-    # ⚠️ YAHAN DHYAAN DE: 
-    # Niche wale link ki jagah apne Streamlit Cloud dashboard ka LIVE link daalna!
-    # Jaise: "https://teri-app-ka-naam.streamlit.app"
-    REDIRECT_URI = "http://localhost:8501" 
+    # ✅ YAHAN TERA LIVE STREAMLIT APP KA LINK HAI
+    REDIRECT_URI = "https://kadam-onkar-91-nifty-ai-dashboard.streamlit.app" 
     
     st.sidebar.subheader("🔐 Upstox Live Authentication")
     
@@ -33,6 +31,8 @@ def get_upstox_access_token():
             if 'access_token' in res_json:
                 st.session_state.access_token = res_json['access_token']
                 st.sidebar.success("Connected to Live Upstox Feed!")
+            else:
+                st.sidebar.error("Login failed. Check Redirect URI in Upstox Portal.")
         except Exception:
             pass
 
@@ -46,7 +46,7 @@ def get_upstox_access_token():
     encoded_redirect = urllib.parse.quote(REDIRECT_URI, safe='')
     login_url = f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={API_KEY}&redirect_uri={encoded_redirect}"
     
-    # ✅ YAHAN MAINE HTML HATA KAR NAYA SECURE BUTTON LAGA DIYA HAI
+    # ✅ SECURE LOGIN BUTTON JISE CLICK KARNE PAR NAYA TAB KHULEGA
     st.sidebar.link_button("🚀 Login with Upstox", login_url)
     
     return None
