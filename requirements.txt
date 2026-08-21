@@ -7,3 +7,4 @@ google-genai
 requests
 yfinance
 xgboost
+feedparser
