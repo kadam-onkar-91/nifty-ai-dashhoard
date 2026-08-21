@@ -6,3 +6,4 @@ numpy
 google-genai
 requests
 yfinance
+xgboost
