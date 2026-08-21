@@ -9,3 +9,6 @@ yfinance
 xgboost
 feedparser
 scikit-learn
+matplotlib
+seaborn
+
