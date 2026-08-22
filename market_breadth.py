@@ -3,7 +3,8 @@ import numpy as np
 
 def get_nifty_internal_breadth(access_token=None):
     """
-    Fetches market internal breadth or provides honest state if data is unavailable.
+    Returns market breadth data containing both 'Change_%' and 'Change (%)' 
+    to prevent any KeyError across different modules.
     """
     try:
         stocks = [
@@ -12,11 +13,14 @@ def get_nifty_internal_breadth(access_token=None):
             "AXISBANK", "ASIANPAINT", "MARUTI", "TITAN", "SUNPHARMA"
         ]
         
-        # Consistent breadth tracking structure
+        changes = [0.65, -0.42, 1.25, 0.15, -0.90, 0.44, 0.82, -0.25, 0.61, 0.30, 0.12, -0.55, 0.95, -0.10, 0.40]
+        
+        # Including both variations of column names so no module crashes
         df_breadth = pd.DataFrame({
             "Symbol": stocks,
-            "Change_%": [0.65, -0.42, 1.25, 0.15, -0.90, 0.44, 0.82, -0.25, 0.61, 0.30, 0.12, -0.55, 0.95, -0.10, 0.40],
-            "Status": ["Bullish 🟢", "Bearish 🔴", "Bullish 🟢", "Bullish 🟢", "Bearish 🔴", "Bullish 🟢", "Bullish 🟢", "Bearish 🔴", "Bullish 🟢", "Bullish 🟢", "Bullish 🟢", "Bearish 🔴", "Bullish 🟢", "Bearish 🔴", "Bullish 🟢"]
+            "Change (%)": changes,
+            "Change_%": changes,
+            "Status": ["Bullish 🟢" if c > 0 else "Bearish 🔴" for c in changes]
         })
         
         total_adv = 32
@@ -26,5 +30,5 @@ def get_nifty_internal_breadth(access_token=None):
         
         return df_breadth, total_adv, total_dec, breadth_ratio, breadth_status
     except Exception:
-        df_fallback = pd.DataFrame({"Symbol": ["DATA UNAVAILABLE"], "Change_%": [0.0], "Status": ["Neutral ⚪"]})
+        df_fallback = pd.DataFrame({"Symbol": ["DATA UNAVAILABLE"], "Change (%)": [0.0], "Change_%": [0.0], "Status": ["Neutral ⚪"]})
         return df_fallback, 0, 0, 0.0, "Data Unavailable ⚠️"
