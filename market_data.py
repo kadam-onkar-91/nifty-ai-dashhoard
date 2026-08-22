@@ -127,3 +127,4 @@ def fetch_live_market_data(access_token):
     model.fit(X, y)
     
     return df, model, feature_cols, live_price
+        
