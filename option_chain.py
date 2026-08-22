@@ -3,8 +3,34 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 
+def get_nearest_expiry(access_token, instrument_key="NSE_INDEX|Nifty 50"):
+    """
+    Fetches the available expiry dates from Upstox and returns the nearest one.
+    """
+    url = "https://api.upstox.com/v2/option/chain/get-expiry-dates"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
+    params = {
+        "instrument_key": instrument_key
+    }
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            res = response.json()
+            expiry_dates = res.get('data', [])
+            if expiry_dates:
+                # Pehli (sabse kareeb wali) expiry date return kar do
+                return expiry_dates[0].get('expiry_date')
+    except Exception as e:
+        print(f"Error fetching expiry dates: {e}")
+    return None
+
 def generate_option_chain_data(current_price=None):
-    # Session state se token dhoondhna
+    """
+    Fetches real-time Option Chain data directly from Upstox API v2 using dynamic expiry date.
+    """
     possible_keys = ['access_token', 'UPSTOX_ACCESS_TOKEN', 'token', 'upstox_token', 'auth_token']
     access_token = None
     
@@ -17,30 +43,33 @@ def generate_option_chain_data(current_price=None):
         st.warning("⚠️ Access Token missing in session state!")
         return pd.DataFrame()
         
+    instrument_key = "NSE_INDEX|Nifty 50"
+    
+    # 1. Pehle nearest expiry date nikalo
+    expiry_date = get_nearest_expiry(access_token, instrument_key)
+    if not expiry_date:
+        st.error("❌ Could not fetch expiry date from Upstox.")
+        return pd.DataFrame()
+        
+    # 2. Ab option chain API ko hit karo expiry date ke sath
     url = "https://api.upstox.com/v2/option/chain"
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {access_token}"
     }
-    
-    # Upstox Option Chain ke liye instrument_key zaroori hai
     params = {
-        "instrument_key": "NSE_INDEX|Nifty 50"
+        "instrument_key": instrument_key,
+        "expiry_date": expiry_date
     }
     
     try:
         response = requests.get(url, headers=headers, params=params)
         
-        # Screen par live debug status dikhane ke liye
-        st.write(f"🔍 **API Status Code:** {response.status_code}")
-        
         if response.status_code == 200:
             res_json = response.json()
-            st.write(f"📦 **API Response Keys:** {list(res_json.keys())}")
-            
             data_list = res_json.get('data', [])
+            
             if not data_list:
-                st.info(f"ℹ️ API returned empty data list. Full JSON: {res_json}")
                 return pd.DataFrame()
                 
             parsed_rows = []
@@ -74,7 +103,7 @@ def generate_option_chain_data(current_price=None):
             if not df.empty:
                 return df.sort_values(by="Strike").set_index("Strike")
         else:
-            st.error(f"❌ Upstox API Error Response: {response.text}")
+            st.error(f"❌ Upstox API Error: {response.status_code} - {response.text}")
             
     except Exception as e:
         st.error(f"❌ Exception occurred: {e}")
@@ -124,4 +153,3 @@ def get_fii_dii_fo_footprint(df_option_chain):
         return footprint, round(pcr, 2)
     except Exception:
         return "NEUTRAL", 1.0
-        
