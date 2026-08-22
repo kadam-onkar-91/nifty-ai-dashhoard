@@ -40,6 +40,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 # -------------------------------------------------------------
 
+# Initialize Database
+database.init_db()
+
 # Secure Gemini API Key Configuration using Streamlit Secrets
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -82,6 +85,9 @@ df, model, feature_cols, live_price = market_data.fetch_live_market_data(access_
 
 if df is not None and not df.empty:
     
+    # Update pending trade outcomes in the database dynamically using live price
+    database.update_pending_outcomes(live_price)
+
     # -------------------------------------------------------------
     # 🚀 ADVANCED FEATURE: VWAP & POC CALCULATION
     # -------------------------------------------------------------
@@ -185,7 +191,6 @@ if df is not None and not df.empty:
     avg_bb_width = df['BB_Width'].rolling(window=50).mean().iloc[-1]
     current_bb_width = df['BB_Width'].iloc[-1]
 
-    # Agar Volatility bahut low hai (Market Soya hai / Rangebound hai)
     is_choppy = current_bb_width < (avg_bb_width * 0.75)
 
     if is_choppy:
@@ -229,8 +234,11 @@ if df is not None and not df.empty:
     t1 = live_price + (2.0 * intraday_atr) if signal_code >= 0 else live_price - (2.0 * intraday_atr)
     t2 = live_price + (4.0 * intraday_atr) if signal_code >= 0 else live_price - (4.0 * intraday_atr)
 
-    # Save to Database
-    database.log_prediction_to_db(live_price, signal_code, sl, t1, t2)
+    # Save to Database using safe entry log or log_prediction_to_db if available
+    try:
+        database.log_entry_safe(final_signal_text, live_price, sl, t1)
+    except Exception:
+        database.log_prediction_to_db(live_price, signal_code, sl, t1, t2)
 
     # 🔔 Send Telegram Alert on High Conviction Signals (Confidence >= 68)
     if alert_sys and signal_code != 0 and confluence_score >= 68:
@@ -242,11 +250,19 @@ if df is not None and not df.empty:
             logic="Institutional Confluence Score >= 68 + Volatility Filter Passed"
         )
 
-    # Step 4: Show Core Metrics with Confluence Accuracy Score
-    col1, col2, col3 = st.columns(3)
+    # Fetch Real Historical Win Rate Statistics from Database
+    real_stats = database.get_real_accuracy_stats()
+
+    # Step 4: Show Core Metrics with Confluence Accuracy Score & Real Win Rate
+    col1, col2, col3, col4 = st.columns(4)
     with col1: st.metric(label="Real-Time Live Nifty Price (LTP)", value=f"₹ {live_price:,.2f}")
     with col2: st.metric(label="Institutional Confluence Signal", value=final_signal_text)
     with col3: st.metric(label="AI Model Accuracy Score", value=f"{confluence_score}%")
+    with col4: 
+        if real_stats["win_rate"] is not None:
+            st.metric(label="Real Historical Win Rate", value=f"{real_stats['win_rate']}%", delta=f"{real_stats['total_resolved']} Trades Resolved")
+        else:
+            st.metric(label="Real Historical Win Rate", value="Not enough data", delta="0 Resolved")
 
     # Display Dynamic Active Trade Management Banner
     if st.session_state.active_trade:
@@ -405,14 +421,4 @@ if df is not None and not df.empty:
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("🌐 Global Market Sentiment & Regional Live News")
     st.info(f"**⚡ World's Strongest News Highlight (Live Today):**\n\n*{top_headline}*")
-    try: st.dataframe(df_global_sentiment.style.background_gradient(subset=['Positive News', 'Negative News'], cmap='Blues'), use_container_width=True)
-    except Exception: st.dataframe(df_global_sentiment, use_container_width=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.subheader("🌍 Global Major Stock Markets & Macro Live Tracker")
-    col_m1, col_m2 = st.columns(2)
-    with col_m1: st.metric(label="🎯 Automatic Global Sentiment Score", value=global_sentiment_score)
-    with col_m2: st.metric(label="📈 Average Global Change (%)", value=f"{avg_market_change}%")
-    
-    try: st.dataframe(df_global_markets, column_config={"Logo": st.column_config.ImageColumn("Flag / Icon", width="small")}, hide_index=True, use_container_width=True)
-    except Exception: st.dataframe(df_global_markets, use_container_width=True)
+    try: st.dataframe(df_global_sentiment.style.background_gradient(subset=['Positive News', 'Negative News'], cmap='Blues'), use_contai
