@@ -90,3 +90,4 @@ def detect_market_structure(df):
         })
         
     return structures
+    
