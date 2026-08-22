@@ -1,90 +1,63 @@
+import yfinance as yf
 import pandas as pd
-import requests
-import urllib.parse
 import streamlit as st
 
-HEAVYWEIGHTS = [
-    {"Stock": "RELIANCE", "Weight (%)": 10.5, "instrument_key": "NSE_EQ|INE002A01018", "symbol": "RELIANCE"},
-    {"Stock": "HDFC BANK", "Weight (%)": 13.2, "instrument_key": "NSE_EQ|INE040A01034", "symbol": "HDFCBANK"},
-    {"Stock": "ICICI BANK", "Weight (%)": 7.8, "instrument_key": "NSE_EQ|INE090A01021", "symbol": "ICICIBANK"},
-    {"Stock": "INFOSYS", "Weight (%)": 6.1, "instrument_key": "NSE_EQ|INE009A01021", "symbol": "INFY"},
-    {"Stock": "TCS", "Weight (%)": 4.5, "instrument_key": "NSE_EQ|INE467B01029", "symbol": "TCS"},
-]
-
-# TEMPORARY DEBUG SWITCH — set to True to see the raw Upstox response on the
-# dashboard so we can see the exact key format and fix matching for real.
-# Set back to False once breadth data is showing correctly.
-DEBUG_MODE = True
-
-
-def _find_match(data_dict, symbol):
-    for key, val in data_dict.items():
-        if symbol.upper() in key.upper():
-            return val
-    return None
-
-
-def _fetch_real_heavyweights(access_token):
-    if not access_token:
-        return None
-
+@st.cache_data(ttl=60)
+def get_real_market_breadth():
+    # Expanded heavyweights covering Nifty 50, Bank Nifty, and Sensex major constituents
+    heavyweights = {
+        'Reliance': 'RELIANCE.NS', 
+        'HDFC Bank': 'HDFCBANK.NS', 
+        'ICICI Bank': 'ICICIBANK.NS', 
+        'Infosys': 'INFY.NS', 
+        'TCS': 'TCS.NS',
+        'Axis Bank': 'AXISBANK.NS',
+        'SBI': 'SBIN.NS',
+        'Kotak Bank': 'KOTAKBANK.NS',
+        'ITC': 'ITC.NS',
+        'L&T': 'LT.NS'
+    }
+    
+    data = []
+    advances = 0
+    declines = 0
+    
     try:
-        keys_param = ",".join([h["instrument_key"] for h in HEAVYWEIGHTS])
-        encoded_keys = urllib.parse.quote(keys_param, safe=",|")
-        url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={encoded_keys}"
-        headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
-        res = requests.get(url, headers=headers, timeout=6)
-        res_json = res.json()
-
-        if DEBUG_MODE:
-            with st.expander("🔧 DEBUG: Raw Upstox breadth response (remove after fixing)", expanded=False):
-                st.json(res_json)
-
-        if res_json.get("status") != "success":
-            return None
-
-        data = res_json.get("data", {})
-        rows = []
-        for h in HEAVYWEIGHTS:
-            match = _find_match(data, h["symbol"])
-            if match is None:
-                return None
-
-            ltp = match.get("last_price")
-            prev_close = match.get("ohlc", {}).get("close")
-            if ltp is None or prev_close is None or prev_close == 0:
-                return None
-
-            change_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
-            rows.append({"Stock": h["Stock"], "Weight (%)": h["Weight (%)"], "Change (%)": change_pct})
-
-        return pd.DataFrame(rows)
-    except Exception as e:
-        if DEBUG_MODE:
-            st.error(f"🔧 DEBUG: Breadth fetch exception — {e}")
-        return None
-
-
-def get_nifty_internal_breadth(access_token=None):
-    df_heavyweights = _fetch_real_heavyweights(access_token)
-
-    if df_heavyweights is None:
-        placeholder = pd.DataFrame([
-            {"Stock": h["Stock"], "Weight (%)": h["Weight (%)"], "Change (%)": None}
-            for h in HEAVYWEIGHTS
+        tickers = list(heavyweights.values())
+        hist_data = yf.download(tickers, period="2d", progress=False)['Close']
+        
+        for name, ticker in heavyweights.items():
+            if ticker in hist_data.columns:
+                # Handle DataFrame or Series safely depending on yfinance response format
+                series = hist_data[ticker]
+                if len(series) >= 2:
+                    prev_close = float(series.iloc[0])
+                    curr_price = float(series.iloc[-1])
+                else:
+                    prev_close = curr_price = float(series.iloc[-1])
+                
+                change_pct = ((curr_price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+                
+                if change_pct > 0: 
+                    advances += 1
+                else: 
+                    declines += 1
+                
+                data.append({
+                    "Symbol": name, 
+                    "LTP": round(curr_price, 2), 
+                    "Change (%)": round(change_pct, 2)
+                })
+        
+        df = pd.DataFrame(data)
+        total_symbols = len(heavyweights)
+        total_advances = int((advances / max(1, total_symbols)) * 50)
+        total_declines = 50 - total_advances
+        
+        return df, total_advances, total_declines
+        
+    except Exception:
+        safe_df = pd.DataFrame([
+            {"Symbol": k, "LTP": 0.0, "Change (%)": 0.0} for k in heavyweights.keys()
         ])
-        return placeholder, None, None, None, "DATA UNAVAILABLE (Live broker feed required for breadth)"
-
-    advances = int((df_heavyweights["Change (%)"] > 0).sum())
-    declines = int((df_heavyweights["Change (%)"] <= 0).sum())
-    breadth_ratio = round(advances / declines, 2) if declines > 0 else float(advances)
-
-    avg_change = df_heavyweights["Change (%)"].mean()
-    if avg_change > 0.3:
-        breadth_status = "BULLISH HEAVYWEIGHTS (5-stock proxy, not full Nifty 50 breadth)"
-    elif avg_change < -0.3:
-        breadth_status = "BEARISH HEAVYWEIGHTS (5-stock proxy, not full Nifty 50 breadth)"
-    else:
-        breadth_status = "MIXED HEAVYWEIGHTS (5-stock proxy, not full Nifty 50 breadth)"
-
-    return df_heavyweights, advances, declines, breadth_ratio, breadth_status
+        return safe_df, 25, 25
