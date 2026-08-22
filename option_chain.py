@@ -2,34 +2,23 @@ import requests
 import pandas as pd
 import numpy as np
 import streamlit as st
+from datetime import datetime, timedelta
 
-def get_nearest_expiry(access_token, instrument_key="NSE_INDEX|Nifty 50"):
+def get_upcoming_expiry():
     """
-    Fetches the available expiry dates from Upstox and returns the nearest one.
+    Automatically calculates the upcoming Thursday expiry date in YYYY-MM-DD format.
     """
-    url = "https://api.upstox.com/v2/option/chain/get-expiry-dates"
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {access_token}"
-    }
-    params = {
-        "instrument_key": instrument_key
-    }
-    try:
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code == 200:
-            res = response.json()
-            expiry_dates = res.get('data', [])
-            if expiry_dates:
-                # Pehli (sabse kareeb wali) expiry date return kar do
-                return expiry_dates[0].get('expiry_date')
-    except Exception as e:
-        print(f"Error fetching expiry dates: {e}")
-    return None
+    today = datetime.now()
+    # Thursday is weekday 3 (Monday is 0)
+    days_ahead = 3 - today.weekday()
+    if days_ahead <= 0:  # Agar aaj Thursday nikal chuka hai ya Friday/Saturday/Sunday hai
+        days_ahead += 7
+    next_thursday = today + timedelta(days=days_ahead)
+    return next_thursday.strftime('%Y-%m-%d')
 
 def generate_option_chain_data(current_price=None):
     """
-    Fetches real-time Option Chain data directly from Upstox API v2 using dynamic expiry date.
+    Fetches real-time Option Chain data directly from Upstox API v2 using calculated expiry.
     """
     possible_keys = ['access_token', 'UPSTOX_ACCESS_TOKEN', 'token', 'upstox_token', 'auth_token']
     access_token = None
@@ -45,13 +34,10 @@ def generate_option_chain_data(current_price=None):
         
     instrument_key = "NSE_INDEX|Nifty 50"
     
-    # 1. Pehle nearest expiry date nikalo
-    expiry_date = get_nearest_expiry(access_token, instrument_key)
-    if not expiry_date:
-        st.error("❌ Could not fetch expiry date from Upstox.")
-        return pd.DataFrame()
-        
-    # 2. Ab option chain API ko hit karo expiry date ke sath
+    # 1. Automatic upcoming expiry date generate karna
+    expiry_date = get_upcoming_expiry()
+    
+    # 2. Upstox Option Chain API ko hit karna
     url = "https://api.upstox.com/v2/option/chain"
     headers = {
         "Accept": "application/json",
@@ -103,7 +89,7 @@ def generate_option_chain_data(current_price=None):
             if not df.empty:
                 return df.sort_values(by="Strike").set_index("Strike")
         else:
-            st.error(f"❌ Upstox API Error: {response.status_code} - {response.text}")
+            st.error(f"❌ Upstox API Error ({response.status_code}): {response.text}")
             
     except Exception as e:
         st.error(f"❌ Exception occurred: {e}")
@@ -153,3 +139,4 @@ def get_fii_dii_fo_footprint(df_option_chain):
         return footprint, round(pcr, 2)
     except Exception:
         return "NEUTRAL", 1.0
+        
