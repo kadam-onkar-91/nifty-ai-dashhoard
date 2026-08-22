@@ -1,58 +1,33 @@
 import pandas as pd
-import numpy as np
 
-def calculate_technical_indicators(df):
-    """
-    Computes technical indicators such as RSI, EMAs, VWAP, MACD, ATR, and Bollinger Bands.
-    """
-    if df is None or df.empty:
-        return df
-        
-    df = df.copy()
-    
-    if 'Close' not in df.columns:
-        return df
-        
-    close = df['Close']
-    
-    # Exponential Moving Averages
-    df['EMA_9'] = close.ewm(span=9, adjust=False).mean()
-    df['EMA_20'] = close.ewm(span=20, adjust=False).mean()
-    df['EMA_50'] = close.ewm(span=50, adjust=False).mean()
-    
-    # Relative Strength Index (RSI 14)
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / max(1e-9, loss)
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    # MACD
-    exp1 = close.ewm(span=12, adjust=False).mean()
-    exp2 = close.ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp1 - exp2
-    
-    # Average True Range (ATR)
-    if 'High' in df.columns and 'Low' in df.columns:
-        high_low = df['High'] - df['Low']
-        high_close = np.abs(df['High'] - close.shift())
-        low_close = np.abs(df['Low'] - close.shift())
-        true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        df['ATR'] = true_range.rolling(window=14).mean()
-    else:
-        df['ATR'] = 15.0
+def calculate_rsi(df, period=14):
+    if df is None or len(df) < period:
+        return pd.Series([50] * len(df), index=df.index if df is not None else None)
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
 
-    # Bollinger Bands (20, 2)
-    sma_20 = close.rolling(window=20).mean()
-    std_20 = close.rolling(window=20).std()
-    df['BB_Upper'] = sma_20 + (std_20 * 2)
-    df['BB_Lower'] = sma_20 - (std_20 * 2)
+def calculate_macd(df, fast=12, slow=26, signal=9):
+    if df is None or len(df) < slow:
+        zeros = pd.Series([0] * len(df), index=df.index if df is not None else None)
+        return zeros, zeros, zeros
+    exp1 = df['Close'].ewm(span=fast, adjust=False).mean()
+    exp2 = df['Close'].ewm(span=slow, adjust=False).mean()
+    macd_line = exp1 - exp2
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+def calculate_bollinger_bands(df, period=20, std_dev=2):
+    if df is None or len(df) < period:
+        zeros = pd.Series([0] * len(df), index=df.index if df is not None else None)
+        return zeros, zeros, zeros
+    middle_band = df['Close'].rolling(window=period).mean()
+    std = df['Close'].rolling(window=period).std()
+    upper_band = middle_band + (std * std_dev)
+    lower_band = middle_band - (std * std_dev)
+    return upper_band.fillna(middle_band), middle_band.fillna(middle_band), lower_band.fillna(middle_band)
     
-    # Volume Weighted Average Price (VWAP)
-    if 'Volume' in df.columns and 'High' in df.columns and 'Low' in df.columns:
-        typical_price = (df['High'] + df['Low'] + close) / 3
-        df['VWAP'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
-    else:
-        df['VWAP'] = close.rolling(window=14).mean()
-        
-    return df
