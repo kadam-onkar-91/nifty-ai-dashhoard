@@ -1,11 +1,8 @@
 import pandas as pd
 import requests
 import urllib.parse
+import streamlit as st
 
-# Nifty 50 heavyweight stocks with approximate index weights.
-# NOTE: Upstox's response dict is typically keyed by "EXCHANGE:TRADINGSYMBOL"
-# (e.g. "NSE_EQ:RELIANCE"), not by instrument_key. Verify this against
-# Upstox's current API docs — response key formats have changed before.
 HEAVYWEIGHTS = [
     {"Stock": "RELIANCE", "Weight (%)": 10.5, "instrument_key": "NSE_EQ|INE002A01018", "symbol": "RELIANCE"},
     {"Stock": "HDFC BANK", "Weight (%)": 13.2, "instrument_key": "NSE_EQ|INE040A01034", "symbol": "HDFCBANK"},
@@ -14,9 +11,13 @@ HEAVYWEIGHTS = [
     {"Stock": "TCS", "Weight (%)": 4.5, "instrument_key": "NSE_EQ|INE467B01029", "symbol": "TCS"},
 ]
 
+# TEMPORARY DEBUG SWITCH — set to True to see the raw Upstox response on the
+# dashboard so we can see the exact key format and fix matching for real.
+# Set back to False once breadth data is showing correctly.
+DEBUG_MODE = True
+
 
 def _find_match(data_dict, symbol):
-    """Tries a few reasonable key patterns since exact Upstox key format can vary."""
     for key, val in data_dict.items():
         if symbol.upper() in key.upper():
             return val
@@ -24,11 +25,6 @@ def _find_match(data_dict, symbol):
 
 
 def _fetch_real_heavyweights(access_token):
-    """
-    Fetches REAL LTP + previous close (for Change%) from Upstox's quotes
-    endpoint. Returns None on ANY failure or partial match — we do not mix
-    real data for some stocks with fabricated data for others.
-    """
     if not access_token:
         return None
 
@@ -39,6 +35,10 @@ def _fetch_real_heavyweights(access_token):
         headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
         res = requests.get(url, headers=headers, timeout=6)
         res_json = res.json()
+
+        if DEBUG_MODE:
+            with st.expander("🔧 DEBUG: Raw Upstox breadth response (remove after fixing)", expanded=False):
+                st.json(res_json)
 
         if res_json.get("status") != "success":
             return None
@@ -59,17 +59,13 @@ def _fetch_real_heavyweights(access_token):
             rows.append({"Stock": h["Stock"], "Weight (%)": h["Weight (%)"], "Change (%)": change_pct})
 
         return pd.DataFrame(rows)
-    except Exception:
+    except Exception as e:
+        if DEBUG_MODE:
+            st.error(f"🔧 DEBUG: Breadth fetch exception — {e}")
         return None
 
 
 def get_nifty_internal_breadth(access_token=None):
-    """
-    Reports real heavyweight movement as a breadth PROXY (5 stocks, not the
-    full 50 — being upfront about that limitation matters). If live data
-    can't be fetched or fully matched, this clearly reports
-    'DATA UNAVAILABLE' rather than generating random numbers.
-    """
     df_heavyweights = _fetch_real_heavyweights(access_token)
 
     if df_heavyweights is None:
