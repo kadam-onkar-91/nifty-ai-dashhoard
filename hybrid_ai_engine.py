@@ -199,11 +199,11 @@ Mandatory Tone & Structure:
 NO financial disclaimers. Make it read like a professional desk note from a top proprietary trading desk.
 """
                 response = self.client.models.generate_content(
-                    model='gemini-1.5-flash',
+                    model='gemini-2.5-flash',
                     contents=prompt
                 )
                 return response.text
-            except Exception as e:
+            except Exception:
                 pass 
 
         # Professional Quant Fallback Report
@@ -238,4 +238,3 @@ Do not enter blindly on a direct touch. Wait for a candle confirmation close nea
 🛑 **Invalidation Rule:**
 Agar price **₹{m['invalidation_level']:,.2f}** ke opposite side sustain kar jata hai, toh ye poora setup cancel ho jayega aur position immediate cut karni hai.
 """
-        
