@@ -9,25 +9,18 @@ def init_db():
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS trades
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                      timestamp TEXT, 
-                      signal TEXT, 
-                      entry_price REAL,
-                      stop_loss REAL, 
-                      target REAL, 
-                      status TEXT,
-                      exit_price REAL, 
-                      pnl REAL)''')
+                      timestamp TEXT, signal TEXT, entry_price REAL,
+                      stop_loss REAL, target REAL, status TEXT,
+                      exit_price REAL, pnl REAL)''')
         conn.commit()
 
 def check_open_position():
-    """Checks if there is any active trade running."""
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
         c.execute("SELECT id, signal, entry_price FROM trades WHERE status = 'OPEN'")
         return c.fetchone()
 
 def log_entry_safe(signal, entry_price, sl, target):
-    """Logs a new trade ONLY if no other trade is currently open."""
     if check_open_position():
         return None, "Blocked: Another trade is already OPEN."
         
@@ -38,27 +31,21 @@ def log_entry_safe(signal, entry_price, sl, target):
                      VALUES (?, ?, ?, ?, ?, ?)""",
                   (timestamp, signal, entry_price, sl, target, 'OPEN'))
         conn.commit()
-        trade_id = c.lastrowid
-    return trade_id, "Success: Trade Logged."
+        return c.lastrowid, "Success: Trade Logged."
 
 def log_outcome(trade_id, exit_price, status):
-    """Updates the PnL when Target or SL is hit."""
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
         c.execute("SELECT entry_price, signal FROM trades WHERE id=?", (trade_id,))
         row = c.fetchone()
         if row:
             entry_price, signal = row
-            if signal.upper() == 'BUY':
-                pnl = exit_price - entry_price
-            else:
-                pnl = entry_price - exit_price
+            pnl = (exit_price - entry_price) if signal.upper() == 'BUY' else (entry_price - exit_price)
             c.execute("UPDATE trades SET exit_price = ?, pnl = ?, status = ? WHERE id = ?",
                       (exit_price, round(pnl, 2), status, trade_id))
             conn.commit()
 
 def check_and_update_open_trades(live_price):
-    """Auto-triggers SL or Target based on live tick data."""
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
         c.execute("SELECT id, signal, stop_loss, target FROM trades WHERE status = 'OPEN'")
@@ -66,24 +53,18 @@ def check_and_update_open_trades(live_price):
         
     for t_id, signal, sl, target in open_trades:
         if signal.upper() == 'BUY':
-            if live_price >= target:
-                log_outcome(t_id, live_price, 'TARGET HIT')
-            elif live_price <= sl:
-                log_outcome(t_id, live_price, 'SL HIT')
+            if live_price >= target: log_outcome(t_id, live_price, 'TARGET HIT')
+            elif live_price <= sl: log_outcome(t_id, live_price, 'SL HIT')
         elif signal.upper() == 'SELL':
-            if live_price <= target:
-                log_outcome(t_id, live_price, 'TARGET HIT')
-            elif live_price >= sl:
-                log_outcome(t_id, live_price, 'SL HIT')
+            if live_price <= target: log_outcome(t_id, live_price, 'TARGET HIT')
+            elif live_price >= sl: log_outcome(t_id, live_price, 'SL HIT')
 
 def fetch_performance_metrics():
-    if not os.path.exists(DB_NAME): 
-        return 0, 0, 0.0
+    if not os.path.exists(DB_NAME): return 0, 0, 0.0
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
         c.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='trades'")
-        if c.fetchone()[0] == 0: 
-            return 0, 0, 0.0
+        if c.fetchone()[0] == 0: return 0, 0, 0.0
         
         c.execute("SELECT COUNT(*) FROM trades WHERE status = 'TARGET HIT'")
         wins = c.fetchone()[0]
