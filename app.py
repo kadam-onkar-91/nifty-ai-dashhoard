@@ -141,7 +141,7 @@ if df is not None and not df.empty:
     
     live_vwap = float(df['VWAP'].iloc[-1])
     live_poc = float(df['POC_Level'].iloc[-1])
-    heavyweight_avg_change = df_heavyweights['Change (%)'].mean()
+    heavyweight_avg_change = df_heavyweights['Change (%)'].mean() if 'Change (%)' in df_heavyweights.columns else 0.0
 
     # Calculate Confluence Score (Base 50%)
     confluence_score = 50
@@ -180,7 +180,7 @@ if df is not None and not df.empty:
         signal_code = 0
 
     # -------------------------------------------------------------
-    # 🌪️ NEW: ADVANCED VOLATILITY REGIME FILTER (CHOOPY MARKET BLOCKER)
+    # 🌪️ NEW: ADVANCED VOLATILITY REGIME FILTER (CHOPPY MARKET BLOCKER)
     # -------------------------------------------------------------
     df['BB_Mid'] = df['Close'].rolling(window=20).mean()
     df['BB_Std'] = df['Close'].rolling(window=20).std()
@@ -234,13 +234,13 @@ if df is not None and not df.empty:
     t1 = live_price + (2.0 * intraday_atr) if signal_code >= 0 else live_price - (2.0 * intraday_atr)
     t2 = live_price + (4.0 * intraday_atr) if signal_code >= 0 else live_price - (4.0 * intraday_atr)
 
-    # Save to Database using safe entry log or log_prediction_to_db if available
+    # Save to Database using safe entry log
     try:
         database.log_entry_safe(final_signal_text, live_price, sl, t1)
     except Exception:
         database.log_prediction_to_db(live_price, signal_code, sl, t1, t2)
 
-    # 🔔 Send Telegram Alert on High Conviction Signals (Confidence >= 68)
+    # 🔔 Send Telegram Alert on High Conviction Signals
     if alert_sys and signal_code != 0 and confluence_score >= 68:
         alert_sys.send_trade_alert(
             signal_type=final_signal_text,
@@ -272,7 +272,7 @@ if df is not None and not df.empty:
     # -------------------------------------------------------------
 
     # -------------------------------------------------------------
-    # 🦅 HYBRID AI ENGINE INTEGRATION & REASONING REPORT (UPDATED)
+    # 🦅 HYBRID AI ENGINE INTEGRATION & REASONING REPORT
     # -------------------------------------------------------------
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("🦅 Multi-Factor Hybrid AI Deep Reasoning Report")
@@ -421,4 +421,7 @@ if df is not None and not df.empty:
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("🌐 Global Market Sentiment & Regional Live News")
     st.info(f"**⚡ World's Strongest News Highlight (Live Today):**\n\n*{top_headline}*")
-    try: st.dataframe(df_global_sentiment.style.background_gradient(subset=['Positive News', 'Negative News'], cmap='Blues'), use_contai
+    
+    try:
+        if 'Positive News' in df_global_sentiment.columns and 'Negative News' in df_global_sentiment.columns:
+            st.dataframe(d
