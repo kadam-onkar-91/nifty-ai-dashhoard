@@ -3,16 +3,15 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 
-def fetch_live_option_chain(instrument_key="NSE_INDEX|Nifty 50"):
+def generate_option_chain_data(current_price=None):
     """
     Fetches real-time Option Chain data directly from Upstox API v2
-    using the active access token from Streamlit session state.
+    while keeping the original function name for app.py compatibility.
     """
-    # Session state se active access token fetch karna
     access_token = st.session_state.get('access_token') or st.session_state.get('UPSTOX_ACCESS_TOKEN')
     
     if not access_token:
-        # Agar token nahi mila to warning dikhayega
+        print("Warning: Access token missing for Option Chain API.")
         return pd.DataFrame()
         
     url = "https://api.upstox.com/v2/option/chain"
@@ -21,7 +20,7 @@ def fetch_live_option_chain(instrument_key="NSE_INDEX|Nifty 50"):
         "Authorization": f"Bearer {access_token}"
     }
     params = {
-        "instrument_key": instrument_key
+        "instrument_key": "NSE_INDEX|Nifty 50"
     }
     
     try:
@@ -129,3 +128,4 @@ def get_fii_dii_fo_footprint(df_option_chain):
         return footprint, round(pcr, 2)
     except Exception:
         return "NEUTRAL", 1.0
+        
