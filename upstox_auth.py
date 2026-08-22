@@ -3,10 +3,12 @@ import requests
 import urllib.parse
 
 def get_upstox_access_token():
-    API_KEY = st.secrets["UPSTOX_API_KEY"]
-    API_SECRET = st.secrets["UPSTOX_API_SECRET"]
-    REDIRECT_URI = st.secrets["REDIRECT_URI"]
-
+    API_KEY = "f3a1cf39-d058-44ed-893f-6cb875cd9d4b"
+    API_SECRET = "t1k768tlei"
+    
+    # ✅ YAHAN TERA LIVE STREAMLIT APP KA LINK HAI
+    REDIRECT_URI = "https://kadam-onkar-91-nifty-ai-dashboard.streamlit.app" 
+    
     st.sidebar.subheader("🔐 Upstox Live Authentication")
     
     query_params = st.query_params
