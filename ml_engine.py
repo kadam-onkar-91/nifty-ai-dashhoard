@@ -244,4 +244,5 @@ def train_and_backtest(df, live_vix=None):
         "latest_signal": latest_signal,
         "model_ready": model_ready,
         "latest_confidence": latest_confidence
-    }
+        }
+            
