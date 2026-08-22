@@ -385,4 +385,7 @@ if df is not None and not df.empty:
     with col_m2:
         st.metric(label="📈 Average Global Change (%)", value=f"{avg_market_change}%")
     try:
-        st.dataframe(df_global_ma
+        st.dataframe(df_global_markets, column_config={"Logo": st.column_config.ImageColumn("Flag / Icon", width="small")},
+                     hide_index=True, use_container_width=True)
+    except Exception:
+        st.dataframe(df_global_markets, use_container_width=True)
