@@ -25,6 +25,7 @@ def get_global_market_indices():
     ]
     
     data = []
+    
     for item in indices_data:
         name = item["name"]
         ticker = item["ticker"]
@@ -42,6 +43,7 @@ def get_global_market_indices():
                 current_price = hist['Close'].iloc[-1]
                 prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
                 change_pct = ((current_price - prev_close) / prev_close) * 100
+                
                 status = "Bullish 🟢" if change_pct >= 0 else "Bearish 🔴"
                 
                 data.append({
@@ -72,7 +74,9 @@ def get_global_market_indices():
     return df_markets
 
 def get_global_market_summary(df_markets):
-    """Calculates an automatic Global Market Sentiment Score based on live data."""
+    """
+    Calculates an automatic Global Market Sentiment Score based on live data.
+    """
     if df_markets.empty:
         return "Neutral / Mixed 🟡", 0.0
     
@@ -92,16 +96,3 @@ def get_global_market_summary(df_markets):
         score = "🟡 Neutral / Sideways"
         
     return score, round(avg_change, 2)
-
-def get_live_vix(df_markets):
-    """Pulls the real India VIX value out of the global markets table for ML model."""
-    if df_markets is None or df_markets.empty:
-        return 14.0
-    try:
-        vix_row = df_markets[df_markets["Global Market / Asset"] == "India VIX"]
-        if vix_row.empty:
-            return 14.0
-        value = float(vix_row["Latest Price"].iloc[0])
-        return value if value > 0 else 14.0
-    except Exception:
-        return 14.0
