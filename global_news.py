@@ -1,8 +1,6 @@
 import pandas as pd
 import feedparser
-import streamlit as st
 
-@st.cache_data(ttl=300)
 def get_global_market_sentiment():
     """
     Fetches real-time today's financial news headlines across key regions 
@@ -22,14 +20,8 @@ def get_global_market_sentiment():
     sentiment_data = []
     all_headlines = []
 
-    positive_keywords = [
-        'surge', 'jump', 'gain', 'growth', 'rally', 'positive', 'boost', 
-        'up', 'high', 'deal', 'peace', 'recovery', 'profit', 'expansion'
-    ]
-    negative_keywords = [
-        'fall', 'drop', 'slump', 'crash', 'loss', 'inflation', 'war', 
-        'tension', 'negative', 'down', 'crisis', 'sanction', 'decline', 'fear'
-    ]
+    positive_keywords = ['surge', 'jump', 'gain', 'growth', 'rally', 'positive', 'boost', 'up', 'high', 'deal', 'peace']
+    negative_keywords = ['fall', 'drop', 'slump', 'crash', 'loss', 'inflation', 'war', 'tension', 'negative', 'down', 'crisis', 'sanction']
 
     for region, query in regions.items():
         pos_count = 0
@@ -41,8 +33,8 @@ def get_global_market_sentiment():
             
             entries = feed.entries[:5]
             for entry in entries:
-                title = entry.get("title", "").lower()
-                all_headlines.append({"region": region, "title": entry.get("title", "")})
+                title = entry.title.lower()
+                all_headlines.append({"region": region, "title": entry.title})
                 
                 if any(word in title for word in positive_keywords):
                     pos_count += 1
