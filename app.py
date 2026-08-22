@@ -3,7 +3,6 @@ from streamlit_autorefresh import st_autorefresh
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
-
 import database
 import upstox_auth
 import market_data
