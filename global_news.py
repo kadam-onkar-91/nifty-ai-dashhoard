@@ -67,3 +67,4 @@ def get_global_market_sentiment():
     top_headline = all_headlines[0]['title'] if all_headlines else "Global markets react to latest macroeconomic data releases."
 
     return df_sentiment, top_headline
+    
