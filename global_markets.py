@@ -96,3 +96,24 @@ def get_global_market_summary(df_markets):
         score = "🟡 Neutral / Sideways"
         
     return score, round(avg_change, 2)
+
+
+def get_live_vix(df_markets):
+    """
+    NEW: Pulls the real India VIX value out of the global markets table so
+    it can be fed into ml_engine.py as an actual model feature — instead of
+    being just a display number that never touches the model (which is
+    what was happening before).
+    Returns None if VIX couldn't be fetched, so the model can honestly
+    drop the feature rather than use a fake constant.
+    """
+    if df_markets is None or df_markets.empty:
+        return None
+    try:
+        vix_row = df_markets[df_markets["Global Market / Asset"] == "India VIX"]
+        if vix_row.empty:
+            return None
+        value = float(vix_row["Latest Price"].iloc[0])
+        return value if value > 0 else None
+    except Exception:
+        return None
