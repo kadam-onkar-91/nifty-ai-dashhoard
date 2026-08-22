@@ -167,4 +167,3 @@ def get_fii_dii_fo_footprint(df_option_chain):
         return footprint, round(pcr, 2)
     except Exception:
         return "NEUTRAL", 1.0
-    
