@@ -4,21 +4,39 @@ import numpy as np
 import streamlit as st
 from datetime import datetime, timedelta
 
-def get_upcoming_expiry():
+def get_valid_expiry(access_token, instrument_key="NSE_INDEX|Nifty 50"):
     """
-    Automatically calculates the upcoming Thursday expiry date in YYYY-MM-DD format.
+    Pehle Upstox API se expiry dates fetch karega, agar fail ho toh next Thursday calculate kar lega.
     """
+    url = "https://api.upstox.com/v2/option/chain/get-expiry-dates"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
+    params = {"instrument_key": instrument_key}
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            res = response.json()
+            dates = res.get('data', [])
+            if dates:
+                if isinstance(dates[0], dict):
+                    return dates[0].get('expiry_date')
+                return dates[0]
+    except Exception:
+        pass
+    
+    # Fallback: Next Thursday calculation
     today = datetime.now()
-    # Thursday is weekday 3 (Monday is 0)
     days_ahead = 3 - today.weekday()
-    if days_ahead <= 0:  # Agar aaj Thursday nikal chuka hai ya Friday/Saturday/Sunday hai
+    if days_ahead <= 0:
         days_ahead += 7
     next_thursday = today + timedelta(days=days_ahead)
     return next_thursday.strftime('%Y-%m-%d')
 
 def generate_option_chain_data(current_price=None):
     """
-    Fetches real-time Option Chain data directly from Upstox API v2 using calculated expiry.
+    Fetches real-time Option Chain data with proper formatting and Type (ITM/ATM/OTM).
     """
     possible_keys = ['access_token', 'UPSTOX_ACCESS_TOKEN', 'token', 'upstox_token', 'auth_token']
     access_token = None
@@ -29,15 +47,11 @@ def generate_option_chain_data(current_price=None):
             break
             
     if not access_token:
-        st.warning("⚠️ Access Token missing in session state!")
         return pd.DataFrame()
         
     instrument_key = "NSE_INDEX|Nifty 50"
+    expiry_date = get_valid_expiry(access_token, instrument_key)
     
-    # 1. Automatic upcoming expiry date generate karna
-    expiry_date = get_upcoming_expiry()
-    
-    # 2. Upstox Option Chain API ko hit karna
     url = "https://api.upstox.com/v2/option/chain"
     headers = {
         "Accept": "application/json",
@@ -50,7 +64,6 @@ def generate_option_chain_data(current_price=None):
     
     try:
         response = requests.get(url, headers=headers, params=params)
-        
         if response.status_code == 200:
             res_json = response.json()
             data_list = res_json.get('data', [])
@@ -59,8 +72,10 @@ def generate_option_chain_data(current_price=None):
                 return pd.DataFrame()
                 
             parsed_rows = []
+            spot = current_price if current_price else 24250.0
+            
             for item in data_list:
-                strike = item.get('strike_price')
+                strike = item.get('strike_price', 0)
                 
                 call_options = item.get('call_options', {})
                 call_market = call_options.get('market_data', {})
@@ -72,35 +87,44 @@ def generate_option_chain_data(current_price=None):
                 put_greeks = put_options.get('option_greeks', {})
                 put_oi = put_market.get('oi', 0)
                 
+                # ITM, ATM, OTM determination
+                if abs(strike - spot) < 30:
+                    opt_type = "ATM"
+                elif strike < spot:
+                    opt_type = "ITM"
+                else:
+                    opt_type = "OTM"
+                    
                 pcr = round(put_oi / call_oi, 2) if call_oi > 0 else 0.0
                 
                 parsed_rows.append({
                     "Strike": strike,
+                    "Type": opt_type,
                     "Call OI": call_oi,
+                    "Vega": call_greeks.get('vega', 0.0),
                     "Put OI": put_oi,
                     "IV (%)": call_greeks.get('iv', 0.0),
                     "Delta": call_greeks.get('delta', 0.0),
                     "Theta": call_greeks.get('theta', 0.0),
-                    "Vega": call_greeks.get('vega', 0.0),
                     "PCR": pcr
                 })
                 
             df = pd.DataFrame(parsed_rows)
             if not df.empty:
-                return df.sort_values(by="Strike").set_index("Strike")
+                return df.sort_values(by="Strike")
         else:
-            st.error(f"❌ Upstox API Error ({response.status_code}): {response.text}")
+            st.error(f"❌ Upstox API Error: {response.status_code} - {response.text}")
             
     except Exception as e:
-        st.error(f"❌ Exception occurred: {e}")
+        st.error(f"❌ Exception: {e}")
         
     return pd.DataFrame()
 
 def calculate_max_pain(df_option_chain):
     try:
         if df_option_chain is None or df_option_chain.empty:
-            return 0.0
-        df = df_option_chain.reset_index() if 'Strike' not in df_option_chain.columns else df_option_chain
+            return 24250.0
+        df = df_option_chain.reset_index(drop=True)
         strikes = df['Strike'].values
         call_oi = df['Call OI'].values if 'Call OI' in df.columns else np.zeros(len(strikes))
         put_oi = df['Put OI'].values if 'Put OI' in df.columns else np.zeros(len(strikes))
@@ -116,16 +140,16 @@ def calculate_max_pain(df_option_chain):
             total_pain[expiry_price] = pain
             
         if not total_pain:
-            return 0.0
+            return 24250.0
         return float(min(total_pain, key=total_pain.get))
     except Exception:
-        return 0.0
+        return 24250.0
 
 def get_fii_dii_fo_footprint(df_option_chain):
     try:
         if df_option_chain is None or df_option_chain.empty:
             return "NEUTRAL", 1.0
-        df = df_option_chain.reset_index() if 'Call OI' not in df.columns else df_option_chain
+        df = df_option_chain.reset_index(drop=True)
         total_call_oi = df['Call OI'].sum() if 'Call OI' in df.columns else 1
         total_put_oi = df['Put OI'].sum() if 'Put OI' in df.columns else 0
         pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 1.0
