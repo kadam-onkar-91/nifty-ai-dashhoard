@@ -215,6 +215,8 @@ if df is not None and not df.empty:
     with col3:
         st.metric(label="AI Confluence Score (live heuristic)", value=f"{ai_analysis['confidence_pct']}%")
 
+    # (Wahan ka status alert/info message yahan se puri tarah hata diya gaya hai)
+
     # -------------------------------------------------------------
     # HYBRID AI ENGINE REASONING REPORT
     # -------------------------------------------------------------
