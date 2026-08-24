@@ -74,7 +74,7 @@ df, model, feature_cols, live_price = market_data.fetch_live_market_data(access_
 if df is not None and not df.empty:
 
     # -------------------------------------------------------------
-    # VWAP & POC CALCULATION (unchanged from original — was correct)
+    # VWAP & POC CALCULATION
     # -------------------------------------------------------------
     try:
         df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
@@ -112,8 +112,6 @@ if df is not None and not df.empty:
     max_pain = option_chain.calculate_max_pain(df_option_chain)
     fii_footprint, current_pcr = option_chain.get_fii_dii_fo_footprint(df_option_chain)
 
-    # Bank Nifty / Sensex -- the biggest cross-index drivers of Nifty option
-    # sentiment. Fetched Upstox-first (live) with Yahoo Finance fallback.
     nifty_change_pct = index_correlation.get_nifty_change_pct(access_token, live_price)
     index_correlation_data, banknifty_correlation_note = index_correlation.get_bank_nifty_sensex(
         access_token, nifty_change_pct
@@ -122,16 +120,15 @@ if df is not None and not df.empty:
     df_global_sentiment, top_headline = global_news.get_global_market_sentiment()
     df_global_markets = global_markets.get_global_market_indices()
     global_sentiment_score, avg_market_change = global_markets.get_global_market_summary(df_global_markets)
-    live_vix = global_markets.get_live_vix(df_global_markets)  # NEW: real VIX, not hardcoded
+    live_vix = global_markets.get_live_vix(df_global_markets)
 
     # -------------------------------------------------------------
-    # REAL, WALK-FORWARD VALIDATED MODEL (replaces the unvalidated
-    # retrain-every-30-seconds XGBoost signal from before)
+    # REAL, WALK-FORWARD VALIDATED MODEL
     # -------------------------------------------------------------
     ml_results = ml_engine.train_and_backtest(df, live_vix=live_vix)
 
     # -------------------------------------------------------------
-    # VOLATILITY REGIME FILTER (unchanged — was working correctly)
+    # VOLATILITY REGIME FILTER
     # -------------------------------------------------------------
     df['BB_Mid'] = df['Close'].rolling(window=20).mean()
     df['BB_Std'] = df['Close'].rolling(window=20).std()
@@ -144,8 +141,7 @@ if df is not None and not df.empty:
     is_choppy = current_bb_width < (avg_bb_width * 0.75) if pd.notna(avg_bb_width) and avg_bb_width > 0 else False
 
     # -------------------------------------------------------------
-    # HYBRID AI ENGINE — dynamic ATR-based SL/Target (kept consistent
-    # everywhere, instead of a hardcoded 50/100-point trade elsewhere)
+    # HYBRID AI ENGINE 
     # -------------------------------------------------------------
     ai_analysis = ai_engine.analyze(
         live_price=live_price,
@@ -163,9 +159,8 @@ if df is not None and not df.empty:
     )
 
     signal_code = 1 if "BULLISH" in ai_analysis['bias_text'] else (-1 if "BEARISH" in ai_analysis['bias_text'] else 0)
-    # Require the validated ML model to agree before treating this as actionable
     if ml_results.get("model_ready") and signal_code != 0 and ml_results.get("latest_signal", 0) != signal_code:
-        signal_code = 0  # ML model disagrees with confluence engine — stay flat rather than force a signal
+        signal_code = 0  
 
     final_signal_text = ai_analysis['signal_type'] if signal_code != 0 else "NO TRADE (ML model disagreement or choppy)"
 
@@ -176,9 +171,7 @@ if df is not None and not df.empty:
     intraday_atr = ai_analysis['tech_metrics'].get('atr', 15.0) * 0.4
 
     # -------------------------------------------------------------
-    # DATABASE-DRIVEN TRADE STATE (single source of truth — replaces
-    # the old session_state active_trade system, which could drift out
-    # of sync with what was actually logged to the DB)
+    # DATABASE-DRIVEN TRADE STATE
     # -------------------------------------------------------------
     database.check_and_update_open_trades(live_price)
     open_trade = database.check_open_position()
@@ -186,7 +179,9 @@ if df is not None and not df.empty:
     if open_trade is None and signal_code != 0:
         signal_label = "BUY" if signal_code == 1 else "SELL"
         trade_id, log_msg = database.log_entry_safe(signal_label, live_price, sl, t1, t2)
-        if trade_id and alert_sys and ai_analysis['confidence_pct'] >= 68:
+        
+        # Telegram Alert (Confidence >= 45%)
+        if trade_id and alert_sys and ai_analysis['confidence_pct'] >= 45:
             alert_sys.send_trade_alert(
                 signal_type=final_signal_text, confidence=ai_analysis['confidence_pct'],
                 price=live_price, sentiment=f"Global Score: {global_sentiment_score}",
@@ -194,7 +189,6 @@ if df is not None and not df.empty:
             )
         open_trade = database.check_open_position()
     elif open_trade is not None:
-        # Trailing stop-loss management on the DB-tracked open trade
         is_buy = "BUY" in open_trade["signal"].upper()
         entry = open_trade["entry_price"]
         if is_buy:
@@ -211,7 +205,7 @@ if df is not None and not df.empty:
     perf = database.fetch_performance_metrics()
 
     # -------------------------------------------------------------
-    # CORE METRICS — fake "Accuracy Score" renamed, real metrics added
+    # CORE METRICS 
     # -------------------------------------------------------------
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -219,18 +213,10 @@ if df is not None and not df.empty:
     with col2:
         st.metric(label="Institutional Confluence Signal", value=final_signal_text)
     with col3:
-        # RENAMED from "AI Model Accuracy Score" — this is a live confidence
-        # heuristic based on current indicators, NOT historical accuracy.
         st.metric(label="AI Confluence Score (live heuristic)", value=f"{ai_analysis['confidence_pct']}%")
 
-    if open_trade:
-        st.warning(f"🛡️ **ACTIVE TRADE (DB-tracked)** | {open_trade['signal']} | Entry: ₹{open_trade['entry_price']:.2f} "
-                   f"| Current SL: ₹{open_trade['stop_loss']:.2f} | Target: ₹{open_trade['target_1']:.2f}")
-    else:
-        st.info("ℹ️ System is scanning for high-probability entry setup with Volatility Regime Protection...")
-
     # -------------------------------------------------------------
-    # HYBRID AI ENGINE REASONING REPORT (unchanged logic)
+    # HYBRID AI ENGINE REASONING REPORT
     # -------------------------------------------------------------
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("🦅 Multi-Factor Hybrid AI Deep Reasoning Report")
@@ -243,7 +229,7 @@ if df is not None and not df.empty:
         st.markdown(ai_report_text)
 
     # -------------------------------------------------------------
-    # INSTITUTIONAL CHART (unchanged — was correct)
+    # INSTITUTIONAL CHART 
     # -------------------------------------------------------------
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("📊 Institutional Order Flow Chart (VWAP & Volume Profile)")
@@ -272,7 +258,7 @@ if df is not None and not df.empty:
     col_v2.info(f"**Smart Money POC:** {poc_status} (POC: ₹{live_poc:,.2f})")
 
     # -------------------------------------------------------------
-    # FII / DII FOOTPRINT & MAX PAIN (unchanged)
+    # FII / DII FOOTPRINT & MAX PAIN
     # -------------------------------------------------------------
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("🏛️ Institutional F&O Footprint & Max Pain Analytics")
@@ -294,9 +280,7 @@ if df is not None and not df.empty:
             st.info(f"**Max Pain Gravity Note:** Live price (₹{live_price:,.2f}) is currently **below** Max Pain (₹{max_pain:,.2f}). Expiry pull is downward.")
 
     # -------------------------------------------------------------
-    # NIFTY INTERNAL BREADTH & HEAVYWEIGHTS TRACKER — combined section.
-    # Full 50-stock breadth shown first (how many of the actual 50 are up
-    # vs down), then the best-weighted heavyweights table underneath.
+    # NIFTY INTERNAL BREADTH & HEAVYWEIGHTS TRACKER
     # -------------------------------------------------------------
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("📈 Nifty Internal Breadth & Heavyweights Tracker")
@@ -344,8 +328,7 @@ if df is not None and not df.empty:
         st.success("✅ **Breadth Confirmation:** Heavyweights are aligned with the confluence score.")
 
     # -------------------------------------------------------------
-    # BANK NIFTY, SENSEX & CORRELATED INDICES — the biggest cross-market
-    # movers that affect Nifty 50 option chain sentiment.
+    # BANK NIFTY, SENSEX & CORRELATED INDICES
     # -------------------------------------------------------------
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("🏦 Bank Nifty, Sensex & Correlated Indices")
@@ -366,7 +349,7 @@ if df is not None and not df.empty:
             st.info(f"**Bank Nifty ⇄ Nifty 50 Correlation:** {banknifty_correlation_note}")
 
     # -------------------------------------------------------------
-    # DATA TABLES (unchanged)
+    # DATA TABLES 
     # -------------------------------------------------------------
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("🧱 Advanced Technical Indicators Table")
@@ -383,60 +366,3 @@ if df is not None and not df.empty:
         st.warning("⚠️ **Source: SIMULATED** — no live Upstox login/data. Greeks below are calculated with real "
                     "Black-Scholes math (live spot price, live India VIX, real time-to-expiry), but Open Interest "
                     "is a modelled estimate, not real broker OI. Login with Upstox above for live real OI/PCR.")
-    if not df_option_chain.empty:
-        try:
-            st.dataframe(df_option_chain.style.background_gradient(subset=['PCR'], cmap='RdYlGn'), use_container_width=True)
-        except Exception:
-            st.dataframe(df_option_chain, use_container_width=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.subheader("🏦 Smart Money Concepts & Market Structure (BOS / CHoCH)")
-    if market_structure:
-        trigger_val = market_structure[0]["Trigger Level"]
-        if "Bullish" in smc_event:
-            st.success(f"**Market Structure Status:** {smc_event} | **Trigger Level:** {trigger_val}")
-        elif "Bearish" in smc_event:
-            st.error(f"**Market Structure Status:** {smc_event} | **Trigger Level:** {trigger_val}")
-        else:
-            st.info(f"**Market Structure Status:** {smc_event} | **Trigger Level:** {trigger_val}")
-
-    col_smc1, col_smc2, col_smc3 = st.columns(3)
-    with col_smc1:
-        st.markdown("##### 📌 Fair Value Gaps (FVG)")
-        if fvg:
-            st.table(pd.DataFrame(fvg))
-        else:
-            st.info("No active FVG detected.")
-    with col_smc2:
-        st.markdown("##### 🧱 Order Blocks (OB)")
-        if ob:
-            st.table(pd.DataFrame(ob))
-        else:
-            st.info("No active Order Blocks detected.")
-    with col_smc3:
-        st.markdown("##### 🌊 Liquidity Sweeps")
-        if sweeps:
-            st.table(pd.DataFrame(sweeps))
-        else:
-            st.info("No active Sweeps detected.")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.subheader("🌐 Global Market Sentiment & Regional Live News")
-    st.info(f"**⚡ World's Strongest News Highlight (Live Today):**\n\n*{top_headline}*")
-    try:
-        st.dataframe(df_global_sentiment.style.background_gradient(subset=['Positive News', 'Negative News'], cmap='Blues'), use_container_width=True)
-    except Exception:
-        st.dataframe(df_global_sentiment, use_container_width=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.subheader("🌍 Global Major Stock Markets & Macro Live Tracker")
-    col_m1, col_m2 = st.columns(2)
-    with col_m1:
-        st.metric(label="🎯 Automatic Global Sentiment Score", value=global_sentiment_score)
-    with col_m2:
-        st.metric(label="📈 Average Global Change (%)", value=f"{avg_market_change}%")
-    try:
-        st.dataframe(df_global_markets, column_config={"Logo": st.column_config.ImageColumn("Flag / Icon", width="small")},
-                     hide_index=True, use_container_width=True)
-    except Exception:
-        st.dataframe(df_global_markets, use_container_width=True)
