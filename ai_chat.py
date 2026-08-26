@@ -5,9 +5,11 @@ import asyncio
 
 try:
     from google import genai
+    from google.genai import types
     HAS_GENAI = True
 except ImportError:
     genai = None
+    types = None
     HAS_GENAI = False
 
 try:
@@ -59,7 +61,15 @@ def _speak(text: str):
         clean_text = _clean_for_speech(text)
         if not clean_text.strip():
             return
-        audio_bytes = asyncio.run(_generate_speech_bytes(clean_text))
+        
+        # Fixed: Isolated event loop to avoid Streamlit RuntimeError
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            audio_bytes = loop.run_until_complete(_generate_speech_bytes(clean_text))
+        finally:
+            loop.close()
+
         if audio_bytes:
             st.audio(io.BytesIO(audio_bytes), format="audio/mp3")
     except Exception:
@@ -136,15 +146,16 @@ def render_ai_chat(gemini_api_key: str, dashboard_context: dict):
     with st.chat_message("assistant"):
         with st.spinner("Live data padh raha hoon, deep analysis kar raha hoon..."):
             try:
-                # Collected all 5 keys securely for automatic failover/rotation
-                gemini_keys = [
-                    st.secrets.get("GEMINI_API_KEY_1", gemini_api_key),
+                # Collected all available keys securely with fallback deduplication
+                raw_keys = [
+                    gemini_api_key,
+                    st.secrets.get("GEMINI_API_KEY_1"),
                     st.secrets.get("GEMINI_API_KEY_2"),
                     st.secrets.get("GEMINI_API_KEY_3"),
                     st.secrets.get("GEMINI_API_KEY_4"),
                     st.secrets.get("GEMINI_API_KEY_5"),
                 ]
-                gemini_keys = [k for k in gemini_keys if k]
+                gemini_keys = list(dict.fromkeys([k for k in raw_keys if k and isinstance(k, str) and k.strip()]))
 
                 history_text = "\n".join(
                     f"{m['role'].upper()}: {m['content']}"
@@ -155,12 +166,21 @@ def render_ai_chat(gemini_api_key: str, dashboard_context: dict):
 
                 contents = [prompt_text]
                 if uploaded_img is not None:
-                    contents.append({
-                        "inline_data": {
-                            "mime_type": uploaded_img.type,
-                            "data": uploaded_img.getvalue(),
-                        }
-                    })
+                    # Fixed: Use SDK types.Part for robust multimodal payload
+                    if types:
+                        contents.append(
+                            types.Part.from_bytes(
+                                data=uploaded_img.getvalue(),
+                                mime_type=uploaded_img.type,
+                            )
+                        )
+                    else:
+                        contents.append({
+                            "inline_data": {
+                                "mime_type": uploaded_img.type,
+                                "data": uploaded_img.getvalue(),
+                            }
+                        })
 
                 response = None
                 last_error = None
@@ -169,8 +189,9 @@ def render_ai_chat(gemini_api_key: str, dashboard_context: dict):
                 for current_key in gemini_keys:
                     try:
                         client = genai.Client(api_key=current_key)
+                        # Fixed: Model updated to valid gemini-2.5-flash
                         resp = client.models.generate_content(
-                            model="gemini-3.1-flash-lite",
+                            model="gemini-2.5-flash",
                             contents=contents,
                         )
                         if resp and resp.text:
@@ -193,3 +214,4 @@ def render_ai_chat(gemini_api_key: str, dashboard_context: dict):
 
             if HAS_TTS:
                 _speak(answer)
+                
