@@ -1,0 +1,388 @@
+import pandas as pd
+import numpy as np
+
+"""
+EARLY-WARNING SUPPORT/RESISTANCE APPROACH PREDICTOR
+-----------------------------------------------------
+Problem this solves: the existing confluence engine only confirms a
+direction AFTER price has already reacted (touched a level and moved).
+By then price is often already near the NEXT level, so the signal feels
+"late". This module looks at price WHILE it is still approaching a key
+support/resistance level (within ~1 ATR of it) and estimates, before the
+touch happens, the probability the level BREAKS vs the probability price
+REVERSES (bounces) off it -- combining ICT-style confluence (liquidity
+sweeps, order blocks, fair value gaps, premium/discount) with classic
+momentum/volume/wick exhaustion reads.
+
+This module is fully standalone and does not modify or depend on any
+other file's internal logic -- it only reads the OHLC/indicator data
+that market_data.py already produces, plus the FVG/OB lists smart_money.py
+already produces.
+"""
+
+PROXIMITY_ATR_MULT = 1.0      # "approaching zone" = within 1x ATR of a level
+SWING_LOOKBACK = 15           # candles each side to confirm a fractal pivot
+PDLEVELS_LOOKBACK_DAYS = 3    # how many previous days' High/Low to keep
+ENTRY_CONFIDENCE_THRESHOLD = 60.0  # only suggest an actionable early entry above this break/bounce %
+
+
+def _find_swing_points(df, lookback=SWING_LOOKBACK):
+    """Simple fractal-style swing high/low detector using a centered window."""
+    highs, lows = [], []
+    if df is None or len(df) < (lookback * 2 + 1):
+        return highs, lows
+    h = df['High'].values
+    l = df['Low'].values
+    for i in range(lookback, len(df) - lookback):
+        window_h = h[i - lookback:i + lookback + 1]
+        window_l = l[i - lookback:i + lookback + 1]
+        if h[i] == window_h.max():
+            highs.append(float(h[i]))
+        if l[i] == window_l.min():
+            lows.append(float(l[i]))
+    return highs, lows
+
+
+def get_key_levels(df):
+    """
+    Builds key support/resistance levels from:
+    - Previous day(s) High/Low (classic intraday levels every trader watches)
+    - Fractal swing highs/lows from recent candle history
+    """
+    result = {'resistances': [], 'supports': [], 'prev_day_levels': []}
+    if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return result
+
+    try:
+        daily = df.groupby(df.index.date).agg({'High': 'max', 'Low': 'min', 'Close': 'last'})
+        daily = daily.iloc[:-1]  # drop today's still-forming session
+        for date_idx, row in daily.tail(PDLEVELS_LOOKBACK_DAYS).iterrows():
+            result['prev_day_levels'].append({
+                'date': str(date_idx), 'high': float(row['High']),
+                'low': float(row['Low']), 'close': float(row['Close'])
+            })
+            result['resistances'].append(float(row['High']))
+            result['supports'].append(float(row['Low']))
+    except Exception:
+        pass
+
+    try:
+        swing_highs, swing_lows = _find_swing_points(df.tail(150))
+        result['resistances'].extend(swing_highs)
+        result['supports'].extend(swing_lows)
+    except Exception:
+        pass
+
+    result['resistances'] = sorted(set(round(x, 2) for x in result['resistances']))
+    result['supports'] = sorted(set(round(x, 2) for x in result['supports']))
+    return result
+
+
+def _nearest_level(levels, price, direction):
+    candidates = [lv for lv in levels if (lv > price if direction == 'above' else lv < price)]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda x: abs(x - price))
+
+
+def _candle_wick_ratios(df, n=5):
+    recent = df.tail(n)
+    if recent.empty:
+        return 0.0, 0.0
+    rng = (recent['High'] - recent['Low']).replace(0, 0.01)
+    lower_wick = (recent[['Open', 'Close']].min(axis=1) - recent['Low'])
+    upper_wick = (recent['High'] - recent[['Open', 'Close']].max(axis=1))
+    return float((lower_wick / rng).mean()), float((upper_wick / rng).mean())
+
+
+def _liquidity_sweep_recent(df, level, kind, n=8):
+    """
+    ICT-style liquidity sweep: did price wick THROUGH the level recently
+    and then close back on the defended side? Classic stop-hunt pattern
+    that front-runs a reversal ("Turtle Soup" / Judas Swing).
+    """
+    recent = df.tail(n)
+    if recent.empty or level is None:
+        return False
+    if kind == 'support':
+        return bool(((recent['Low'] < level) & (recent['Close'] > level)).any())
+    return bool(((recent['High'] > level) & (recent['Close'] < level)).any())
+
+
+def _premium_discount_position(df, lookback=100):
+    """ICT premium/discount: equilibrium (50%) of the recent swing range."""
+    recent = df.tail(lookback)
+    if recent.empty:
+        return 'equilibrium', 0.5
+    swing_high, swing_low = recent['High'].max(), recent['Low'].min()
+    if swing_high == swing_low:
+        return 'equilibrium', 0.5
+    pos = (recent['Close'].iloc[-1] - swing_low) / (swing_high - swing_low)
+    zone = 'discount' if pos < 0.5 else 'premium'
+    return zone, round(float(pos), 2)
+
+
+def _volume_trend(df, n=5):
+    """Positive = volume expanding into the move, negative = contracting."""
+    if 'Volume' not in df.columns or len(df) < n + 3:
+        return 0.0
+    recent_vol = df['Volume'].tail(n).mean()
+    prior_vol = df['Volume'].tail(n * 2).head(n).mean()
+    if prior_vol <= 0:
+        return 0.0
+    return float(np.clip((recent_vol - prior_vol) / prior_vol, -1, 1))
+
+
+def _rsi_divergence(df, kind, n=10):
+    """
+    Rough divergence check over the last n candles.
+    support: bullish divergence (price lower-low, RSI higher-low) -> reversal risk.
+    resistance: bearish divergence (price higher-high, RSI lower-high) -> reversal risk.
+    Returns negative (favors reversal/bounce) or slightly positive (favors continuation).
+    """
+    if 'RSI' not in df.columns or len(df) < n:
+        return 0.0
+    recent = df.tail(n)
+    try:
+        if kind == 'support':
+            idx = recent['Low'].idxmin()
+            half = recent.loc[:idx]
+            if len(half) < 3:
+                return 0.0
+            f, s = half.iloc[:len(half) // 2], half.iloc[len(half) // 2:]
+            if f['Low'].min() >= s['Low'].min() and f['RSI'].min() < s['RSI'].min():
+                return -0.3
+            return 0.1
+        else:
+            idx = recent['High'].idxmax()
+            half = recent.loc[:idx]
+            if len(half) < 3:
+                return 0.0
+            f, s = half.iloc[:len(half) // 2], half.iloc[len(half) // 2:]
+            if f['High'].max() <= s['High'].max() and f['RSI'].max() > s['RSI'].max():
+                return -0.3
+            return 0.1
+    except Exception:
+        return 0.0
+
+
+def _parse_price(s):
+    try:
+        return float(str(s).replace(',', ''))
+    except Exception:
+        return None
+
+
+def _zone_confluence(zone_list, level_price, atr):
+    """Net bullish-vs-bearish OB/FVG confluence sitting at/near this level."""
+    if not zone_list or level_price is None or not atr:
+        return 0
+    tol = 0.3 * atr
+    hits = 0
+    for z in zone_list:
+        p = _parse_price(z.get('Price'))
+        if p is None or abs(p - level_price) > tol:
+            continue
+        t = str(z.get('Type', '')).lower()
+        if 'bullish' in t:
+            hits += 1
+        elif 'bearish' in t:
+            hits -= 1
+    return hits
+
+
+def _build_early_entry(target_kind, live_price, atr, break_pct, bounce_pct):
+    """
+    Turns the break/bounce read into an ACTIONABLE suggestion (not just an
+    info %) once conviction crosses ENTRY_CONFIDENCE_THRESHOLD -- this is
+    what lets you enter WHILE the move is still forming near the level,
+    instead of waiting for the slower main confirmation signal (by which
+    point the move is often already over).
+
+    SL/target are ATR-based off the current price (not off the level), so
+    the trade stays valid/consistent no matter how close price already is
+    to the level.
+    """
+    conf = max(break_pct, bounce_pct)
+    if conf < ENTRY_CONFIDENCE_THRESHOLD:
+        return {
+            'action': 'WAIT — Conviction Too Low', 'confidence_pct': conf,
+            'entry_price': None, 'stop_loss': None, 'target': None
+        }
+
+    sl_buffer = max(0.3 * atr, 5.0)
+
+    if target_kind == 'support':
+        going_up = bounce_pct > break_pct
+        label = 'BUY (Anticipated Bounce)' if going_up else 'SELL (Anticipated Breakdown)'
+    else:
+        going_up = break_pct > bounce_pct
+        label = 'BUY (Anticipated Breakout)' if going_up else 'SELL (Anticipated Rejection)'
+
+    entry = live_price
+    if going_up:
+        sl = entry - sl_buffer
+        target = entry + (sl_buffer * 2.0)
+    else:
+        sl = entry + sl_buffer
+        target = entry - (sl_buffer * 2.0)
+
+    return {
+        'action': label, 'confidence_pct': conf,
+        'entry_price': round(entry, 2), 'stop_loss': round(sl, 2), 'target': round(target, 2)
+    }
+
+
+def predict_level_reaction(df, live_price, atr, fvg_list=None, ob_list=None, trend_bias=0.0):
+    """
+    Core "before-the-touch" early-warning function.
+
+    Returns a dict describing whichever key level price is currently
+    approaching (support while falling, resistance while rising), with a
+    break-probability vs bounce-probability split and the confluence
+    factors behind it. If price isn't near any key level right now, it
+    just reports the nearest levels with status NO_KEY_LEVEL_NEARBY.
+
+    score convention (internal): negative = favors BOUNCE/REVERSAL,
+    positive = favors BREAK/CONTINUATION -- for both support and resistance.
+    """
+    out = {
+        'status': 'NO_KEY_LEVEL_NEARBY', 'approaching': None, 'level_price': None,
+        'distance_pts': None, 'break_pct': 50.0, 'bounce_pct': 50.0,
+        'factors': [], 'level_type': None, 'directional_bias': None,
+        'nearest_support': None, 'nearest_resistance': None, 'early_entry': None
+    }
+    if df is None or df.empty or live_price is None or not atr or atr <= 0 or len(df) < 10:
+        return out
+
+    levels = get_key_levels(df)
+    fvg_list, ob_list = fvg_list or [], ob_list or []
+
+    nearest_support = _nearest_level(levels['supports'], live_price, 'below')
+    nearest_resistance = _nearest_level(levels['resistances'], live_price, 'above')
+    out['nearest_support'] = nearest_support
+    out['nearest_resistance'] = nearest_resistance
+
+    proximity = PROXIMITY_ATR_MULT * atr
+    dist_support = (live_price - nearest_support) if nearest_support is not None else None
+    dist_resistance = (nearest_resistance - live_price) if nearest_resistance is not None else None
+
+    recent_closes = df['Close'].tail(5)
+    momentum_down = len(recent_closes) >= 2 and recent_closes.iloc[-1] < recent_closes.iloc[0]
+    momentum_up = len(recent_closes) >= 2 and recent_closes.iloc[-1] > recent_closes.iloc[0]
+
+    approaching_support = dist_support is not None and dist_support <= proximity and momentum_down
+    approaching_resistance = dist_resistance is not None and dist_resistance <= proximity and momentum_up
+
+    target_kind = None
+    if approaching_support and approaching_resistance:
+        target_kind = 'support' if dist_support <= dist_resistance else 'resistance'
+    elif approaching_support:
+        target_kind = 'support'
+    elif approaching_resistance:
+        target_kind = 'resistance'
+
+    if target_kind is None:
+        return out
+
+    level_price = nearest_support if target_kind == 'support' else nearest_resistance
+    distance_pts = dist_support if target_kind == 'support' else dist_resistance
+
+    score = 0.0
+    factors = []
+
+    # 1. RSI momentum divergence (early exhaustion tell)
+    div_score = _rsi_divergence(df, target_kind)
+    score += div_score
+    if div_score < 0:
+        factors.append("RSI momentum divergence detected -> underlying push into this level is weakening (favors reversal)")
+    else:
+        factors.append("No RSI divergence -> momentum still aligned with the move (favors continuation)")
+
+    # 2. Wick rejection bias
+    lower_ratio, upper_ratio = _candle_wick_ratios(df, n=5)
+    if target_kind == 'support':
+        wick_score = lower_ratio - upper_ratio
+        score -= 0.3 * float(np.clip(wick_score, -1, 1))
+        if wick_score > 0.15:
+            factors.append("Long lower wicks forming into support -> buyers actively defending (favors bounce)")
+        elif wick_score < -0.15:
+            factors.append("Weak wicks / strong down-closes into support -> sellers in control (favors breakdown)")
+    else:
+        wick_score = upper_ratio - lower_ratio
+        score -= 0.3 * float(np.clip(wick_score, -1, 1))
+        if wick_score > 0.15:
+            factors.append("Long upper wicks forming into resistance -> sellers actively defending (favors rejection)")
+        elif wick_score < -0.15:
+            factors.append("Weak wicks / strong up-closes into resistance -> buyers in control (favors breakout)")
+
+    # 3. ICT Liquidity Sweep — already fired = strong early reversal tell
+    if _liquidity_sweep_recent(df, level_price, target_kind, n=8):
+        score -= 0.3
+        factors.append("ICT Liquidity Sweep already detected at this level (stop-hunt + reclaim) -> strong early reversal signal")
+    else:
+        factors.append("No liquidity sweep detected yet at this level")
+
+    # 4. Order Block / FVG confluence at this exact level
+    zone_conf = _zone_confluence(ob_list, level_price, atr) + _zone_confluence(fvg_list, level_price, atr)
+    if target_kind == 'support':
+        score += -0.15 * float(np.clip(zone_conf, -2, 2))
+        if zone_conf > 0:
+            factors.append("Bullish Order Block / FVG sitting right at this support -> institutional demand zone (favors bounce)")
+        elif zone_conf < 0:
+            factors.append("Bearish Order Block / FVG stacked at this support -> weak defense (favors breakdown)")
+    else:
+        score += 0.15 * float(np.clip(zone_conf, -2, 2))
+        if zone_conf > 0:
+            factors.append("Bullish Order Block / FVG stacked at this resistance -> buyers overpowering supply (favors breakout)")
+        elif zone_conf < 0:
+            factors.append("Bearish Order Block / FVG sitting right at this resistance -> institutional supply zone (favors rejection)")
+
+    # 5. Volume trend into the move
+    vol_score = _volume_trend(df, n=5)
+    score += 0.2 * vol_score
+    if vol_score > 0.15:
+        factors.append("Volume expanding into this move -> favors continuation through the level")
+    elif vol_score < -0.15:
+        factors.append("Volume contracting into this move -> favors exhaustion/reversal at the level")
+
+    # 6. Broader trend bias (pass in e.g. the confluence engine's tech_score)
+    trend_sign = -1 if target_kind == 'support' else 1
+    score += 0.15 * trend_sign * float(np.clip(trend_bias, -1, 1))
+    if trend_bias > 0.15:
+        factors.append("Broader trend is bullish -> " + ("favors support holding (bounce)" if target_kind == 'support' else "favors resistance breaking (breakout)"))
+    elif trend_bias < -0.15:
+        factors.append("Broader trend is bearish -> " + ("favors support breaking (breakdown)" if target_kind == 'support' else "favors resistance holding (rejection)"))
+
+    # 7. ICT Premium / Discount zone
+    zone, pos = _premium_discount_position(df)
+    pd_score = (0.5 - pos) * 2
+    if target_kind == 'support':
+        score += -0.1 * pd_score
+        factors.append(f"Price is in a {zone} zone (ICT) of the recent range -> " +
+                        ("favors demand / bounce at support" if zone == 'discount' else "less support defense expected"))
+    else:
+        score += 0.1 * pd_score
+        factors.append(f"Price is in a {zone} zone (ICT) of the recent range -> " +
+                        ("favors supply / rejection at resistance" if zone == 'premium' else "resistance may break easier"))
+
+    score = float(np.clip(score, -1, 1))
+    break_pct = float(np.clip(round(50 + score * 40, 1), 10, 90))
+    bounce_pct = round(100 - break_pct, 1)
+
+    if target_kind == 'support':
+        directional_bias = "BREAKDOWN LIKELY (bearish) 🔴" if break_pct > bounce_pct else "BOUNCE LIKELY (bullish) 🟢"
+    else:
+        directional_bias = "BREAKOUT LIKELY (bullish) 🟢" if break_pct > bounce_pct else "REJECTION LIKELY (bearish) 🔴"
+
+    early_entry = _build_early_entry(target_kind, live_price, atr, break_pct, bounce_pct)
+
+    out.update({
+        'status': 'APPROACHING_LEVEL', 'approaching': target_kind,
+        'level_price': round(level_price, 2), 'distance_pts': round(distance_pts, 2),
+        'break_pct': break_pct, 'bounce_pct': bounce_pct, 'factors': factors,
+        'level_type': 'Support' if target_kind == 'support' else 'Resistance',
+        'directional_bias': directional_bias, 'raw_score': round(score, 3),
+        'early_entry': early_entry
+    })
+    return out
