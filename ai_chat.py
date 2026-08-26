@@ -108,8 +108,8 @@ def render_ai_chat(gemini_api_key: str, dashboard_context: dict):
         "future ko pakka nahi bata sakta."
     )
 
-    if not gemini_api_key or not HAS_GENAI:
-        st.warning("Gemini API key configured nahi hai ya google-genai package missing hai -- chat available nahi hai.")
+    if not HAS_GENAI:
+        st.warning("google-genai package missing hai -- chat available nahi hai.")
         return
 
     if "dashboard_chat_history" not in st.session_state:
@@ -136,7 +136,15 @@ def render_ai_chat(gemini_api_key: str, dashboard_context: dict):
     with st.chat_message("assistant"):
         with st.spinner("Live data padh raha hoon, deep analysis kar raha hoon..."):
             try:
-                client = genai.Client(api_key=gemini_api_key)
+                # Collected all 5 keys securely for automatic failover/rotation
+                gemini_keys = [
+                    st.secrets.get("GEMINI_API_KEY_1", gemini_api_key),
+                    st.secrets.get("GEMINI_API_KEY_2"),
+                    st.secrets.get("GEMINI_API_KEY_3"),
+                    st.secrets.get("GEMINI_API_KEY_4"),
+                    st.secrets.get("GEMINI_API_KEY_5"),
+                ]
+                gemini_keys = [k for k in gemini_keys if k]
 
                 history_text = "\n".join(
                     f"{m['role'].upper()}: {m['content']}"
@@ -154,11 +162,29 @@ def render_ai_chat(gemini_api_key: str, dashboard_context: dict):
                         }
                     })
 
-                response = client.models.generate_content(
-                    model="gemini-3.1-flash-lite",
-                    contents=contents,
-                )
-                answer = response.text
+                response = None
+                last_error = None
+
+                # Rotates through available keys if quota is exhausted or an error occurs
+                for current_key in gemini_keys:
+                    try:
+                        client = genai.Client(api_key=current_key)
+                        resp = client.models.generate_content(
+                            model="gemini-3.1-flash-lite",
+                            contents=contents,
+                        )
+                        if resp and resp.text:
+                            response = resp
+                            break
+                    except Exception as ex:
+                        last_error = ex
+                        continue
+
+                if response:
+                    answer = response.text
+                else:
+                    answer = f"⚠️ Sabhi Gemini keys ki limit exhaust ho chuki hai ya error aaya: {last_error}"
+
             except Exception as e:
                 answer = f"⚠️ AI se jawab nahi mil paya: {type(e).__name__}: {e}"
 
