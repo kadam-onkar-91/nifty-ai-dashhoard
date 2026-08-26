@@ -2,6 +2,14 @@ import streamlit as st
 import re
 import io
 import asyncio
+import time
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    requests = None
+    HAS_REQUESTS = False
 
 try:
     from google import genai
@@ -16,6 +24,41 @@ try:
 except ImportError:
     edge_tts = None
     HAS_TTS = False
+
+
+# Each Gemini model on the free tier has its OWN separate daily quota, so
+# trying them in order (cheapest/fastest first) multiplies the effective
+# free capacity instead of stopping at the first model's 500-1000/day cap.
+GEMINI_MODEL_FALLBACK_CHAIN = [
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+]
+
+# Groq is a completely separate company/free tier from Google -- used only
+# as a last resort if EVERY Gemini model's daily quota is exhausted.
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+
+def _call_groq(prompt_text: str, groq_api_key: str) -> str:
+    """Last-resort fallback once every Gemini model's free quota is used up
+    for the day. Groq has its own independent free tier, so this only kicks
+    in when Gemini is completely exhausted -- not used for images, since
+    this path is text-only."""
+    if not groq_api_key or not HAS_REQUESTS:
+        raise RuntimeError("Groq not configured")
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {groq_api_key}"},
+        json={
+            "model": GROQ_MODEL,
+            "messages": [{"role": "user", "content": prompt_text}],
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
 
 def _build_context_block(context: dict) -> str:
@@ -89,11 +132,15 @@ Rules you must always follow:
 """
 
 
-def render_ai_chat(gemini_api_key: str, dashboard_context: dict):
+def render_ai_chat(gemini_api_key: str, dashboard_context: dict, groq_api_key: str = None):
     """Renders a chat box at the point it's called. Every turn re-sends the
     CURRENT live dashboard_context (so answers always reflect this run's
     numbers, not stale ones from when the chat started), plus the running
     conversation, plus an optional uploaded screenshot.
+
+    groq_api_key is OPTIONAL -- if not provided, the app still works, it
+    just won't have the last-resort Groq fallback once all Gemini models'
+    daily quotas are exhausted.
 
     IMPORTANT: the caller must render this OUTSIDE any auto-refreshing
     st.fragment. If it lived inside one, the fragment's own refresh timer
@@ -135,6 +182,8 @@ def render_ai_chat(gemini_api_key: str, dashboard_context: dict):
 
     with st.chat_message("assistant"):
         with st.spinner("Live data padh raha hoon, deep analysis kar raha hoon..."):
+            answer = None
+            used_fallback_note = None
             try:
                 client = genai.Client(api_key=gemini_api_key)
 
@@ -154,15 +203,69 @@ def render_ai_chat(gemini_api_key: str, dashboard_context: dict):
                         }
                     })
 
-                response = client.models.generate_content(
-                    model="gemini-3.1-flash-lite",
-                    contents=contents,
-                )
-                answer = response.text
+                last_err = None
+                quota_exhausted_models = []
+
+                # 1) Walk the Gemini model fallback chain -- each model has
+                #    its own independent free-tier daily quota, so a 429 on
+                #    one model just moves to the next, not to a hard stop.
+                for model_name in GEMINI_MODEL_FALLBACK_CHAIN:
+                    try:
+                        response = client.models.generate_content(
+                            model=model_name,
+                            contents=contents,
+                        )
+                        answer = response.text
+                        if model_name != GEMINI_MODEL_FALLBACK_CHAIN[0]:
+                            used_fallback_note = f"_(via {model_name} -- pehla model busy tha)_"
+                        break
+                    except Exception as e:
+                        last_err = e
+                        err_str = str(e)
+                        if "RESOURCE_EXHAUSTED" in err_str or "429" in err_str:
+                            quota_exhausted_models.append(model_name)
+                            continue  # try next model in the chain
+                        # Non-quota error (network blip) -- one short retry
+                        # on this same model before moving on.
+                        time.sleep(1.5)
+                        try:
+                            response = client.models.generate_content(
+                                model=model_name,
+                                contents=contents,
+                            )
+                            answer = response.text
+                            break
+                        except Exception as e2:
+                            last_err = e2
+                            continue
+
+                # 2) If every Gemini model is quota-exhausted, fall back to
+                #    Groq (separate provider, separate quota) -- text only.
+                if answer is None and groq_api_key:
+                    try:
+                        answer = _call_groq(prompt_text, groq_api_key)
+                        used_fallback_note = "_(Gemini aaj busy tha, isliye Groq se jawab diya)_"
+                    except Exception as e:
+                        last_err = e
+
+                if answer is None:
+                    if quota_exhausted_models:
+                        answer = (
+                            "⚠️ Aaj ke free requests Gemini ke saare models pe khatam ho gaye hain. "
+                            "Kal quota reset hone ke baad dobara try karo, ya billing enable karo "
+                            "zyada requests ke liye."
+                        )
+                    else:
+                        answer = (
+                            f"⚠️ AI se jawab nahi mil paya (kuch technical dikkat hui). "
+                            f"Thodi der baad phir try karo. [{type(last_err).__name__ if last_err else 'Unknown'}]"
+                        )
             except Exception as e:
                 answer = f"⚠️ AI se jawab nahi mil paya: {type(e).__name__}: {e}"
 
             st.markdown(answer)
+            if used_fallback_note:
+                st.caption(used_fallback_note)
             st.session_state.dashboard_chat_history.append({"role": "assistant", "content": answer})
 
             if HAS_TTS:
