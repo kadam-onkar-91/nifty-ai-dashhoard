@@ -217,6 +217,28 @@ class HybridAIEngine:
             f"Early Actionable Entry: {entry_line}"
         )
 
+    def _format_level_ladder(self, level_ladder, max_each_side=4):
+        """
+        NEW — purely additive helper. Formats the Full Round-Number Ladder
+        Calculator output (every 50/100-pt level, both directions) into a
+        compact text block so the LLM report can see the WHOLE ladder, not
+        just the single nearest level -- kept to the nearest few levels
+        each side (not all 16) to keep the prompt short and quota-friendly.
+        Does not affect net_score/signal logic.
+        """
+        ll = level_ladder
+        if not ll or (not ll.get('supports') and not ll.get('resistances')):
+            return "Ladder data not available."
+        res_lines = "; ".join(
+            f"₹{r['level_price']:,.2f} ({r['distance_pts']:.0f} pts away) -> Break {r['break_pct']}% / Bounce {r['bounce_pct']}%"
+            for r in (ll.get('resistances') or [])[:max_each_side]
+        ) or "None"
+        sup_lines = "; ".join(
+            f"₹{s['level_price']:,.2f} ({s['distance_pts']:.0f} pts away) -> Break {s['break_pct']}% / Bounce {s['bounce_pct']}%"
+            for s in (ll.get('supports') or [])[:max_each_side]
+        ) or "None"
+        return f"Resistances above: {res_lines} | Supports below: {sup_lines}"
+
     def generate_llm_reasoning(self, live_price, meta_summary, sentiment_score, global_avg_change, use_ai=True):
         """Set use_ai=False to skip Gemini entirely and go straight to the
         deterministic template report below -- costs zero API quota, useful
@@ -225,6 +247,7 @@ class HybridAIEngine:
         m = meta_summary
         tm = m['tech_metrics']
         level_prediction_text = self._format_level_prediction(m.get('level_prediction'))
+        level_ladder_text = self._format_level_ladder(m.get('level_ladder'))
 
         if use_ai and self.api_keys and HAS_GENAI:
             try:
@@ -258,6 +281,7 @@ Live Market Data & Quant Metrics:
 - Volatility Status: {"Choppy / Rangebound (No Trade Guard Active)" if m['is_choppy'] else "Active Volatility Expansion"}
 - Global Macro: Avg Change = {global_avg_change}% | Sentiment = {sentiment_score}
 - Early-Warning Support/Resistance Approach Predictor (ICT): {level_prediction_text}
+- Full Round-Number Ladder (nearest levels each side, every 50/100pt, Break%/Bounce% each): {level_ladder_text}
 
 Mandatory Tone & Structure:
 1. Start exact tone: "Haan. Maine chart + options chain + FII footprint + internal breadth + Bank Nifty/Sensex correlation + global news data sab read kar liya hai..."
@@ -320,6 +344,7 @@ Nifty Spot **₹{live_price:,.2f}** par trade kar raha hai. VWAP: **₹{tm['vwap
 4. **Smart Money Structure:** Current SMC Event = **"{m['smc_desc']}"** with Volatility State: {"Choppy ⚠️" if m['is_choppy'] else "Active 🟢"}.
 5. **Global Macro Context:** Global sentiment is **{sentiment_score}** with an average change of **{global_avg_change}%**.
 6. **Early-Warning Support/Resistance Approach Predictor (ICT):** {level_prediction_text}
+7. **Full Round-Number Ladder (every 50/100pt level, both directions):** {level_ladder_text}
 
 ⚠️ **Trap Warning & Confirmation Rule:**
 Do not enter blindly on a direct touch. Wait for a candle confirmation close near **₹{m['entry_price']:,.2f}** followed by a valid retest before executing.

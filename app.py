@@ -294,6 +294,10 @@ def _live_dashboard():
             fvg_list=fvg, ob_list=ob, trend_bias=ai_analysis.get('tech_score', 0.0),
             df_option_chain=df_option_chain
         )
+        # Attach it too, same pattern as level_prediction above, so the Deep
+        # Reasoning Report (Gemini + fallback template) can read the FULL
+        # ladder, not just the single nearest level.
+        ai_analysis['level_ladder'] = level_ladder
 
         signal_code = 1 if "BULLISH" in ai_analysis['bias_text'] else (-1 if "BEARISH" in ai_analysis['bias_text'] else 0)
         # Require the validated ML model to agree before treating this as actionable
@@ -773,6 +777,14 @@ def _live_dashboard():
                 + (f"Trade Plan: Entry ₹{sniper['trade_plan']['entry']:,.2f} | Target ₹{sniper['trade_plan']['target']:,.2f} | "
                    f"SL ₹{sniper['trade_plan']['sl']:,.2f}" if sniper['trade_plan'] else "Trade Plan: No trade -- confluence not confirmed yet")
             ) if sniper else "Not enough candle history yet for PDH/PDL/CPR",
+            "Full S/R Ladder (every 50/100pt, nearest 4 each side)": (
+                "Resistances above: " + ("; ".join(
+                    f"₹{r['level_price']:,.2f} ({r['distance_pts']:.0f}pts) Break {r['break_pct']}%/Bounce {r['bounce_pct']}%"
+                    for r in (level_ladder.get('resistances') or [])[:4]) or "None")
+                + " | Supports below: " + ("; ".join(
+                    f"₹{s['level_price']:,.2f} ({s['distance_pts']:.0f}pts) Break {s['break_pct']}%/Bounce {s['bounce_pct']}%"
+                    for s in (level_ladder.get('supports') or [])[:4]) or "None")
+            ),
         }
 
 
