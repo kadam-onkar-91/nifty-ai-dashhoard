@@ -1,0 +1,246 @@
+from app_logging import get_logger
+logger = get_logger(__name__)
+import sqlite3
+from datetime import datetime, timedelta
+
+DB_NAME = "trading_logs.db"
+
+# Default symbol used by every call site that doesn't explicitly pass one --
+# this is what keeps all EXISTING Nifty 50 behaviour byte-for-byte identical
+# after the multi-stock upgrade below.
+DEFAULT_SYMBOL = "NIFTY50"
+
+# If a trade sits open longer than this with neither SL nor Target hit,
+# it gets closed at current price so it doesn't block new signals forever
+# and so it doesn't silently vanish from the sample.
+MAX_HOLD_MINUTES = 120
+
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS trades
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  timestamp TEXT,
+                  signal TEXT,
+                  entry_price REAL,
+                  stop_loss REAL,
+                  target_1 REAL,
+                  target_2 REAL,
+                  status TEXT DEFAULT 'OPEN',
+                  exit_price REAL,
+                  exit_timestamp TEXT,
+                  pnl REAL,
+                  mfe REAL,
+                  mae REAL)''')
+    conn.commit()
+    # PHASE 3 -- additive migration for DBs created before mfe/mae existed.
+    # SQLite has no "ADD COLUMN IF NOT EXISTS", so check first.
+    c.execute("PRAGMA table_info(trades)")
+    existing_cols = {row[1] for row in c.fetchall()}
+    if 'mfe' not in existing_cols:
+        c.execute("ALTER TABLE trades ADD COLUMN mfe REAL")
+    if 'mae' not in existing_cols:
+        c.execute("ALTER TABLE trades ADD COLUMN mae REAL")
+    # MULTI-STOCK UPGRADE -- additive migration for DBs created before the
+    # "select any stock" dashboard existed. Every row that already exists
+    # gets backfilled to NIFTY50 so old trade history / backtest / risk
+    # stats keep meaning exactly what they meant before -- nothing about
+    # the existing Nifty flow changes.
+    if 'symbol' not in existing_cols:
+        c.execute("ALTER TABLE trades ADD COLUMN symbol TEXT")
+        c.execute("UPDATE trades SET symbol = ? WHERE symbol IS NULL", (DEFAULT_SYMBOL,))
+    conn.commit()
+    conn.close()
+
+
+def check_open_position(symbol=DEFAULT_SYMBOL):
+    """Returns the currently OPEN trade for this symbol (if any) as a dict, else None.
+
+    Each symbol (NIFTY50, or any selected stock) tracks its own open
+    position independently -- an open Nifty paper trade never blocks a
+    new signal on, say, RELIANCE, and vice versa.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""SELECT id, timestamp, signal, entry_price, stop_loss, target_1, target_2
+                 FROM trades WHERE status = 'OPEN' AND symbol = ? ORDER BY id DESC LIMIT 1""", (symbol,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0], "timestamp": row[1], "signal": row[2],
+        "entry_price": row[3], "stop_loss": row[4], "target_1": row[5], "target_2": row[6]
+    }
+
+
+def log_entry_safe(signal, entry_price, sl, target_1, target_2=None, symbol=DEFAULT_SYMBOL):
+    """
+    Only logs a new trade if no trade is currently OPEN for this symbol.
+    This is what prevents the database from filling up with overlapping/
+    duplicate entries every time the app refreshes and the signal repeats.
+    """
+    if check_open_position(symbol) is not None:
+        return None, f"{symbol} already has an OPEN position — new signal ignored until it resolves."
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("""INSERT INTO trades (timestamp, signal, entry_price, stop_loss, target_1, target_2, status, symbol)
+                 VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?)""",
+              (timestamp, signal, entry_price, sl, target_1, target_2, symbol))
+    trade_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return trade_id, "New trade logged."
+
+
+def _close_trade(trade_id, entry_price, signal, exit_price, status):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    if "BUY" in signal.upper() or signal == "1":
+        pnl = exit_price - entry_price
+    else:
+        pnl = entry_price - exit_price
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("""UPDATE trades SET exit_price = ?, exit_timestamp = ?, pnl = ?, status = ?
+                 WHERE id = ?""", (exit_price, now, round(pnl, 2), status, trade_id))
+    conn.commit()
+    conn.close()
+
+
+def update_stop_loss(trade_id, new_sl):
+    """
+    Updates the stop-loss of the currently open trade (used for trailing
+    SL / breakeven-lock logic). This keeps the database as the single
+    source of truth for trade state instead of a separate session_state
+    system that can drift out of sync with it.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE trades SET stop_loss = ? WHERE id = ? AND status = 'OPEN'", (new_sl, trade_id))
+    conn.commit()
+    conn.close()
+
+
+def check_and_update_open_trades(live_price, symbol=DEFAULT_SYMBOL):
+    """
+    Call this on every refresh with the current live price for `symbol`.
+    It checks that symbol's open trade against its Target/SL and closes it
+    automatically. If a trade has been open too long with neither level
+    hit, it force-closes at the current price (TIME_EXIT) so trades never
+    sit open forever and so new signals aren't blocked indefinitely.
+
+    Only trades belonging to `symbol` are touched, so running this for a
+    selected stock never affects the Nifty 50 open trade or any other
+    stock's open trade.
+
+    PHASE 3 addition: also updates MFE (Maximum Favorable Excursion) and
+    MAE (Maximum Adverse Excursion) for the open trade -- the best and
+    worst the trade moved in its favor/against it before closing. This is
+    sampled once per dashboard refresh (~every 30s), not tick-by-tick, so
+    it's a real but coarse-grained MFE/MAE, not exchange-precision -- the
+    backtest engine labels it as such rather than overclaiming precision.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""SELECT id, timestamp, signal, entry_price, stop_loss, target_1, mfe, mae
+                 FROM trades WHERE status = 'OPEN' AND symbol = ?""", (symbol,))
+    open_trades = c.fetchall()
+    conn.close()
+
+    for trade_id, ts, signal, entry_price, sl, target_1, mfe, mae in open_trades:
+        is_buy = "BUY" in signal.upper() or signal == "1"
+
+        favorable_move = (live_price - entry_price) if is_buy else (entry_price - live_price)
+        new_mfe = favorable_move if mfe is None else max(mfe, favorable_move)
+        new_mae = favorable_move if mae is None else min(mae, favorable_move)
+        conn2 = sqlite3.connect(DB_NAME)
+        conn2.cursor().execute("UPDATE trades SET mfe = ?, mae = ? WHERE id = ?",
+                                (round(new_mfe, 2), round(new_mae, 2), trade_id))
+        conn2.commit()
+        conn2.close()
+
+        if is_buy:
+            if live_price >= target_1:
+                _close_trade(trade_id, entry_price, signal, live_price, "TARGET HIT")
+                continue
+            elif live_price <= sl:
+                _close_trade(trade_id, entry_price, signal, live_price, "SL HIT")
+                continue
+        else:
+            if live_price <= target_1:
+                _close_trade(trade_id, entry_price, signal, live_price, "TARGET HIT")
+                continue
+            elif live_price >= sl:
+                _close_trade(trade_id, entry_price, signal, live_price, "SL HIT")
+                continue
+
+        try:
+            opened_at = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+            if datetime.now() - opened_at > timedelta(minutes=MAX_HOLD_MINUTES):
+                _close_trade(trade_id, entry_price, signal, live_price, "TIME_EXIT")
+        except Exception:
+            logger.exception("Broad exception caught; fallback path executed")
+            pass
+
+
+def fetch_performance_metrics(symbol=DEFAULT_SYMBOL):
+    """
+    Returns the REAL, measured track record FOR THIS SYMBOL ONLY. win_rate
+    is calculated only from resolved TARGET HIT / SL HIT trades (a cleaner
+    win-rate signal); TIME_EXIT trades are reported separately since they
+    were neither a clean win nor a clean loss.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='trades'")
+    if c.fetchone()[0] == 0:
+        conn.close()
+        return {"wins": 0, "losses": 0, "time_exits": 0, "win_rate": None, "sample_size": 0, "total_pnl": 0.0}
+
+    c.execute("SELECT COUNT(*) FROM trades WHERE status = 'TARGET HIT' AND symbol = ?", (symbol,))
+    wins = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM trades WHERE status = 'SL HIT' AND symbol = ?", (symbol,))
+    losses = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM trades WHERE status = 'TIME_EXIT' AND symbol = ?", (symbol,))
+    time_exits = c.fetchone()[0]
+    c.execute("SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE status != 'OPEN' AND symbol = ?", (symbol,))
+    total_pnl = c.fetchone()[0]
+    conn.close()
+
+    resolved = wins + losses
+    win_rate = round((wins / resolved) * 100, 1) if resolved > 0 else None
+
+    return {
+        "wins": wins, "losses": losses, "time_exits": time_exits,
+        "win_rate": win_rate, "sample_size": resolved, "total_pnl": round(total_pnl, 2)
+    }
+
+
+def fetch_all_closed_trades(symbol=DEFAULT_SYMBOL):
+    """
+    PHASE 3 addition. Returns every resolved (non-OPEN) trade FOR THIS
+    SYMBOL as a list of dicts, ordered oldest-first -- this is the single
+    real source of truth that backtest_engine.py, monte_carlo.py and
+    drift_detection.py build on. No synthetic/simulated trades are ever
+    mixed in here; if the list is short, those modules are expected to say
+    so plainly rather than pad it with invented data. Filtering by symbol
+    means a stock's backtest/Monte Carlo/drift stats are never diluted by
+    Nifty's trade history (or another stock's), and vice versa.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='trades'")
+    if c.fetchone()[0] == 0:
+        conn.close()
+        return []
+    c.execute("""SELECT id, timestamp, signal, entry_price, stop_loss, target_1, target_2,
+                        status, exit_price, exit_timestamp, pnl, mfe, mae
+                 FROM trades WHERE status != 'OPEN' AND symbol = ? ORDER BY id ASC""", (symbol,))
+    rows = c.fetchall()
+    conn.close()
+    cols = ["id", "timestamp", "signal", "entry_price", "stop_loss", "target_1", "target_2",
+            "status", "exit_price", "exit_timestamp", "pnl", "mfe", "mae"]
+    return [dict(zip(cols, row)) for row in rows]
