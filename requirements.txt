@@ -2,7 +2,7 @@
 # Python 3.12+ recommended.
 streamlit==1.64.0
 plotly==6.5.2
-pandas==2.2.3
+pandas==2.3.3
 numpy==2.3.5
 google-genai==2.23.0
 requests==2.32.5
