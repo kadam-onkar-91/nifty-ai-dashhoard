@@ -114,6 +114,9 @@ FACTOR_LABELS = {
     "nifty50_news_aligned": "NIFTY 50-specific live news sentiment aligned (own RSS scoring)",
     "nifty50_fundamentals_aligned": "NIFTY 50 constituent-aggregate fundamentals tilt aligned/neutral",
     "external_ai_aligned": "Independent Gemini dashboard research agrees",
+    "entry_not_extended": "Entry is not chasing an extended move",
+    "entry_confirmed_bounce": "Bounce/rejection candle confirmed at the entry",
+    "pcr_velocity_aligned": "PCR velocity (OI change speed) aligned",
 }
 
 # ---------------------------------------------------------------------
@@ -701,7 +704,7 @@ def get_factor_reliability():
             "samples_when_true": true_total,
             "wins_when_true": true_wins,
             "losses_when_true": true_losses,
-            "label": FACTOR_LABELS[key],
+            "label": FACTOR_LABELS.get(key, key.replace("_", " ").capitalize()),
         }
     return result
 

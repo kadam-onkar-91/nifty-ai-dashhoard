@@ -146,11 +146,11 @@ with st.sidebar:
     ).strip().upper()
     _sb_col1, _sb_col2 = st.columns(2)
     with _sb_col1:
-        if st.button("Load Stock", key="sidebar_load_stock_btn", use_container_width=True) and _sidebar_symbol_raw:
+        if st.button("Load Stock", key="sidebar_load_stock_btn", width="stretch") and _sidebar_symbol_raw:
             st.session_state["active_symbol"] = _sidebar_symbol_raw
             st.session_state.pop(f"stock_full_analysis_{_sidebar_symbol_raw}", None)
     with _sb_col2:
-        if st.button("⬅ Nifty 50", key="sidebar_back_to_nifty_btn", use_container_width=True):
+        if st.button("⬅ Nifty 50", key="sidebar_back_to_nifty_btn", width="stretch"):
             st.session_state["active_symbol"] = None
     if st.session_state.get("active_symbol"):
         st.success(f"Active dashboard: **{st.session_state['active_symbol']}**")
@@ -771,7 +771,7 @@ def _live_dashboard():
             st.markdown("---")
             st.markdown("**Sector Breadth** (real per-sector aggregation of the full-50 breadth data above)")
             if sector_breadth is not None and not sector_breadth.empty:
-                st.dataframe(sector_breadth, hide_index=True, use_container_width=True)
+                st.dataframe(sector_breadth, hide_index=True, width="stretch")
                 leader = sector_breadth.iloc[0]
                 laggard = sector_breadth.iloc[-1]
                 st.caption(f"Leading sector: {leader['Sector']} ({leader['Avg Change (%)']:+.2f}%) | "
@@ -891,7 +891,7 @@ def _live_dashboard():
                     if r.get("status") == "OK":
                         mtf_rows.append({"Timeframe": lbl, "Trend": r["trend"], "Structure": r["structure_event"], "Last Close": r["last_close"]})
                 if mtf_rows:
-                    st.dataframe(pd.DataFrame(mtf_rows), hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(mtf_rows), hide_index=True, width="stretch")
                 st.write(f"**{mtf_structure['classification']}**")
             else:
                 st.caption(f"Multi-timeframe structure unavailable: {mtf_structure.get('reason', 'unknown')}")
@@ -943,7 +943,7 @@ def _live_dashboard():
                         "Bounce %": f"{r['bounce_pct']}%",
                         "Read": r['directional_bias'].replace(" 🟢", "").replace(" 🔴", "")
                     } for r in level_ladder['resistances']]
-                    st.dataframe(lad_res_rows, hide_index=True, use_container_width=True)
+                    st.dataframe(lad_res_rows, hide_index=True, width="stretch")
                 else:
                     st.caption("Ladder data abhi available nahi hai.")
 
@@ -957,7 +957,7 @@ def _live_dashboard():
                         "Bounce %": f"{s['bounce_pct']}%",
                         "Read": s['directional_bias'].replace(" 🟢", "").replace(" 🔴", "")
                     } for s in level_ladder['supports']]
-                    st.dataframe(lad_sup_rows, hide_index=True, use_container_width=True)
+                    st.dataframe(lad_sup_rows, hide_index=True, width="stretch")
                 else:
                     st.caption("Ladder data abhi available nahi hai.")
 
@@ -1272,7 +1272,7 @@ def _live_dashboard():
                        f"{strategy_result.get('blocked_count', 0)} stale/against-the-move signal(s) blocked")
         if _strategy_rows:
             with st.expander(f"🧩 Named Strategy Library — {len(_strategy_rows)} strategies scanned, {len(_ranked)} live", expanded=bool(_ranked)):
-                st.dataframe(pd.DataFrame(_strategy_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(_strategy_rows), hide_index=True, width="stretch")
                 st.caption("Win rate sirf resolved historical samples se aata hai. Naya strategy/history insufficient ho to N/A dikhaya jata hai; fake accuracy nahi.")
 
         # -------------------------------------------------------------
@@ -1531,7 +1531,7 @@ def _live_dashboard():
                                                             else "abhi data kam")}
                          for g, e in sorted(_sh["by_gate"].items(), key=lambda kv: -kv[1]["n"])]
                 if _rows:
-                    st.dataframe(_rows, hide_index=True, use_container_width=True)
+                    st.dataframe(_rows, hide_index=True, width="stretch")
                 st.caption(f"Abhi {_sh['open']} shadow trade chal rahe hain | total logged: {_sh['total']}")
             except Exception:
                 st.caption("Shadow data abhi available nahi.")
@@ -1539,7 +1539,7 @@ def _live_dashboard():
             _gc_show = st.session_state.get('_gate_counts') or {}
             if _gc_show:
                 st.dataframe([{"Gate": k, "Candles": v} for k, v in sorted(_gc_show.items(), key=lambda kv: -kv[1])],
-                             hide_index=True, use_container_width=True)
+                             hide_index=True, width="stretch")
                 st.caption("Agar ek hi gate bahut zyada rok raha hai (Gemini ke alawa), wahi tune karne ki jagah hai.")
             else:
                 st.caption("Abhi data nahi -- thodi der chalne do.")
@@ -1577,7 +1577,7 @@ def _live_dashboard():
                                      else "— record nahi (purana trade)")),
                     "Exit": f"₹{s['exit_price']:,.2f} @ {s['exit_timestamp']}" if s['exit_price'] else "-"
                 } for s in _recent_setups]
-                st.dataframe(_setup_rows, hide_index=True, use_container_width=True)
+                st.dataframe(_setup_rows, hide_index=True, width="stretch")
 
             _with_g = [x for x in (_recent_setups or []) if x.get('gemini')]
             if _with_g:
@@ -1610,7 +1610,7 @@ def _live_dashboard():
                     "True Samples": _r.get('samples_when_true', 0),
                     "Win Rate When True": f"{_r['win_rate_when_true']}%" if _r['win_rate_when_true'] is not None else "Not enough data yet",
                 })
-            st.dataframe(_rel_rows, hide_index=True, use_container_width=True)
+            st.dataframe(_rel_rows, hide_index=True, width="stretch")
 
         # -------------------------------------------------------------
         # -------------------------------------------------------------
@@ -1648,7 +1648,7 @@ def _live_dashboard():
                       annotation_text=f"POC Level (Max Vol): {df['POC_Level'].iloc[-1]:.2f}", annotation_position="top right")
         fig.update_layout(xaxis_title='Time', yaxis_title='Price (₹)', template='plotly_dark', height=600,
                            xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         live_vwap = float(df['VWAP'].iloc[-1])
         live_poc = float(df['POC_Level'].iloc[-1])
@@ -1750,10 +1750,10 @@ def _live_dashboard():
 
             try:
                 st.dataframe(df_heavyweights.style.background_gradient(subset=['Change (%)'], cmap='RdYlGn'),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
             except Exception:
                 logger.exception("Broad exception caught; fallback path executed")
-                st.dataframe(df_heavyweights, use_container_width=True, hide_index=True)
+                st.dataframe(df_heavyweights, width="stretch", hide_index=True)
 
             if "Upstox" not in breadth_status:
                 with st.expander("🔧 Why isn't this using Upstox Live? (debug)", expanded=False):
@@ -1797,7 +1797,7 @@ def _live_dashboard():
         display_columns = ['Close', 'Volume', 'VWAP', 'POC_Level', 'EMA_20', 'EMA_50', 'MACD', 'ATR', 'RSI']
         available_cols = [col for col in display_columns if col in df.columns]
         with st.expander("📈 View Live Indicators Grid", expanded=False):
-            st.dataframe(df[available_cols].tail(10), use_container_width=True)
+            st.dataframe(df[available_cols].tail(10), width="stretch")
 
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("⛓️ Nifty 50 Option Chain (Greeks & PCR)", expanded=False):
@@ -1809,10 +1809,10 @@ def _live_dashboard():
                             "is a modelled estimate, not real broker OI. Login with Upstox above for live real OI/PCR.")
             if not df_option_chain.empty:
                 try:
-                    st.dataframe(df_option_chain.style.background_gradient(subset=['PCR'], cmap='RdYlGn'), use_container_width=True)
+                    st.dataframe(df_option_chain.style.background_gradient(subset=['PCR'], cmap='RdYlGn'), width="stretch")
                 except Exception:
                     logger.exception("Broad exception caught; fallback path executed")
-                    st.dataframe(df_option_chain, use_container_width=True)
+                    st.dataframe(df_option_chain, width="stretch")
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("🏦 Smart Money Concepts & Market Structure (BOS / CHoCH)")
@@ -1905,10 +1905,10 @@ def _live_dashboard():
         with st.expander("🌐 Global Market Sentiment & Regional Live News", expanded=False):
             st.info(f"**⚡ World's Strongest News Highlight (Live Today):**\n\n*{top_headline}*")
             try:
-                st.dataframe(df_global_sentiment.style.background_gradient(subset=['Positive News', 'Negative News'], cmap='Blues'), use_container_width=True)
+                st.dataframe(df_global_sentiment.style.background_gradient(subset=['Positive News', 'Negative News'], cmap='Blues'), width="stretch")
             except Exception:
                 logger.exception("Broad exception caught; fallback path executed")
-                st.dataframe(df_global_sentiment, use_container_width=True)
+                st.dataframe(df_global_sentiment, width="stretch")
 
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("🌍 Global Major Stock Markets & Macro Live Tracker", expanded=False):
@@ -1919,10 +1919,10 @@ def _live_dashboard():
                 st.metric(label="📈 Average Global Change (%)", value=f"{avg_market_change}%")
             try:
                 st.dataframe(df_global_markets, column_config={"Logo": st.column_config.ImageColumn("Flag / Icon", width="small")},
-                             hide_index=True, use_container_width=True)
+                             hide_index=True, width="stretch")
             except Exception:
                 logger.exception("Broad exception caught; fallback path executed")
-                st.dataframe(df_global_markets, use_container_width=True)
+                st.dataframe(df_global_markets, width="stretch")
 
 
 
@@ -1961,19 +1961,19 @@ def _render_fundamentals_cards(f):
         for col, key, label in [(c1,"P/E","P/E"),(c2,"P/B","P/B"),(c3,"ROA","ROA"),(c4,"ROE","ROE"),(c5,"ROCE","ROCE"),(c6,"EV/EBITDA","EV/EBITDA")]:
             r=ratios.get(key) or {}; col.metric(label, str(r.get("company_value") or "N/A"), delta=(str(r.get("sector_value")) if r.get("sector_value") is not None else None))
         if f.get("income_statement"):
-            st.markdown("**Income Statement**"); st.dataframe(pd.DataFrame(f["income_statement"].get("income_statement", [])), hide_index=True, use_container_width=True)
+            st.markdown("**Income Statement**"); st.dataframe(pd.DataFrame(f["income_statement"].get("income_statement", [])), hide_index=True, width="stretch")
         if f.get("balance_sheet"):
-            st.markdown("**Balance Sheet**"); st.dataframe(pd.DataFrame(f["balance_sheet"].get("history", [])), hide_index=True, use_container_width=True)
+            st.markdown("**Balance Sheet**"); st.dataframe(pd.DataFrame(f["balance_sheet"].get("history", [])), hide_index=True, width="stretch")
         if f.get("cash_flow"):
-            st.markdown("**Cash Flow**"); st.dataframe(pd.DataFrame(f["cash_flow"].get("cash_flow", [])), hide_index=True, use_container_width=True)
+            st.markdown("**Cash Flow**"); st.dataframe(pd.DataFrame(f["cash_flow"].get("cash_flow", [])), hide_index=True, width="stretch")
         if f.get("shareholdings"):
-            st.markdown("**Shareholding**"); st.dataframe(pd.DataFrame(f["shareholdings"]), hide_index=True, use_container_width=True)
+            st.markdown("**Shareholding**"); st.dataframe(pd.DataFrame(f["shareholdings"]), hide_index=True, width="stretch")
         if f.get("corporate_actions"):
             with st.expander("Corporate Actions"):
-                st.dataframe(pd.DataFrame(f["corporate_actions"]), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(f["corporate_actions"]), hide_index=True, width="stretch")
         if f.get("competitors"):
             with st.expander("Competitors"):
-                st.dataframe(pd.DataFrame(f["competitors"]), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(f["competitors"]), hide_index=True, width="stretch")
     else:
         # Fallback is still shown as clean cards, never raw JSON.
         labels=[("longName","Company"),("sector","Sector"),("industry","Industry"),("marketCap","Market Cap"),("trailingPE","P/E"),("forwardPE","Forward P/E"),("priceToBook","P/B"),("returnOnEquity","ROE"),("profitMargins","Profit Margin"),("revenueGrowth","Revenue Growth"),("earningsGrowth","Earnings Growth"),("debtToEquity","Debt/Equity")]
@@ -2061,19 +2061,19 @@ def _render_market_structure_smc(ms_list, smc):
     with fcol:
         st.markdown("**📌 Fair Value Gaps (FVG)**")
         if fvg_rows:
-            st.dataframe(pd.DataFrame(fvg_rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(fvg_rows), hide_index=True, width="stretch")
         else:
             st.caption("None detected.")
     with ocol:
         st.markdown("**🧱 Order Blocks (OB)**")
         if ob_rows:
-            st.dataframe(pd.DataFrame(ob_rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(ob_rows), hide_index=True, width="stretch")
         else:
             st.caption("None detected.")
     with lcol:
         st.markdown("**🌊 Liquidity Sweeps**")
         if sweep_rows:
-            st.dataframe(pd.DataFrame(sweep_rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(sweep_rows), hide_index=True, width="stretch")
         else:
             st.caption("None detected.")
 
@@ -2088,7 +2088,7 @@ def _render_liquidity_levels(liq):
     print raw source code / internal docs instead of the table."""
     levels = (liq or {}).get("levels") or []
     if levels:
-        st.dataframe(pd.DataFrame(levels[:12]), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(levels[:12]), hide_index=True, width="stretch")
     else:
         st.info("No liquidity levels available.")
 
@@ -2101,7 +2101,7 @@ def _render_mtf_table(mtf):
                 rows.append({"Timeframe": tf, "Status": v.get("status"), "Trend": v.get("trend", "N/A"),
                              "Structure": v.get("structure", v.get("close", "N/A")), "Bars": v.get("bars", "N/A")})
     if rows:
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     else:
         st.caption("Multi-timeframe structure unavailable.")
 
@@ -2127,7 +2127,7 @@ def _render_macro_table(macro):
         else:
             rows.append({"Instrument": label, "Last": "N/A", "Change %": "N/A", "Source": "Unavailable"})
     if rows:
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     else:
         st.info("Macro context unavailable.")
 
@@ -2144,7 +2144,7 @@ def _render_commodity_fundamentals(f):
     if factors:
         st.markdown("**Factor monitor**")
         rows = [{"Factor": str(k).replace("_", " ").title(), "Status": v} for k, v in factors.items()]
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     sources = f.get("sources", [])
     if sources:
         st.caption("Sources: " + ", ".join(str(s) for s in sources))
@@ -2249,7 +2249,7 @@ def _render_stock_dashboard(symbol):
             "Trend": sa["trend"], "Momentum": sa["momentum"], "MTF Alignment": mtf.get("alignment"),
             "Order-book": q.get("pressure", "N/A"), "OBI %": q.get("imbalance_pct"),
             "Sector": sa.get("sector"), "Sector Change %": sa.get("sector_context", {}).get("change_pct"),
-        }]), hide_index=True, use_container_width=True)
+        }]), hide_index=True, width="stretch")
 
     with tabs[1]:
         tc = sa.get("technical_context", {})
@@ -2307,13 +2307,13 @@ def _render_stock_dashboard(symbol):
         oc = sa.get("option_chain", {})
         if oc.get("status") == "AVAILABLE":
             st.caption(f"Source: {oc.get('source')} · Expiry: {oc.get('expiry')}")
-            st.dataframe(pd.DataFrame(oc.get("rows", [])), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(oc.get("rows", [])), hide_index=True, width="stretch")
         else:
             st.info(oc.get("reason", "No live option chain for this stock — most NSE equities have no listed F&O, "
                                      "so this is honestly shown as unavailable rather than borrowed from Nifty's option chain."))
         q = sa.get("quote", {})
         st.markdown("#### Live order-book snapshot (this stock's own depth — its Order Flow / Institutional Flow input)")
-        st.dataframe(pd.DataFrame([q]), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame([q]), hide_index=True, width="stretch")
 
     with tabs[4]:
         st.markdown("**Position Sizing Calculator**")
@@ -2366,7 +2366,7 @@ def _render_stock_dashboard(symbol):
         st.dataframe(pd.DataFrame([{
             "Sector": sa.get("sector"), "Sector Change %": sa.get("sector_context", {}).get("change_pct"),
             "NIFTY Change %": sa.get("nifty_context", {}).get("nifty_change_pct")
-        }]), hide_index=True, use_container_width=True)
+        }]), hide_index=True, width="stretch")
         st.markdown("#### NIFTY 50 news")
         _render_stock_news(sa.get("nifty_news", []))
         st.markdown("#### NIFTY 50 fundamentals (constituent aggregate)")
