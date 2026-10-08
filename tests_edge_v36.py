@@ -258,7 +258,7 @@ class DecisionTests(DbCase):
 
     def test_session_window_blocks_open_noise_and_late_entries(self):
         self.assertFalse(_decide(now=dtime(9, 16))["has_setup"])
-        late = _decide(now=dtime(15, 5))
+        late = _decide(now=dtime(15, 12))   # entry window now runs to 15:10 (was 14:45)
         self.assertFalse(late["has_setup"]); self.assertIn("entry window", late["reason"])
 
     def test_strong_opposite_global_research_vetoes(self):

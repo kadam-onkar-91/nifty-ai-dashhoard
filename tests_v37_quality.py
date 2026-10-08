@@ -144,3 +144,16 @@ class WinFloorValve(unittest.TestCase):
 
     def test_weekend_does_not_count_as_drought(self):
         self.assertEqual(self._floor("2026-10-09 14:00:00", datetime(2026, 10, 12, 10, 0))[0], 0.35)   # Fri -> Mon
+
+
+class LateSessionWindow(unittest.TestCase):
+    def test_entries_allowed_after_1445_until_1510(self):
+        import ai_trade_decision as atd
+        self.assertEqual(atd.NO_ENTRY_AFTER.hour, 15); self.assertEqual(atd.NO_ENTRY_AFTER.minute, 10)
+        d = atd.generate_trade_decision(22210.0, {}, 17.0, signal_code=-1, now_ist=datetime(2026, 10, 8, 14, 55), dashboard_context={}, strategy_result={"has_setup": True, "score": 95, "direction": "SELL", "selected_strategies": ["x"]})
+        self.assertNotIn("Outside the entry window", d["reason"])
+
+    def test_still_blocked_after_1510(self):
+        import ai_trade_decision as atd
+        d = atd.generate_trade_decision(22210.0, {}, 17.0, signal_code=-1, now_ist=datetime(2026, 10, 8, 15, 12), dashboard_context={}, strategy_result={"has_setup": True, "score": 95, "direction": "SELL", "selected_strategies": ["x"]})
+        self.assertIn("Outside the entry window", d["reason"])

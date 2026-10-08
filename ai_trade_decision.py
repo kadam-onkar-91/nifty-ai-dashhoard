@@ -56,7 +56,8 @@ FLOOR_RELAXED_PROB = 0.31            # without a logged setup the win-chance flo
 DROUGHT_RELIEF_MIN_PROB = 0.40  # the dry-spell relief may only ease the EV bar for setups that are at least this likely to win
 ENFORCE_SESSION_WINDOW = True
 NO_ENTRY_BEFORE = dtime(9, 25)  # first 10 min: opening auction noise / wide spreads
-NO_ENTRY_AFTER = dtime(14, 45)  # later entries cannot play out before the 15:20 square-off
+NO_ENTRY_AFTER = dtime(15, 10)  # entries allowed until the market's last minutes; the tool auto-closes open trades at 15:20
+                                # (trade_learning.EOD_SQUAREOFF), so nothing opened after 15:10 could do anything.  Was 14:45.
 
 
 def _round_to_strike(price, step=50):
@@ -1350,7 +1351,14 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     # A wall 140 pts away with a 20 pt stop is a "7R" target that almost never fills inside the
     # 2-hour holding window and silently inflates the reward:risk.  Cap it at a realistic distance.
     try:
-        _bars = max(1.0, float(trade_learning.MAX_HOLD_MINUTES) / 5.0)
+        # late in the session there is less time before the 15:20 auto-close: scale the realistic target reach to the minutes left
+        try:
+            _eod = datetime.combine(_now.date(), trade_learning.EOD_SQUAREOFF)
+            _mins_left = (_eod - _now.replace(tzinfo=None)).total_seconds() / 60.0
+        except Exception:
+            _mins_left = float(trade_learning.MAX_HOLD_MINUTES)
+        _hold_min = max(10.0, min(float(trade_learning.MAX_HOLD_MINUTES), _mins_left))
+        _bars = max(1.0, _hold_min / 5.0)
         _reach = TARGET_REACH_ATR * float(atr) * math.sqrt(_bars) if atr else None
     except Exception:
         _reach = None
