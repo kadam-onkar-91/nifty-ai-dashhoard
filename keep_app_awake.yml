@@ -1,0 +1,40 @@
+name: keep dashboard open in market hours
+
+# Opens your Streamlit app in a headless browser (the "robot tab") so research / shadow trades / learning / trades keep running
+# even when YOUR phone is off.  Setup steps: see KEEPER_SETUP.md
+on:
+  schedule:
+    - cron: "30 3 * * 1-5"    # 09:00 IST  -> morning run, stays until 14:55 IST
+    - cron: "20 9 * * 1-5"    # 14:50 IST  -> afternoon run, waits for the morning run to finish, stays until 15:35 IST
+  workflow_dispatch:           # "Run workflow" button for a manual test
+
+concurrency:
+  group: market-keeper
+  cancel-in-progress: false    # the afternoon run QUEUES behind the morning run (no two tabs at once)
+
+jobs:
+  keep-open:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install headless Chrome
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: keep the app open until the market closes
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+          SKIP_DATES: ${{ vars.SKIP_DATES }}
+        run: python keep_open.py
+      - name: last screenshot (to see what the robot saw)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keeper-last-screenshot
+          path: keeper_last.png
+          if-no-files-found: ignore
+          retention-days: 1
