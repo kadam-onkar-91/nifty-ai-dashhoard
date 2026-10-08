@@ -19,6 +19,7 @@ import safe_io
 import entry_quality
 import pcr_velocity
 import shadow_trades
+import trade_diagnostics
 import index_correlation
 import ml_engine
 import support_resistance
@@ -1491,6 +1492,12 @@ def _live_dashboard():
                     st.caption("🎯 " + str(_decision['target_note']))
                 if _decision.get('learning_note'):
                     st.caption("🧠 Learned from past trades: " + str(_decision['learning_note']))
+                if (_decision.get('oi_buildup') or {}).get('available'):
+                    st.caption(("⚠️ " if _decision['oi_buildup'].get('against') else "✅ ") + "OI flow: " + str(_decision['oi_buildup'].get('label')))
+                if _decision.get('repeat_mistake_note'):
+                    st.caption("🔁 " + str(_decision['repeat_mistake_note']))
+                if (_decision.get('event_risk') or {}).get('level') == 'CAUTION':
+                    st.caption("📅 Event caution: " + str(_decision['event_risk'].get('reason')))
                 if _decision.get('probe'):
                     st.warning("🧪 " + str(_decision.get('probe_note')))
                 _sr = _decision.get('strategy_engine') or {}
@@ -1559,6 +1566,17 @@ def _live_dashboard():
                                f"({_track['sample_incl_expired']} trades)")
                 if _track['expired'] > 0:
                     st.caption(f"({_track['expired']} setups time-expired — na clean win, na clean loss)")
+
+            try:
+                _lrs = trade_diagnostics.loss_reason_summary(trade_learning._labelled_rows_full())
+            except Exception:
+                _lrs = []
+            if _lrs:
+                st.markdown("**Haar ke kaaran (real trades jo haare, kaunsi condition sabse zyada thi):**")
+                st.dataframe(pd.DataFrame([{"Kaaran": r["reason"], "Haare": r["losses"], "Is condition wale trades": r["trades_with_tag"],
+                                            "Win %": r["win_rate"]} for r in _lrs[:8]]), width="stretch", hide_index=True)
+                st.caption("Jis condition ka win % kam hai aur kaafi trades ho chuke hain, engine agle trade me usko khud penalty deta hai "
+                           "(repeat-mistake check). Kam data pe kuch nahi karta.")
 
             st.markdown("**Recent AI Setups (kab liya tha, real log):**")
             _recent_setups = trade_learning.get_recent_setups(limit=20)

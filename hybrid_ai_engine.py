@@ -77,7 +77,13 @@ class HybridAIEngine:
         # Option Chain PCR Confluence
         avg_pcr = 1.0
         if df_option_chain is not None and not df_option_chain.empty and 'PCR' in df_option_chain.columns:
-            try: avg_pcr = float(df_option_chain['PCR'].mean())
+            try:
+                # Standard PCR = total Put OI / total Call OI. The old plain mean of the per-strike PCR column was blown up by
+                # strikes with near-zero Call OI (reports showed PCR ~797) and always pushed the score bullish.
+                if {'Put OI', 'Call OI'}.issubset(df_option_chain.columns) and float(df_option_chain['Call OI'].sum()) > 0:
+                    avg_pcr = float(df_option_chain['Put OI'].sum()) / float(df_option_chain['Call OI'].sum())
+                else:
+                    avg_pcr = float(df_option_chain['PCR'].median())
             except Exception:
                         logger.exception("Could not parse PCR; using neutral fallback")
                         avg_pcr = 1.0

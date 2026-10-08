@@ -28,6 +28,10 @@ EMA_SEVERE_ATR = 3.0
 IMPULSE_ATR = 2.0         # last completed candle at least this many ATR long, in the trade direction
 RUN_ATR_6 = 3.0           # price already moved this many ATR in the trade direction over the last 6 candles
 STREAK_CANDLES = 4        # same-colour closed candles in a row
+DAY_MOVE_PCT = 1.0        # the day has ALREADY moved this % (from yesterday's close) in the trade direction
+DAY_MOVE_SEVERE_PCT = 1.4 # ... this much AND price sits at the day's low/high = chasing the very end of the move
+DAY_POS_EXTREME = 0.12    # 0 = exactly at the day's low (SELL) / high (BUY); within this fraction of the day's range = "at the extreme"
+SHOCK_ATR = 3.0           # a closed candle in the last 3 this many ATR long = news/volatility shock: wait until it settles
 
 
 def _f(x, default=None):
@@ -94,6 +98,40 @@ def assess_entry(df, direction, atr=None):
             m["run_6c_atr"] = round(run, 2)
             if run >= RUN_ATR_6:
                 flags.append(f"price already moved {run:.1f} ATR in the trade direction over the last 30 min")
+
+        # 6) how much of the DAY's move is already done (e.g. SELL after -1.7% right at the day low = chasing the end)
+        try:
+            idx = df.index
+            if hasattr(idx, "date"):
+                days = list(idx.date)
+                today = days[-1]
+                is_today = [d == today for d in days]
+                dday = df[is_today]
+                prev = df[[not x for x in is_today]]
+                if len(dday) >= 3:
+                    hi, lo = _f(dday["High"].max()), _f(dday["Low"].min())
+                    ref = _f(prev["Close"].iloc[-1]) if len(prev) else _f(dday["Open"].iloc[0])
+                    if ref and hi is not None and lo is not None and hi > lo:
+                        move_pct = sign * (live - ref) / ref * 100.0
+                        pos = ((hi - live) if buy else (live - lo)) / (hi - lo)
+                        m["day_move_pct"] = round(move_pct, 2)
+                        m["day_pos"] = round(max(0.0, min(1.0, pos)), 2)
+                        word = "rally" if buy else "fall"
+                        if move_pct >= DAY_MOVE_SEVERE_PCT and pos <= DAY_POS_EXTREME:
+                            flags.append(f"the day's {word} is already {move_pct:.1f}% and price is at the day's {'high' if buy else 'low'} (chasing the end of the move)")
+                            severe = True
+                        elif move_pct >= DAY_MOVE_PCT:
+                            flags.append(f"the day's {word} is already {move_pct:.1f}% (late in the move)")
+        except Exception:
+            pass
+        # 7) volatility shock: a huge candle in the last 3 closed ones (news / stop-run) -> let it settle first
+        try:
+            rngs = [(float(r["High"]) - float(r["Low"])) / a for _, r in closed.iloc[-3:].iterrows()]
+            m["max_recent_candle_atr"] = round(max(rngs), 2) if rngs else None
+            if rngs and max(rngs) >= SHOCK_ATR:
+                flags.append(f"volatility shock in the last 15 min (a candle {max(rngs):.1f} ATR long) - wait for it to settle")
+        except Exception:
+            pass
 
         # 5) streak of same-colour candles
         streak = 0

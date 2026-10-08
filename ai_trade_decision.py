@@ -16,6 +16,9 @@ logger = get_logger(__name__)
 
 import trade_learning
 import edge_model
+import event_calendar
+import oi_buildup
+import trade_diagnostics
 import strategy_engine
 import gemini_pool
 import json
@@ -44,6 +47,13 @@ OI_FRONT_RUN_ATR = 0.25
 TARGET_REACH_ATR = 0.7         # realistic reach inside the holding window = this x ATR x sqrt(hold bars)
 OI_MIN_RR = 1.2                 # wall closer than this many R -> not a usable target (soft penalty, no new gate)
 MAX_TARGET_R = 2.2              # cap for wall/structure targets; the ATR fallback stays at 1.5R
+MIN_WIN_PROB = 0.35             # HARD floor on the calibrated win probability.  A trade the engine itself rates at ~31% (it loses
+                                # 2 of 3) can still show a hair of positive EV at 2.2R and, with the dry-spell relief, used to slip through.
+                                # Shadow trades now supply learning data, so the engine no longer needs low-quality trades to learn.
+ROUND_TRIP_COST_PTS = 2.0       # bid-ask spread + brokerage/STT, as underlying points per trade.  Charged against EV: a setup must beat its costs.
+FLOOR_RELAX_AFTER_TRADING_DAYS = 2   # safety valve against the old "no trade for days" problem: after this many trading days
+FLOOR_RELAXED_PROB = 0.31            # without a logged setup the win-chance floor eases to this (never lower)
+DROUGHT_RELIEF_MIN_PROB = 0.40  # the dry-spell relief may only ease the EV bar for setups that are at least this likely to win
 ENFORCE_SESSION_WINDOW = True
 NO_ENTRY_BEFORE = dtime(9, 25)  # first 10 min: opening auction noise / wide spreads
 NO_ENTRY_AFTER = dtime(14, 45)  # later entries cannot play out before the 15:20 square-off
@@ -477,6 +487,8 @@ _GATE_PATTERNS = (
     ("No strategy formed", "No named strategy"),
     ("Strategy vs AI direction mismatch", "AI research is"),
     ("Stale data", "STALE/FROZEN"),
+    ("Event risk window", "Event risk window"),
+    ("Win-chance floor", "below the minimum"),
     ("Outside entry window", "entry window"),
     ("Cooldown / pause", "Cooldown"),
     ("Same setup already traded", "Same setup already traded"),
@@ -586,6 +598,24 @@ def apply_gemini_verdict(decision, review, now=None):
     d["has_setup"] = False
     d["reason"] = "Final review did not approve this strategy+AI setup: " + str(r.get("reason") or "REJECT/UNAVAILABLE")
     return d
+
+
+def _win_floor(now):
+    """(floor, note).  Normal floor MIN_WIN_PROB; if the engine has logged NO setup for FLOOR_RELAX_AFTER_TRADING_DAYS trading days
+    the floor eases to FLOOR_RELAXED_PROB so the new quality gates can never silently freeze it again.  Shadow trades keep learning
+    either way."""
+    try:
+        rows = trade_learning.get_recent_setups(limit=1)
+        if not rows:
+            return FLOOR_RELAXED_PROB, "no setup logged yet -> floor eased"
+        last = datetime.strptime(str(rows[0].get("timestamp"))[:10], "%Y-%m-%d").date()
+        import numpy as _np
+        gap = int(_np.busday_count(last, now.date()))
+        if gap >= FLOOR_RELAX_AFTER_TRADING_DAYS:
+            return FLOOR_RELAXED_PROB, f"no setup for {gap} trading days -> floor eased to {100 * FLOOR_RELAXED_PROB:.0f}%"
+    except Exception:
+        pass
+    return MIN_WIN_PROB, ""
 
 
 def _is_drought(now):
@@ -754,6 +784,13 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         return {"has_setup": False,
                 "reason": (f"Outside the entry window ({NO_ENTRY_BEFORE.strftime('%H:%M')}-{NO_ENTRY_AFTER.strftime('%H:%M')} IST): "
                            "the first minutes are opening noise and late entries cannot play out before the end-of-day square-off."),
+                "context_audit": context_audit}
+
+    # EVENT RISK: scheduled news (RBI / Fed reaction / Budget ...) moves price on news, not on the levels this engine reads.
+    _event = event_calendar.event_risk(_now)
+    if _event.get("level") == "BLOCK":
+        return {"has_setup": False,
+                "reason": f"Event risk window: {_event.get('reason')}. No NEW entries until the news has been absorbed (edit event_calendar.py to change).",
                 "context_audit": context_audit}
 
     # Context completeness is audit information, not a trade gate. Missing
@@ -1379,6 +1416,15 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     factor_flags["pcr_velocity_aligned"] = (_pvb == direction)
     if _pvb in ("BUY", "SELL") and _pvb != direction:
         _penalty += 0.10
+    # OI BUILDUP: is fresh writer money behind this move, or is the move being absorbed?  (option-chain OI change vs yesterday)
+    _eqm = (_eq or {}).get("metrics", {}) if _eq else {}
+    _dm = _eqm.get("day_move_pct")
+    _signed_move = (float(_dm) * (1.0 if direction == "BUY" else -1.0)) if _dm is not None else None
+    _oib = oi_buildup.assess(raw_option_chain, live_price, direction, _signed_move)
+    _penalty += float(_oib.get("penalty_logit", 0.0))
+    # EVENT CAUTION (scheduled news earlier today / yesterday night)
+    if _event.get("level") == "CAUTION":
+        _penalty += float(_event.get("penalty_logit", 0.0))
     factors_true = sum(1 for v in factor_flags.values() if v)
     factors_total = len(factor_flags)
     if strategy_path:                                      # a strong named-strategy score is evidence, a weak one is not
@@ -1389,6 +1435,9 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
               "streak": (_eq or {}).get("metrics", {}).get("streak"), "atr": float(atr) if atr else None, "rr": round(rr, 3),
               "hour": _now.hour + _now.minute / 60.0, "vix": live_vix, "pcr_per15": _pv.get("per15"),
               "strategy_score": _sscore if strategy_path else None, "is_buy": 1.0 if direction == "BUY" else 0.0}
+    _feats.update({"day_move_pct": _eqm.get("day_move_pct"), "day_pos": _eqm.get("day_pos"),
+                   "oi_flow": float(_oib.get("flow", 0)), "expiry_day": 1.0 if _event.get("expiry_day") else 0.0,
+                   "event_caution": 1.0 if _event.get("level") == "CAUTION" else 0.0})
     _feats = {k: (round(float(v), 3) if isinstance(v, (int, float)) and v == v else None) for k, v in _feats.items()}
     try:
         _adj = trade_learning.learned_adjustment(factor_flags, _feats)
@@ -1396,6 +1445,14 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         logger.exception("learned adjustment failed (ignored)")
         _adj = {"delta_logit": 0.0, "note": "", "nn": {}, "memory": {}}
     _penalty -= float(_adj.get("delta_logit", 0.0))
+    # REPEAT-MISTAKE CHECK: tags (extended entry, late session, huge day move ...) that have already lost often -> small penalty
+    _tags = trade_diagnostics.risk_tags(factor_flags, _feats, hour=_now.hour + _now.minute / 60.0)
+    try:
+        _tag_pen, _tag_note = trade_diagnostics.tag_penalty(_tags, trade_learning._labelled_rows_full())
+    except Exception:
+        logger.exception("tag penalty failed (ignored)")
+        _tag_pen, _tag_note = 0.0, ""
+    _penalty += _tag_pen
     edge = trade_learning.compute_edge(factor_flags, rr, _penalty)
     edge["learning_note"] = _adj.get("note", "")
     confidence_pct = edge["confidence_pct"]
@@ -1409,9 +1466,15 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     if _form.get("bad"):
         _min_ev += BAD_FORM_EV_EXTRA
         _bar_notes.append(f"recent form {_form.get('wins')}/{_form.get('n')} -> bar +{BAD_FORM_EV_EXTRA:.2f}R")
-    if _is_drought(_now):
+    if _is_drought(_now) and float(edge.get("win_probability") or 0.0) >= DROUGHT_RELIEF_MIN_PROB:
         _min_ev = max(0.0, _min_ev - DROUGHT_EV_RELIEF)
         _bar_notes.append(f"dry spell -> bar -{DROUGHT_EV_RELIEF:.2f}R")
+    try:
+        _cost_r = ROUND_TRIP_COST_PTS / max(abs(float(underlying_entry) - float(stop_loss)), 1e-9)
+        _min_ev += _cost_r
+        _bar_notes.append(f"trading costs ~{ROUND_TRIP_COST_PTS:.0f} pts -> bar +{_cost_r:.2f}R")
+    except Exception:
+        pass
     edge["required_ev_r"] = round(_min_ev, 3)
     edge["bar_notes"] = _bar_notes
     edge["required_probability"] = round(edge_model.required_probability(rr, _min_ev), 4)
@@ -1427,6 +1490,19 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
                 "learning_note": edge.get("learning_note", ""),
                 "candidate": {"direction": direction, "underlying_entry": underlying_entry, "stop_loss": stop_loss, "target": target,
                               "risk_reward": round(rr, 2), "factor_flags": dict(factor_flags, _features=_feats)}}
+
+    _wp = float(edge.get("win_probability") or 0.0)
+    _floor, _floor_note = _win_floor(_now)
+    if _wp < _floor:
+        return {"has_setup": False,
+                "reason": (f"Win-chance floor: the engine's own win probability for this setup is {100 * _wp:.1f}%, below the minimum "
+                           f"{100 * _floor:.0f}%{(' (' + _floor_note + ')') if _floor_note else ''}. Even with a positive-looking R:R it would lose about {100 * (1 - _wp):.0f} of 100 times. "
+                           "Waiting for a better setup (this setup is still tracked as a shadow trade to learn from)."),
+                "context_audit": context_audit, "expectancy_r": edge["expectancy_r"], "confidence_pct": confidence_pct,
+                "factors_true": factors_true, "factors_total": factors_total, "factor_flags": factor_flags,
+                "learning_note": edge.get("learning_note", ""),
+                "candidate": {"direction": direction, "underlying_entry": underlying_entry, "stop_loss": stop_loss, "target": target,
+                              "risk_reward": round(rr, 2), "factor_flags": dict(factor_flags, _features=dict(_feats, win_prob=round(_wp, 3)))}}
 
     # Self-learning segment gate: pause a playbook / grade / hour / side that has PROVEN to lose
     # (this existed in trade_learning.py but was never called, and no trade ever stored the meta it needs).
@@ -1456,7 +1532,14 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     factor_flags["_setup_score"] = round(_sscore, 1)
     factor_flags["_reasons"] = list(lp.get("factors", []))[:3]
     factor_flags["_edge"] = {"p": edge["win_probability"], "ev_r": edge["expectancy_r"], "rr": round(rr, 2)}
+    _feats["win_prob"] = round(_wp, 3)
     factor_flags["_features"] = _feats
+    factor_flags["_risk_tags"] = trade_diagnostics.risk_tags(factor_flags, _feats, hour=_now.hour + _now.minute / 60.0)
+    factor_flags["_oi_buildup"] = _oib.get("label")
+    if _tag_note:
+        factor_flags["_repeat_mistake_note"] = _tag_note
+    if _event.get("level") != "NONE":
+        factor_flags["_event_note"] = _event.get("reason")
     if edge.get("learning_note"):
         factor_flags["_learning_note"] = edge["learning_note"]
     if oi_wall_note:
@@ -1493,6 +1576,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         "ai_research_source": ai_research_source,
         "target_note": oi_wall_note, "learning_note": edge.get("learning_note", ""),
         "entry_quality": _eq, "pcr_velocity": _pv or None,
+        "oi_buildup": _oib, "event_risk": _event, "risk_tags": factor_flags.get("_risk_tags"), "repeat_mistake_note": _tag_note,
         "expectancy_r": edge["expectancy_r"], "win_probability": edge["win_probability"],
         "breakeven_probability": edge["breakeven_probability"], "required_ev_r": edge["required_ev_r"],
         "edge": edge,

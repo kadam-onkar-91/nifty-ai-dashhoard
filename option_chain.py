@@ -325,10 +325,12 @@ def generate_option_chain_data(current_price=None):
                     call_market = call_options.get('market_data', {})
                     call_greeks = call_options.get('option_greeks', {})
                     call_oi = call_market.get('oi', 0)
+                    call_prev_oi = call_market.get('prev_oi', 0) or 0   # yesterday's closing OI (used by oi_buildup.py)
 
                     put_options = item.get('put_options', {})
                     put_market = put_options.get('market_data', {})
                     put_oi = put_market.get('oi', 0)
+                    put_prev_oi = put_market.get('prev_oi', 0) or 0
 
                     if abs(strike - spot) < 30:
                         opt_type = "ATM"
@@ -345,6 +347,8 @@ def generate_option_chain_data(current_price=None):
                         "Call OI": call_oi,
                         "Vega": call_greeks.get('vega', 0.0),
                         "Put OI": put_oi,
+                        "Call Prev OI": call_prev_oi,
+                        "Put Prev OI": put_prev_oi,
                         "IV (%)": call_greeks.get('iv', 0.0),
                         "Delta": call_greeks.get('delta', 0.0),
                         "Theta": call_greeks.get('theta', 0.0),
