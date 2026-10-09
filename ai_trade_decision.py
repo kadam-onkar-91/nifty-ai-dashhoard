@@ -558,6 +558,32 @@ def review_job_forget(sig):
         _REVIEW_JOBS.pop(sig, None)
 
 
+def _no_strategy_detail(sr):
+    """One short, factual sentence on why no named strategy qualified -- shown under the main message and stored in the gate log.
+    Pure explanation: it never changes whether a trade is taken."""
+    try:
+        sr = sr or {}
+        src = str(sr.get("market_data_source") or "")
+        if sr.get("status") == "INSUFFICIENT_DATA":
+            return " [Detail: strategy layer ko abhi kaafi candles nahi mile (80 se kam).]"
+        if src and src != "UPSTOX_LIVE" and sr.get("live_upstox") is False:
+            return (f" [Detail: price data source = {src}, Upstox LIVE feed nahi. Is wajah se koi strategy trade nahi banati -- "
+                    f"Upstox login (roz subah ~3:30 AM ke baad naya) check karo.]")
+        ranked = sr.get("ranked_active") or []
+        n_buy, n_sell = int(sr.get("buy_live_count", 0) or 0), int(sr.get("sell_live_count", 0) or 0)
+        blocked = [r for r in ranked if not r.get("live_valid", True)]
+        bits = [f"live strategies: BUY {n_buy} / SELL {n_sell}"]
+        if blocked:
+            note = str(blocked[0].get("live_note") or "").split(" - ")[0][:90]
+            bits.append(f"{len(blocked)} ko live price action ne roka ({note})")
+        if not ranked:
+            bits.append("abhi koi strategy signal active hi nahi (6-candle window me)")
+        bits.append(f"best score BUY {sr.get('buy_score', 0)} / SELL {sr.get('sell_score', 0)} (min {strategy_engine.MIN_ENTRY_SCORE:.0f})")
+        return " [Detail: " + "; ".join(bits) + ".]"
+    except Exception:
+        return ""
+
+
 def classify_block(reason):
     """Name of the gate that stopped a setup, for the 'which gate blocks most' diagnostics."""
     t = str(reason or "")
@@ -752,7 +778,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
 
     if not strategy_path:
         return {"has_setup": False,
-                "reason": "No named strategy is currently formed strongly enough. AI research continues, but it cannot open an entry by itself.",
+                "reason": "No named strategy is currently formed strongly enough. AI research continues, but it cannot open an entry by itself." + _no_strategy_detail(strategy_result),
                 "context_audit": context_audit, "strategy_required": True}
 
     if ai_research_dir == 0:

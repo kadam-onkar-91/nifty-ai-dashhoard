@@ -19,6 +19,7 @@ import safe_io
 import entry_quality
 import pcr_velocity
 import shadow_trades
+import gate_log
 import trade_diagnostics
 import index_correlation
 import ml_engine
@@ -1470,6 +1471,15 @@ def _live_dashboard():
                     st.session_state['_gate_last_bucket'] = _bk
             except Exception:
                 pass
+            # v41: the same fact, written to disk, so the morning is still visible at noon (session_state is wiped on every reload)
+            try:
+                gate_log.record(df.index[-1], live_price, _gkey, reason=_decision.get('reason') or '',
+                                direction=(_decision.get('direction') or (strategy_result or {}).get('direction') or ''),
+                                source=str(getattr(df, 'attrs', {}).get('market_source', '')),
+                                detail=f"buy={(strategy_result or {}).get('buy_score')} sell={(strategy_result or {}).get('sell_score')} "
+                                       f"live={((strategy_result or {}).get('live_state') or {}).get('score')}")
+            except Exception:
+                logger.exception('gate_log write failed (ignored)')
             if not _decision['has_setup']:
                 st.info(f"⏳ **Abhi koi genuine setup nahi hai.** {_decision['reason']}")
             else:
@@ -1550,6 +1560,37 @@ def _live_dashboard():
                 st.caption("Agar ek hi gate bahut zyada rok raha hai (Gemini ke alawa), wahi tune karne ki jagah hai.")
             else:
                 st.caption("Abhi data nahi -- thodi der chalne do.")
+
+        # v41: persistent timeline of TODAY -- answers "subah itna move hua, engine ne kya kiya / chal bhi raha tha?"
+        with st.expander("📜 Aaj ka engine timeline (disk pe saved -- reload se nahi mitta)", expanded=False):
+            try:
+                _today = str(df.index[-1])[:10]
+                _note = gate_log.coverage_note(_today)
+                _sm = gate_log.summary(_today)
+                try:
+                    _day_df = df[df.index.astype(str).str[:10] == _today]
+                    _day_rng = float(_day_df['High'].max() - _day_df['Low'].min()) if len(_day_df) else 0.0
+                    _day_chg = float(_day_df['Close'].iloc[-1] - _day_df['Open'].iloc[0]) if len(_day_df) else 0.0
+                except Exception:
+                    _day_rng, _day_chg = 0.0, 0.0
+                st.write(f"**Aaj ki range:** {_day_rng:,.0f} pts | **Open se ab tak:** {_day_chg:+,.0f} pts | "
+                         f"**Engine ne dekhi candles:** {len({r['candle'] for r in _sm['rows']})} | **Trade liye:** {_sm['taken']}")
+                if _note:
+                    st.warning("⚠️ " + _note)
+                if _day_rng >= 150 and _sm['taken'] == 0:
+                    st.info("Aaj bada move aaya aur koi trade nahi bana. Neeche dekho har candle pe kaun sa gate tha. Agar upar "
+                            "'engine chal nahi raha tha' likha hai to wahi asli wajah hai (gate nahi).")
+                if _sm['by_gate']:
+                    st.dataframe([{"Gate": k, "Candles": v} for k, v in sorted(_sm['by_gate'].items(), key=lambda kv: -kv[1])],
+                                 hide_index=True, width="stretch")
+                    st.dataframe([{"Candle": r['candle'][11:16], "Price": r['price'], "Gate": r['gate'], "Dir": r['direction'],
+                                   "Detail": (r['detail'] or '')[:60], "Reason": (r['reason'] or '')[:140]}
+                                  for r in _sm['rows'][-60:]][::-1], hide_index=True, width="stretch")
+                else:
+                    st.caption("Aaj ka record abhi khali hai -- engine ka pehla candle record hote hi yahan dikhega.")
+            except Exception:
+                logger.exception('timeline expander failed (ignored)')
+                st.caption("Timeline abhi available nahi.")
 
         with st.expander("📈 Engine ka real track record + factor reliability", expanded=False):
             _track = trade_learning.get_overall_track_record()

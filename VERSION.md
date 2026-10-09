@@ -1,3 +1,15 @@
+# NIFTY AI -- v41: "why no trade?" is now answered from disk (no trading rule changed)
+
+- **Problem:** a big morning move and no trade, but the only evidence was a per-session table that restarts on every page reload (the keeper robot reloads
+  every 30 min), plus a generic "No named strategy..." sentence. It was impossible to tell a gate from "the engine was not even running".
+- **New `gate_log.py`:** every 5-min candle the engine's verdict (gate name, direction, price, strategy scores, reason, data source) is written to a local
+  SQLite file (`gate_log.db`, 14 days, git-ignored). New expander "Aaj ka engine timeline" shows today's range, trades taken, a per-gate count, the last 60
+  candles, and a warning when the engine was not running (late start / holes > 15 min). A big move + zero trades now says which of the two it was.
+- **"No named strategy" now explains itself:** data source if it is not UPSTOX_LIVE, how many live strategies exist, how many the live price action blocked
+  (and the first reason), best BUY/SELL score vs the minimum. Text is only appended, so gate classification is unchanged.
+- No entry/exit/target/gate/learning logic was touched. Tests: `python -m unittest tests_v41_visibility` (8); with the older suites 122 pass.
+  (`tests_level_verdict.py` is a legacy file that already failed before v41: it calls an old API.)
+
 # NIFTY AI -- v40: the engine learns from its mistakes (shadow trades + mistake memory + self-validated neural net)
 
 Goal: stop the "many gates -> no trades -> no learning -> no trades" dead-lock WITHOUT taking more losing real trades, and let the
