@@ -98,6 +98,30 @@ def main() -> int:
         ctx = browser.new_context(viewport={"width": 1366, "height": 900})
         page = ctx.new_page()
 
+        def app_scope():
+            """The frame that really holds the Streamlit app.  On Streamlit Cloud the app lives INSIDE an iframe, so looking only at the
+            outer page finds nothing (that was why the first version kept reloading)."""
+            try:
+                for f in page.frames:
+                    try:
+                        if f.locator('[data-testid="stApp"]').count() > 0:
+                            return f
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return None
+
+        def diag(tag: str) -> None:
+            """What the robot sees, for debugging (also saved as keeper_last.png)."""
+            try:
+                frames = [f.url[:90] for f in page.frames]
+                txt = page.inner_text("body", timeout=5000)[:240].replace("\n", " | ")
+                log(f"diag[{tag}]: title={page.title()!r} frames={frames} text={txt!r}")
+                page.screenshot(path="keeper_last.png")
+            except Exception as exc:
+                log(f"diag failed: {exc}")
+
         def wake_if_asleep() -> bool:
             try:
                 btn = page.get_by_role("button", name=wake_btn)
@@ -114,17 +138,22 @@ def main() -> int:
             page.goto(url, wait_until="domcontentloaded", timeout=180000)
             page.wait_for_timeout(8000)
             wake_if_asleep()
-            try:
-                page.wait_for_selector('[data-testid="stApp"]', timeout=120000)
-            except Exception:
-                log("Streamlit container not visible yet (app may still be starting).")
+            deadline = time.time() + 150
+            while time.time() < deadline:
+                if app_scope() is not None:
+                    return
+                wake_if_asleep()
+                page.wait_for_timeout(3000)
+            log("Streamlit app not visible yet (app may still be starting).")
+            diag("open")
 
         def healthy():
             """-> (ok, note).  ok=False when the page is broken OR the dashboard's own IST clock stopped moving (engine not cycling)."""
             try:
-                if page.locator('[data-testid="stApp"]').count() == 0:
+                scope = app_scope()
+                if scope is None:
                     return False, "no Streamlit page"
-                body = page.inner_text("body", timeout=15000)
+                body = scope.locator("body").inner_text(timeout=15000)
                 if any(t in body for t in bad_text):
                     return False, "error/disconnected text on page"
                 lag = parse_heartbeat(body, ist_now())
@@ -157,6 +186,10 @@ def main() -> int:
                 ok, note = healthy()
                 if not ok:
                     fails += 1
+                    if fails == 1:
+                        log(f"Page not healthy (#1): {note} -> checking again in a minute.")
+                        diag("unhealthy")
+                        continue
                     log(f"Page not healthy (#{fails}): {note} -> reloading.")
                     open_app(); last_reload = time.time()
                     continue
