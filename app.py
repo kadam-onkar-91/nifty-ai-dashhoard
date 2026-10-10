@@ -46,6 +46,7 @@ import global_research
 from hybrid_ai_engine import HybridAIEngine
 from alert_manager import AlertManager
 from ai_chat import render_ai_chat
+import ui_theme
 
 # Page Configuration
 st.set_page_config(page_title="Nifty 50 Real-Time AI Predictor", page_icon="⚡", layout="wide")
@@ -126,8 +127,8 @@ trade_learning.configure_supabase(
     st.secrets.get("SUPABASE_KEY", None)
 )
 
-st.title("⚡ Nifty 50 Institutional AI Trading Dashboard (Pro Edition)")
-st.markdown("---")
+ui_theme.inject_theme()   # premium dark-glass look + animations
+ui_theme.render_hero()    # animated hero banner (presentation only)
 
 # -------------------------------------------------------------
 # 🔎 SELECT YOUR STOCK -- primary sidebar entry point (works the moment
