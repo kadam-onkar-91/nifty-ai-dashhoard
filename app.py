@@ -47,6 +47,7 @@ from hybrid_ai_engine import HybridAIEngine
 from alert_manager import AlertManager
 from ai_chat import render_ai_chat
 import ui_theme
+import live_chart
 
 # Page Configuration
 st.set_page_config(page_title="Nifty 50 Real-Time AI Predictor", page_icon="⚡", layout="wide")
@@ -174,7 +175,16 @@ ACTIVE_SYMBOL = st.session_state.get("active_symbol") or None
 # fragment (see bottom of file) means it now only re-renders when you
 # actually interact with it -- never on the 30s timer.
 # -------------------------------------------------------------
-@st.fragment(run_every=30)
+# Adaptive refresh: 30s while NSE is open/pre-open (live data matters); 180s when closed,
+# because nothing changes then and every refresh re-runs the whole heavy pipeline (~10-20s).
+try:
+    _REFRESH_IS_LIVE = market_status.get_market_status()["state"] in ("OPEN", "PRE_OPEN")
+except Exception:
+    _REFRESH_IS_LIVE = True
+_REFRESH_SEC = 30 if _REFRESH_IS_LIVE else 180
+
+
+@st.fragment(run_every=_REFRESH_SEC)
 def _live_dashboard():
     # Shows which step is running right now (so a slow data source is visible instead of a silent spinner) and,
     # once loaded, the slowest steps of this refresh.
@@ -200,6 +210,9 @@ def _live_dashboard():
         # see. Purely informational — doesn't change any fetch/score logic.
         # -------------------------------------------------------------
         mkt_status = market_status.get_market_status()
+        # Market just opened/closed since this page was loaded -> re-pick the refresh speed once.
+        if (mkt_status["state"] in ("OPEN", "PRE_OPEN")) != _REFRESH_IS_LIVE:
+            st.rerun()
         last_candle_time = df.index[-1] if len(df.index) > 0 else None
         data_freshness = market_status.check_data_freshness(last_candle_time, mkt_status['state'])
 
@@ -1695,20 +1708,24 @@ def _live_dashboard():
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("📊 Institutional Order Flow Chart (VWAP & Volume Profile)")
 
-        chart_df = df.tail(100)
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=chart_df.index, open=chart_df['Open'], high=chart_df['High'],
-            low=chart_df['Low'], close=chart_df['Close'], name='Nifty 50',
-            increasing_line_color='#26A69A', decreasing_line_color='#EF5350'
-        ))
-        fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA_20'], mode='lines', name='EMA 20', line=dict(color='#2962FF', width=1)))
-        fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['VWAP'], mode='lines', name='VWAP (Smart Money Avg)', line=dict(color='#E040FB', width=2.5, dash='dot')))
-        fig.add_hline(y=df['POC_Level'].iloc[-1], line_width=2, line_dash="solid", line_color="#FFEA00",
-                      annotation_text=f"POC Level (Max Vol): {df['POC_Level'].iloc[-1]:.2f}", annotation_position="top right")
-        fig.update_layout(xaxis_title='Time', yaxis_title='Price (₹)', template='plotly_dark', height=600,
-                           xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
-        st.plotly_chart(fig, width="stretch")
+        st.session_state["_live_poc"] = float(df['POC_Level'].iloc[-1])   # shown on the live 1-minute chart
+        if _LIVE_CHART_ON:
+            st.caption("📈 Live 1-minute candle chart (TradingView style) dashboard ke sabse upar hai.")
+        else:
+            chart_df = df.tail(100)
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(
+                x=chart_df.index, open=chart_df['Open'], high=chart_df['High'],
+                low=chart_df['Low'], close=chart_df['Close'], name='Nifty 50',
+                increasing_line_color='#26A69A', decreasing_line_color='#EF5350'
+            ))
+            fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA_20'], mode='lines', name='EMA 20', line=dict(color='#2962FF', width=1)))
+            fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['VWAP'], mode='lines', name='VWAP (Smart Money Avg)', line=dict(color='#E040FB', width=2.5, dash='dot')))
+            fig.add_hline(y=df['POC_Level'].iloc[-1], line_width=2, line_dash="solid", line_color="#FFEA00",
+                          annotation_text=f"POC Level (Max Vol): {df['POC_Level'].iloc[-1]:.2f}", annotation_position="top right")
+            fig.update_layout(xaxis_title='Time', yaxis_title='Price (₹)', template='plotly_dark', height=600,
+                               xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig, width="stretch")
 
         live_vwap = float(df['VWAP'].iloc[-1])
         live_poc = float(df['POC_Level'].iloc[-1])
@@ -1989,7 +2006,9 @@ def _live_dashboard():
     _sp.done()
 
 
+_LIVE_CHART_ON = False
 if not ACTIVE_SYMBOL:
+    _LIVE_CHART_ON = live_chart.render()   # own fast refresh; False -> old chart is used
     _live_dashboard()
 else:
     st.info(f"📌 Abhi **{ACTIVE_SYMBOL}** dashboard active hai (neeche dekho). Nifty 50 index dashboard par wapas jaane ke liye sidebar mein '⬅ Nifty 50' dabao.")
