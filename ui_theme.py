@@ -177,14 +177,12 @@ iframe[title="st.iframe"], iframe[title="streamlit_component"]{ border:0; }
 .stApp, .stApp p, .stApp li, .stApp label, .stApp span, .stApp div[data-testid="stMarkdownContainer"]{ color:var(--txt); }
 .stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp h5{ color:#f4f7ff; text-shadow:0 0 18px rgba(34,211,238,.18); }
 [data-testid="stMetricValue"]{ color:#fff !important; text-shadow:0 0 16px rgba(34,211,238,.45); }
-/* v43b: clean, professional headings -- same crisp white look as the hero title, only a faint glow.
-   (Alerts, bold text, expanders and labels are left exactly as they were.) */
-.stApp h2, .stApp h3,
+/* v43c: NO glow on text.  Plain, crisp, high-contrast headings only. */
+.stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp h5,
 .stApp [data-testid="stHeading"] h2, .stApp [data-testid="stHeading"] h3,
 .stApp [data-testid="stMarkdownContainer"] h2, .stApp [data-testid="stMarkdownContainer"] h3{
-  color:#f7f9ff !important; -webkit-text-fill-color:#f7f9ff;
-  font-weight:800 !important; letter-spacing:-.01em;
-  text-shadow:0 0 12px rgba(34,211,238,.22) !important; }
+  color:#f4f7ff !important; -webkit-text-fill-color:#f4f7ff; text-shadow:none !important;
+  font-weight:700 !important; letter-spacing:-.005em; }
 [data-testid="stMetricLabel"], [data-testid="stCaptionContainer"], .stCaption{ color:var(--mute) !important; }
 /* tables / dataframes (glide-data-grid reads these vars) */
 [data-testid="stDataFrame"], [data-testid="stDataFrame"] > div, [data-testid="stTable"], .stTable table, table{
