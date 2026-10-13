@@ -171,43 +171,6 @@ iframe[title="st.iframe"], iframe[title="streamlit_component"]{ border:0; }
 @media (prefers-reduced-motion:reduce){
   *, *::before, *::after{ animation:none !important; transition:none !important; }
 }
-
-/* ===== v42: identical dark look on PC (light-theme browsers) and mobile ===== */
-:root, .stApp{ color-scheme:dark; }
-.stApp, .stApp p, .stApp li, .stApp label, .stApp span, .stApp div[data-testid="stMarkdownContainer"]{ color:var(--txt); }
-.stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp h5{ color:#f4f7ff; text-shadow:0 0 18px rgba(34,211,238,.18); }
-[data-testid="stMetricValue"]{ color:#fff !important; text-shadow:0 0 16px rgba(34,211,238,.45); }
-/* v43c: NO glow on text.  Plain, crisp, high-contrast headings only. */
-.stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp h5,
-.stApp [data-testid="stHeading"] h2, .stApp [data-testid="stHeading"] h3,
-.stApp [data-testid="stMarkdownContainer"] h2, .stApp [data-testid="stMarkdownContainer"] h3{
-  color:#f4f7ff !important; -webkit-text-fill-color:#f4f7ff; text-shadow:none !important;
-  font-weight:700 !important; letter-spacing:-.005em; }
-[data-testid="stMetricLabel"], [data-testid="stCaptionContainer"], .stCaption{ color:var(--mute) !important; }
-/* tables / dataframes (glide-data-grid reads these vars) */
-[data-testid="stDataFrame"], [data-testid="stDataFrame"] > div, [data-testid="stTable"], .stTable table, table{
-  --gdg-bg-cell:#0b0e1a; --gdg-bg-cell-medium:#0f1322; --gdg-bg-header:#141a2e; --gdg-bg-header-has-focus:#1a2240;
-  --gdg-bg-header-hovered:#1a2240; --gdg-text-dark:#e8ecf7; --gdg-text-medium:#b4bdd6; --gdg-text-light:#8b93ad;
-  --gdg-text-header:#cfd8f5; --gdg-border-color:rgba(255,255,255,.08); --gdg-horizontal-border-color:rgba(255,255,255,.06);
-  --gdg-accent-color:#22d3ee; --gdg-accent-light:rgba(34,211,238,.18); --gdg-bg-bubble:#1a2240; --gdg-bg-search-result:rgba(34,211,238,.2);
-  background:#0b0e1a !important; color:#e8ecf7 !important; }
-.stTable th, table th{ background:#141a2e !important; color:#cfd8f5 !important; border-color:rgba(255,255,255,.08) !important; }
-.stTable td, table td{ background:#0b0e1a !important; color:#e8ecf7 !important; border-color:rgba(255,255,255,.06) !important; }
-/* expanders, chat, inputs, popovers */
-[data-testid="stExpander"], [data-testid="stExpander"] details, [data-testid="stExpander"] summary{
-  background:rgba(255,255,255,.04) !important; color:var(--txt) !important; }
-[data-testid="stExpander"] summary:hover{ background:rgba(34,211,238,.08) !important; }
-[data-testid="stChatInput"], [data-testid="stChatInput"] > div, [data-testid="stChatInput"] textarea,
-[data-testid="stChatInputTextArea"], [data-testid="stBottom"], [data-testid="stBottom"] > div{
-  background:#0b0e1a !important; color:var(--txt) !important; border-color:var(--line) !important; }
-[data-testid="stChatInput"] textarea::placeholder{ color:var(--mute) !important; }
-[data-testid="stChatMessage"]{ background:rgba(255,255,255,.04) !important; border:1px solid var(--line); border-radius:14px; }
-input, textarea, select, [data-baseweb="select"] > div, [data-baseweb="input"], [data-baseweb="textarea"]{
-  background:#0b0e1a !important; color:var(--txt) !important; border-color:var(--line) !important; }
-[data-baseweb="popover"] *, [data-baseweb="menu"], ul[role="listbox"]{ background:#10142a !important; color:var(--txt) !important; }
-.stButton > button, .stDownloadButton > button{ background:rgba(255,255,255,.06) !important; color:var(--txt) !important; }
-[data-testid="stAlert"]{ color:var(--txt) !important; }
-iframe{ color-scheme:normal; }
 </style>
 """
 
@@ -298,6 +261,17 @@ h1 .l{display:block;white-space:nowrap}
     <p class="sub">Smart-money flow, option-chain intelligence, regime detection and risk gating &mdash; fused into one real-time decision engine.</p>
     <div class="chips"><span class="chip">SMC / ICT</span><span class="chip">OPTIONS FLOW</span><span class="chip">REGIME AI</span><span class="chip">RISK ENGINE</span></div>
   </div>
+  <div class="card" id="card">
+    <div class="row"><span>NIFTY &middot; AI PULSE</span><span style="color:#22e6a8">&#9679; LIVE</span></div>
+    <div class="px" id="px">24,812.40</div>
+    <div class="chg" id="chg">&#9650; +0.62%</div>
+    <canvas class="spark" id="spark"></canvas>
+    <div class="bars">
+      <div class="bar">TREND<i style="--w:78%"></i></div>
+      <div class="bar">FLOW<i style="--w:64%"></i></div>
+      <div class="bar">RISK<i style="--w:32%"></i></div>
+    </div>
+  </div>
   <div class="scroll"><span>Scroll</span><b></b></div>
 </div>
 <script>
@@ -311,7 +285,8 @@ h1 .l{display:block;white-space:nowrap}
   addEventListener('resize',resize);resize();
   wrap.addEventListener('pointermove',e=>{const r=wrap.getBoundingClientRect();
     tx=(e.clientX-r.left)/r.width-.5;ty=(e.clientY-r.top)/r.height-.5;
-});
+    const c=document.getElementById('card');
+    c.style.setProperty('--ry',(-10+tx*14)+'deg');c.style.setProperty('--rx',(4-ty*10)+'deg');});
   wrap.addEventListener('pointerleave',()=>{tx=0;ty=0;});
   new IntersectionObserver(es=>{visible=es[0].isIntersecting}).observe(wrap);
 
@@ -387,6 +362,31 @@ h1 .l{display:block;white-space:nowrap}
     },start);
   });
 
+  /* ---- live-looking pulse card (decorative; real data is below) ---- */
+  const sp=document.getElementById('spark'),sc2=sp.getContext('2d');
+  let pts=[],val=24812.4;const base=val;
+  for(let i=0;i<48;i++){val+=(Math.random()-.46)*9;pts.push(val);}
+  function drawSpark(){
+    const w=sp.clientWidth,h=sp.clientHeight;if(!w)return;
+    sp.width=w*DPR;sp.height=h*DPR;sc2.setTransform(DPR,0,0,DPR,0,0);sc2.clearRect(0,0,w,h);
+    const mn=Math.min(...pts),mx2=Math.max(...pts),rg=(mx2-mn)||1;
+    const X=i=>i/(pts.length-1)*w, Y=v=>h-4-((v-mn)/rg)*(h-10);
+    const g=sc2.createLinearGradient(0,0,0,h);g.addColorStop(0,'rgba(34,211,238,.35)');g.addColorStop(1,'rgba(34,211,238,0)');
+    sc2.beginPath();pts.forEach((v,i)=>i?sc2.lineTo(X(i),Y(v)):sc2.moveTo(X(i),Y(v)));
+    sc2.lineTo(w,h);sc2.lineTo(0,h);sc2.closePath();sc2.fillStyle=g;sc2.fill();
+    sc2.beginPath();pts.forEach((v,i)=>i?sc2.lineTo(X(i),Y(v)):sc2.moveTo(X(i),Y(v)));
+    sc2.strokeStyle='#22d3ee';sc2.lineWidth=1.6;sc2.shadowColor='#22d3ee';sc2.shadowBlur=8;sc2.stroke();sc2.shadowBlur=0;
+    const lx=X(pts.length-1),ly=Y(pts[pts.length-1]);
+    sc2.beginPath();sc2.arc(lx-1,ly,3,0,6.283);sc2.fillStyle='#fff';sc2.fill();
+  }
+  function tickPrice(){
+    val+=(Math.random()-.48)*7;pts.push(val);pts.shift();
+    const ch=(val-base)/base*100,up=ch>=0;
+    document.getElementById('px').textContent=val.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+    const c=document.getElementById('chg');c.textContent=(up?'▲ +':'▼ ')+ch.toFixed(2)+'%';c.style.color=up?'#22e6a8':'#ff5d7a';
+    drawSpark();
+  }
+  drawSpark();setInterval(tickPrice,900);
 })();
 </script></body></html>
 """
