@@ -202,19 +202,3 @@ cut repeated/avoidable losses. Measure it on your own resolved trades.
 - Bad-form penalty expires after FORM_STALE_HOURS (30h); probes stay on under bad form but only at strong OI walls.
 - Tests: `python -m unittest tests_level_verdict` (7 tests). tests.py still has one older synthetic test
   (`test_fall_then_stall_produces_a_trade`, no OI/zones supplied) that also failed BEFORE these changes.
-
-## v42
-- .streamlit/config.toml was a copy of ui_theme.py (broken) -> real dark theme config (fixes white tables on PC)
-- ui_theme.py: dark overrides for tables/expanders/chat input, glow text; fake "AI Pulse" price card removed
-- live_chart.py: 5-minute candles, tick every 5 s; app.py: main refresh 45 s
-- keep_open.py: mouse/scroll activity, lag limit 300 s, gentler handling of app restart; KEEPER_SETUP.md path fixed
-
-## v43 -- more (and better) trades, big-move + reversal coverage, glowing headings
-- NEW strategy `impulse_pullback_continuation`: catches big one-way moves (>=2 ATR leg) on the shallow pullback or the fresh continuation break.
-- NEW strategy `exhaustion_reversal`: V-reversal (stretch >=1.5 ATR from EMA20 + rejection candle + reclaim). Reversal strategies (`REVERSAL_KEYS`) are no longer blocked by the "live direction is against you" / "already bounced" checks; they must be <= 3 bars old.
-- `strategy_engine`: MIN_ENTRY_SCORE 38->36, MIN_EDGE 3->2, RECENT_SETUP_BARS 6->8, range-expansion breakout a little more sensitive.
-- `ai_trade_decision`: confluence gate allows 2 conflicting modules when a strategy is formed and >=4 direct confirmations (3 still veto); knife gate lets a formed reversal strategy trade the turn with >=3 independent reversal confirmations; dry-spell relief after 75 min (was 120); win-prob floor 0.35->0.33; first entry 09:20 (was 09:25).
-- Gemini stays the FINAL reviewer on every trade (prompt now understands momentum-continuation and confirmed-reversal entries). Local fallback is UNCHANGED and still strict (only when Gemini is unreachable).
-- SL / target logic UNCHANGED (same SL rules, same 1.5R-2.2R targets).
-- `market_data`: 5-min history 5 -> 8 calendar days (about +2-3 trading days of data for learning).
-- `ui_theme`: section headings, expander titles, bold text, alerts and metric labels now use the same glowing gradient look as the hero title.
