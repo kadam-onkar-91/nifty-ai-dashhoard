@@ -202,3 +202,9 @@ cut repeated/avoidable losses. Measure it on your own resolved trades.
 - Bad-form penalty expires after FORM_STALE_HOURS (30h); probes stay on under bad form but only at strong OI walls.
 - Tests: `python -m unittest tests_level_verdict` (7 tests). tests.py still has one older synthetic test
   (`test_fall_then_stall_produces_a_trade`, no OI/zones supplied) that also failed BEFORE these changes.
+
+## v42
+- .streamlit/config.toml was a copy of ui_theme.py (broken) -> real dark theme config (fixes white tables on PC)
+- ui_theme.py: dark overrides for tables/expanders/chat input, glow text; fake "AI Pulse" price card removed
+- live_chart.py: 5-minute candles, tick every 5 s; app.py: main refresh 45 s
+- keep_open.py: mouse/scroll activity, lag limit 300 s, gentler handling of app restart; KEEPER_SETUP.md path fixed
