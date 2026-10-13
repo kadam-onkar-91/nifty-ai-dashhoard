@@ -177,6 +177,20 @@ iframe[title="st.iframe"], iframe[title="streamlit_component"]{ border:0; }
 .stApp, .stApp p, .stApp li, .stApp label, .stApp span, .stApp div[data-testid="stMarkdownContainer"]{ color:var(--txt); }
 .stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp h5{ color:#f4f7ff; text-shadow:0 0 18px rgba(34,211,238,.18); }
 [data-testid="stMetricValue"]{ color:#fff !important; text-shadow:0 0 16px rgba(34,211,238,.45); }
+/* v43: section headings get the SAME glowing gradient look as the "AI TRADING TERMINAL" hero title */
+.stApp h2, .stApp h3, .stApp h4,
+.stApp [data-testid="stHeading"] h2, .stApp [data-testid="stHeading"] h3, .stApp [data-testid="stHeading"] h4,
+.stApp [data-testid="stMarkdownContainer"] h2, .stApp [data-testid="stMarkdownContainer"] h3, .stApp [data-testid="stMarkdownContainer"] h4{
+  background:linear-gradient(100deg,#67e8f9 0%,#a78bfa 48%,#fb7185 100%);
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; color:transparent !important;
+  text-shadow:none !important; font-weight:800 !important; letter-spacing:.01em;
+  filter:drop-shadow(0 0 8px rgba(34,211,238,.55)) drop-shadow(0 0 20px rgba(139,92,246,.40));
+  display:inline-block; }
+.stApp [data-testid="stExpander"] summary p, .stApp [data-testid="stExpander"] summary span{
+  color:#eaf2ff !important; font-weight:700; text-shadow:0 0 10px rgba(34,211,238,.45); }
+.stApp strong, .stApp b{ color:#ffffff; text-shadow:0 0 10px rgba(34,211,238,.35); }
+.stApp [data-testid="stAlert"] p, .stApp [data-testid="stAlert"] div{ color:#f4f7ff !important; text-shadow:0 0 8px rgba(34,211,238,.22); font-weight:600; }
+.stApp [data-testid="stMetricLabel"] p{ color:#cfe9ff !important; text-shadow:0 0 8px rgba(34,211,238,.30); font-weight:700; }
 [data-testid="stMetricLabel"], [data-testid="stCaptionContainer"], .stCaption{ color:var(--mute) !important; }
 /* tables / dataframes (glide-data-grid reads these vars) */
 [data-testid="stDataFrame"], [data-testid="stDataFrame"] > div, [data-testid="stTable"], .stTable table, table{
