@@ -31,9 +31,9 @@ VERIFIED_WF_SAMPLES = 30
 # Proven-good strategies rise above that, proven-bad ones fall below it. The old gate
 # (58) was mathematically unreachable for almost every strategy (best live score in the
 # dashboard was 42), which is why the engine never produced a single trade.
-MIN_ENTRY_SCORE = 38.0
-MIN_EDGE = 3.0   # when BUY and SELL strategies fire together, the winner must lead by this much
-RECENT_SETUP_BARS = 6  # a short execution window; prevents a valid setup disappearing between refreshes
+MIN_ENTRY_SCORE = 36.0   # v43: 38 -> 36 so more genuine setups reach the AI/Gemini review (they still need confluence + EV + Gemini)
+MIN_EDGE = 2.0   # when BUY and SELL strategies fire together, the winner must lead by this much
+RECENT_SETUP_BARS = 8  # a short execution window; prevents a valid setup disappearing between refreshes
 
 # Performance cache: the 30-second Streamlit refresh used to recompute the full
 # chronological walk-forward for every named strategy. That is the main reason
@@ -57,6 +57,12 @@ _BAR_SIG_MAX = 6000
 _WF_CACHE_MAX = 128
 _SIGNAL_CACHE = {}
 _SIGNAL_CACHE_MAX = 256
+
+# v43: strategies that TRADE THE TURN.  The live-direction validity check used to block every one of them
+# ("BUY blocked: price dropped X ATR / live action is DOWN") -> the engine could never take a reversal.
+REVERSAL_KEYS = {"exhaustion_reversal", "rsi_divergence_reversal", "liquidity_sweep_fvg", "previous_day_liquidity_sweep",
+                 "pivot_reversal", "double_bottom", "inverse_head_shoulders", "falling_wedge", "head_shoulders",
+                 "vwap_sr_rejection", "gap_fade_fill", "ema_trap_fakeout"}
 
 STRATEGY_META = {
     "modified_920_orb": {"name": "Modified 9:20 ORB", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE"}},
@@ -106,6 +112,9 @@ STRATEGY_META = {
     # Momentum / trend strategies. The library above was almost entirely retest, pullback and
     # reversal logic -- a clean one-way sell-off (or rally) with no pullback produced ZERO signals.
     "range_expansion_breakout": {"name": "Range-Expansion Momentum Breakout (Donchian-12 displacement)", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE", "LOW_VOL"}},
+    # v43: the two families the old library was missing -> big one-way moves with pullbacks, and sharp V-reversals.
+    "impulse_pullback_continuation": {"name": "Impulse + Pullback Continuation (big-move catcher)", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE"}},
+    "exhaustion_reversal": {"name": "Exhaustion V-Reversal (stretch + rejection + reclaim)", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE", "LOW_VOL"}},
     "supertrend_flip_vwap": {"name": "SuperTrend Flip + VWAP", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE", "LOW_VOL"}},
 }
 
@@ -655,11 +664,73 @@ def _signal_rules(x: pd.DataFrame, name: str, option_chain=None) -> int:
         # Displacement candle: big range, body-dominant, closes at its extreme, and takes out the
         # previous 12-bar high/low, with price on the right side of EMA20 and VWAP.
         rng=max(high-low,1e-9); o=_num(r["Open"]); b=abs(close-o)
-        prior=x.iloc[-13:-1]
+        prior=x.iloc[-11:-1]
         hh=float(prior["High"].max()); ll=float(prior["Low"].min())
-        big = rng >= 1.2*atr and b >= 0.55*rng
+        big = rng >= 1.0*atr and b >= 0.50*rng
         if big and close>o and close>hh and close>=high-0.30*rng and close>ema20 and close>vwap: return 1
         if big and close<o and close<ll and close<=low+0.30*rng and close<ema20 and close<vwap: return -1
+        return 0
+
+    if name == "impulse_pullback_continuation":
+        # v43 BIG-MOVE CATCHER.  A strong leg (>= 2.0 ATR inside the last 16 bars) followed by either
+        #  (a) a SHALLOW pullback (<= 55% of the leg) that holds EMA20/VWAP and then a confirming candle, or
+        #  (b) a fresh continuation break of the last 6 bars' extreme while EMA9/EMA20/VWAP all agree.
+        win = x.iloc[-16:]
+        H = win["High"].to_numpy(dtype=float); L = win["Low"].to_numpy(dtype=float)
+        n = len(win)
+        e9 = _num(r["EMA9"]); o = _num(r["Open"])
+        hi_i = int(H.argmax()); lo_i = int(L.argmin())
+        # ---- UP leg: low first, high later
+        if lo_i < hi_i:
+            leg = H[hi_i] - L[lo_i]
+            if leg >= 2.0*atr:
+                depth = (H[hi_i] - close) / leg if leg > 0 else 1.0
+                since_hi = n - 1 - hi_i
+                held = close > ema20 - 0.25*atr and close > vwap - 0.25*atr
+                if 1 <= since_hi <= 9 and depth <= 0.55 and held and close > o and (close > _num(p["High"]) or close > e9):
+                    return 1
+                prior6 = float(x["High"].iloc[-7:-1].max())
+                if since_hi == 0 and close > prior6 and e9 > ema20 and close > vwap and body >= 0.35*atr and close > o:
+                    return 1
+        # ---- DOWN leg: high first, low later
+        if hi_i < lo_i:
+            leg = H[hi_i] - L[lo_i]
+            if leg >= 2.0*atr:
+                depth = (close - L[lo_i]) / leg if leg > 0 else 1.0
+                since_lo = n - 1 - lo_i
+                held = close < ema20 + 0.25*atr and close < vwap + 0.25*atr
+                if 1 <= since_lo <= 9 and depth <= 0.55 and held and close < o and (close < _num(p["Low"]) or close < e9):
+                    return -1
+                prior6 = float(x["Low"].iloc[-7:-1].min())
+                if since_lo == 0 and close < prior6 and e9 < ema20 and close < vwap and body >= 0.35*atr and close < o:
+                    return -1
+        return 0
+
+    if name == "exhaustion_reversal":
+        # v43 V-REVERSAL: price stretched >= 1.5 ATR beyond EMA20 inside a >= 2.5 ATR leg, the extreme is very recent (<= 4 bars),
+        # then a rejection candle (hammer / shooting star / engulfing) that closes back through EMA9 or the prior bar's extreme.
+        win = x.iloc[-14:]
+        o = _num(r["Open"]); rng = max(high-low, 1e-9); e9 = _num(r["EMA9"])
+        rsi_min = float(x["RSI14"].iloc[-6:].min()); rsi_max = float(x["RSI14"].iloc[-6:].max())
+        lo8 = x["Low"].iloc[-8:]; hi8 = x["High"].iloc[-8:]
+        lo_pos = int(np.argmin(lo8.to_numpy(dtype=float))); hi_pos = int(np.argmax(hi8.to_numpy(dtype=float)))
+        lo_age = 7 - lo_pos; hi_age = 7 - hi_pos
+        # BUY: washed-out low, bullish reclaim
+        leg_dn = float(win["High"].max()) - float(lo8.min())
+        stretch_dn = float(x["EMA20"].iloc[-8:].iloc[lo_pos]) - float(lo8.min())
+        lower_wick = min(o, close) - low
+        hammer = lower_wick >= 0.45*rng and close >= low + 0.55*rng
+        engulf_up = close > o and close > _num(p["Open"]) and close > _num(p["High"]) and _num(p["Close"]) < _num(p["Open"])
+        if leg_dn >= 2.5*atr and stretch_dn >= 1.5*atr and lo_age <= 4 and rsi_min <= 36 and close > o and (hammer or engulf_up) and (close > e9 or close > _num(p["High"]) or close > _num(p["Open"])):
+            return 1
+        # SELL: blow-off high, bearish rejection
+        leg_up = float(hi8.max()) - float(win["Low"].min())
+        stretch_up = float(hi8.max()) - float(x["EMA20"].iloc[-8:].iloc[hi_pos])
+        upper_wick = high - max(o, close)
+        star = upper_wick >= 0.45*rng and close <= high - 0.55*rng
+        engulf_dn = close < o and close < _num(p["Open"]) and close < _num(p["Low"]) and _num(p["Close"]) > _num(p["Open"])
+        if leg_up >= 2.5*atr and stretch_up >= 1.5*atr and hi_age <= 4 and rsi_max >= 64 and close < o and (star or engulf_dn) and (close < e9 or close < _num(p["Low"]) or close < _num(p["Open"])):
+            return -1
         return 0
 
     if name == "supertrend_flip_vwap":
@@ -1016,12 +1087,21 @@ def _live_state(x: pd.DataFrame) -> Dict[str, Any]:
         return {"ok": False, "score": 0.0}
 
 
-def _signal_validity(sig: int, live: Dict[str, Any], age: int, score: float):
-    """Returns (valid, adjusted_score, note) for one live strategy signal."""
+def _signal_validity(sig: int, live: Dict[str, Any], age: int, score: float, reversal: bool = False):
+    """Returns (valid, adjusted_score, note) for one live strategy signal.
+
+    v43: a REVERSAL strategy is by definition against the move that just happened, so the stale-direction /
+    "already bounced" blocks do not apply to it (its own rule already demands stretch + rejection + reclaim).
+    It only loses a little score for trading against the live trend and must still be FRESH (<= 3 bars old)."""
     if not live.get("ok"):
         return True, score, ""
     ls = float(live.get("score", 0.0)); align = sig * ls
     notes = []
+    if reversal:
+        if age > 3:
+            return False, max(0.0, score - AGE_PENALTY * age), "reversal setup is older than 3 bars - the turn is no longer fresh"
+        adj = score + 0.10 * max(-100.0, min(100.0, align)) - AGE_PENALTY * age + 3.0
+        return True, min(100.0, max(0.0, adj)), "reversal: trading the turn (counter-trend by design)"
     if align <= LIVE_COUNTER_BLOCK:
         side = "SELL" if sig < 0 else "BUY"
         return False, max(0.0, score + LIVE_ALIGN_WEIGHT * max(-100.0, align) - AGE_PENALTY * age), \
@@ -1141,7 +1221,7 @@ def analyze(df: pd.DataFrame, *, sr_context=None, level_prediction=None, order_f
         current=min(100,max(0,base_current+learning_adjustment))
         raw_current=current; valid=True; vnote=""
         if sig and meta["type"]=="directional":
-            valid,current,vnote=_signal_validity(sig,live,int(signal_age or 0),current)
+            valid,current,vnote=_signal_validity(sig,live,int(signal_age or 0),current, reversal=(key in REVERSAL_KEYS))
             if live_upstox:
                 all_active.append((current,key,sig,valid,vnote))
                 if valid: candidates.append((current,key,sig))
