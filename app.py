@@ -181,7 +181,7 @@ try:
     _REFRESH_IS_LIVE = market_status.get_market_status()["state"] in ("OPEN", "PRE_OPEN")
 except Exception:
     _REFRESH_IS_LIVE = True
-_REFRESH_SEC = 45 if _REFRESH_IS_LIVE else 180   # 45 s: a full cycle takes 10-25 s, so 30 s made refreshes pile up/late
+_REFRESH_SEC = 30 if _REFRESH_IS_LIVE else 180
 
 
 @st.fragment(run_every=_REFRESH_SEC)
@@ -1287,8 +1287,7 @@ def _live_dashboard():
                        f"SELL {strategy_result.get('sell_consensus')} ({strategy_result.get('sell_live_count')} live) | "
                        f"{strategy_result.get('blocked_count', 0)} stale/against-the-move signal(s) blocked")
         if _strategy_rows:
-            with st.expander("🧩 Named Strategy Library (strategy table)", expanded=False):   # fixed label = open/closed state survives refresh
-                st.caption(f"{len(_strategy_rows)} strategies scanned, {len(_ranked)} live")
+            with st.expander(f"🧩 Named Strategy Library — {len(_strategy_rows)} strategies scanned, {len(_ranked)} live", expanded=bool(_ranked)):
                 st.dataframe(pd.DataFrame(_strategy_rows), hide_index=True, width="stretch")
                 st.caption("Win rate sirf resolved historical samples se aata hai. Naya strategy/history insufficient ho to N/A dikhaya jata hai; fake accuracy nahi.")
 
@@ -1709,9 +1708,9 @@ def _live_dashboard():
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("📊 Institutional Order Flow Chart (VWAP & Volume Profile)")
 
-        st.session_state["_live_poc"] = float(df['POC_Level'].iloc[-1])   # shown on the live 5-minute chart
+        st.session_state["_live_poc"] = float(df['POC_Level'].iloc[-1])   # shown on the live 1-minute chart
         if _LIVE_CHART_ON:
-            st.caption("📈 Live 5-minute candle chart (TradingView style) dashboard ke sabse upar hai.")
+            st.caption("📈 Live 1-minute candle chart (TradingView style) dashboard ke sabse upar hai.")
         else:
             chart_df = df.tail(100)
             fig = go.Figure()
@@ -2009,8 +2008,7 @@ def _live_dashboard():
 
 _LIVE_CHART_ON = False
 if not ACTIVE_SYMBOL:
-    with st.expander("📈 Live 5-minute chart (kholne ke liye dabao)", expanded=False):   # closed by default; you open it when needed
-        _LIVE_CHART_ON = live_chart.render()   # own fast refresh; False -> old chart is used
+    _LIVE_CHART_ON = live_chart.render()   # own fast refresh; False -> old chart is used
     _live_dashboard()
 else:
     st.info(f"📌 Abhi **{ACTIVE_SYMBOL}** dashboard active hai (neeche dekho). Nifty 50 index dashboard par wapas jaane ke liye sidebar mein '⬅ Nifty 50' dabao.")
