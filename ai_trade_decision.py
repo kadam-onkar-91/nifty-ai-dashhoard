@@ -21,6 +21,7 @@ import oi_buildup
 import trade_diagnostics
 import strategy_engine
 import gemini_pool
+import threading as _threading
 import json
 import time
 import requests
@@ -47,6 +48,18 @@ OI_FRONT_RUN_ATR = 0.25
 TARGET_REACH_ATR = 0.7         # realistic reach inside the holding window = this x ATR x sqrt(hold bars)
 OI_MIN_RR = 1.2                 # wall closer than this many R -> not a usable target (soft penalty, no new gate)
 MAX_TARGET_R = 2.2              # cap for wall/structure targets; the ATR fallback stays at 1.5R
+# v42 -- MOMENTUM CAPTURE LANE + soft-drag caps (see generate_trade_decision).  The calibrated edge model is learned from the engine's
+# own (poor) record, so it sat at 13-15% win chance and blocked every strategy-led entry -- including the clean continuation moves it
+# should catch.  A move that live price action, VWAP/EMA and >= 3 live strategies ALL confirm is a different population from the
+# trades that lost, so it is allowed past the learned EV/win-floor bar (Gemini review, segment pause, cooldown, chase checks stay).
+MOMENTUM_MIN_LIVE = 50.0        # live price-action score (-100..100) in the trade direction
+MOMENTUM_MIN_CONSENSUS = 80.0   # strategy consensus (0..100) of the trade side
+MOMENTUM_MIN_COUNT = 3          # live strategies on the trade side
+MOMENTUM_MIN_RR = 1.0           # the lane never takes a trade whose target (OI wall / structure) is closer than 1R
+LEARNED_DRAG_CAP = 0.30         # the learned adjustment (mistake memory + NN) may lower the win-logit by at most this
+LEARNED_BONUS_CAP = 0.30
+TAG_PENALTY_CAP = 0.20          # repeat-mistake tag penalty cap
+OI_FALLBACK_RR = 1.0            # a wall that gives at least this R is accepted as target when none gives OI_MIN_RR
 MIN_WIN_PROB = 0.35             # HARD floor on the calibrated win probability.  A trade the engine itself rates at ~31% (it loses
                                 # 2 of 3) can still show a hair of positive EV at 2.2R and, with the dry-spell relief, used to slip through.
                                 # Shadow trades now supply learning data, so the engine no longer needs low-quality trades to learn.
@@ -239,6 +252,29 @@ def _oi_wall_target(raw_chain, live_price, direction, min_pts=12.0, max_pts=140.
     return round(tgt, 2), float(strike)
 
 
+def _oi_pick_target(raw_chain, live_price, direction, sl_distance, atr=None):
+    """Nearest significant OI wall that still pays >= OI_MIN_RR (else >= OI_FALLBACK_RR) -> target placed just IN FRONT of it.
+    A nearer significant wall that is too close to pay is a 'blocking' wall (price tends to stall there).
+    Returns (target|None, wall_strike|None, blocking_wall_strike|None, rr_used|None)."""
+    walls = [w for w in _oi_walls(raw_chain, live_price, direction) if w[3]]
+    if not walls:
+        return None, None, None, None
+    buf = max(OI_FRONT_RUN_MIN_PTS, OI_FRONT_RUN_ATR * float(atr)) if atr else OI_FRONT_RUN_MIN_PTS
+    sl = max(float(sl_distance), 1e-9)
+    blocking = None
+    for dist, strike, _oi, _sig in walls:
+        front = dist - buf
+        if front >= OI_MIN_RR * sl:
+            return round(strike - buf if direction == "BUY" else strike + buf, 2), float(strike), blocking, front / sl
+        if blocking is None:
+            blocking = float(strike)
+    for dist, strike, _oi, _sig in walls:           # nothing pays 1.2R: accept the first wall that pays at least 1.0R
+        front = dist - buf
+        if front >= OI_FALLBACK_RR * sl:
+            return round(strike - buf if direction == "BUY" else strike + buf, 2), float(strike), blocking, front / sl
+    return None, None, blocking, None
+
+
 def _gemini_compact_context(dashboard_context, max_total_chars=70000):
     """Build a bounded but broad live-data packet for Gemini.
 
@@ -350,7 +386,7 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
     _dec = {k: (decision or {}).get(k) for k in (
         "direction", "underlying_entry", "strike", "option_type", "level_price", "confidence_note", "entry", "entry_price", "stop_loss", "sl", "target", "target_1", "target_2", "risk_reward",
         "confidence_pct", "critical_confirmations", "major_conflicts", "reason", "reasons", "factor_flags",
-        "option_symbol", "strategy_names") if (decision or {}).get(k) is not None}
+        "option_symbol", "strategy_names", "momentum_lane", "momentum_note", "target_note") if (decision or {}).get(k) is not None}
     decision_json = json.dumps(_dec, ensure_ascii=False, default=str)[:6000]
     # Locally computed LIVE price-action facts so Gemini judges direction on the same evidence the engine used.
     try:
@@ -363,6 +399,16 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
                                 "strategy_switched_to_match_ai": bool((strategy_result or {}).get("rebased_from"))}, default=str)
     except Exception:
         live_json = "{}"
+    # Google-Search research brief (cached 10 min, fetched in its own call so the JSON review stays fast and reliable)
+    _brief = {"text": "", "grounded": False, "age_s": None, "err": "search disabled"}
+    if use_search:
+        _brief = get_news_brief(keys)
+    if _brief.get("text"):
+        brief_txt = (f"FRESH GOOGLE-SEARCH RESEARCH BRIEF ({'grounded' if _brief.get('grounded') else 'ungrounded'}, "
+                     f"{_brief.get('age_s')}s old):\n{_brief['text']}\n"
+                     "Use it for news/event risk and global mood only; price levels and indicators come from the packet.\n\n")
+    else:
+        brief_txt = ""
     prompt = (
         "You are the FINAL independent reviewer for an intraday NIFTY trading system.\n\n"
         f"A named strategy is live and the self-learning AI engine agrees. Proposed direction: {direction}.\n"
@@ -377,20 +423,21 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
         "3) Secondary factors may disagree; require the MAIN evidence (structure, VWAP, order flow, option OI, regime) to lean your way.\n"
         "3b) Do NOT reject only because a minor/secondary factor disagrees or because a pullback is possible. Reject for: stale data, "
         "price chasing, or MAIN evidence leaning the opposite way. If the setup is a retest/pullback entry that is NOT extended, approve it.\n"
+        "3c) TREND / MOMENTUM: when live price action, VWAP/EMA side, order flow and several live strategies all point the same way, a "
+        "continuation entry after a small pullback is NOT chasing -- APPROVE it. Missing a clean trend move is as costly as a loss. "
+        "Only reject a chase when price is at the very END of an already huge move (extreme RSI + far from EMA + no pullback).\n"
         "4) No certainty claims.\n\n"
         f"Live price: {live_price}\nStrategy formed at: {strategy_formed_at}\nStrategy summary:\n{strategy_json}\n\n"
         f"LIVE PRICE-ACTION CHECK (computed by the engine from the latest candles):\n{live_json}\n\n"
         f"AI TRADE DECISION REPORT (entry / SL / target / confidence / reasons):\n{decision_json}\n\n"
-        "You may ALSO use Google Search for fresh NIFTY news / global cues / events today to add your own research, "
-        "but price levels and indicators must come from the packet. Check the entry, SL and target levels are sensible "
-        "for the live price (not already extended, SL not too tight, target realistic).\n\n"
+        f"{brief_txt}"
+        "Check the entry, SL and target levels are sensible for the live price (not already extended, SL not too tight, target realistic: "
+        "the target is placed just in front of the nearest option-OI wall).\n\n"
         f"LIVE RESEARCH PACKET:\n{packet}\n\n"
         "Return ONLY JSON with keys: own_direction (BUY/SELL/NO_TRADE), approved (boolean), verdict (APPROVE/REJECT), "
         "confidence (0-100), reason (short string), risk_flags (array of strings)."
     )
     body_json = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"responseMimeType": "application/json"}}
-    # Gemini cannot combine JSON-mode with the search tool -> grounded body has no responseMimeType
-    body_search = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}]}
 
     def _post(url, hdr, body, timeout):
         resp = requests.post(url, headers=hdr, json=body, timeout=timeout)
@@ -407,21 +454,11 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
     def _one(key, model):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         hdr = {"Content-Type": "application/json", "x-goog-api-key": key}
-        if use_search:
-            try:
-                out = _gemini_extract_json(_post(url, hdr, body_search, 40))
-                out["_search_used"] = True
-                return out
-            except Exception as exc_s:
-                # ANY problem with the search-grounded call (400 unsupported, 429 search quota, timeout,
-                # non-JSON prose...) -> retry the SAME key/model once WITHOUT search, so a search problem
-                # never burns this key/model or cascades through all 5 keys.
-                logger.warning("Grounded review failed (%s) -> plain JSON retry", type(exc_s).__name__)
         try:
-            out = _gemini_extract_json(_post(url, hdr, body_json, 25))
+            out = _gemini_extract_json(_post(url, hdr, body_json, 40))
         except ValueError:
             raise gemini_pool.PoolHTTPError(502, "Gemini reply was not valid JSON")
-        out["_search_used"] = False
+        out["_search_used"] = bool(_brief.get("text"))
         return out
 
     try:
@@ -435,7 +472,9 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
     approved = bool(parsed.get("approved")) and str(parsed.get("verdict", "")).upper() == "APPROVE" and own in (direction, "")
     out = {"direction": own or direction, "confidence": parsed.get("confidence"), 
            "risk_flags": parsed.get("risk_flags") or [], "model": model, "own_direction": own,
-           "search_used": bool(parsed.get("_search_used"))}
+           "search_used": bool(parsed.get("_search_used")), "search_grounded": bool(_brief.get("grounded")),
+           "search_error": (_brief.get("err") or None) if not _brief.get("text") else None,
+           "news_brief": (_brief.get("text") or "")[:700], "news_brief_age_s": _brief.get("age_s")}
     if approved:
         out.update({"status": "APPROVED", "approved": True, "direction": direction, "verdict": "APPROVE",
                     "reason": parsed.get("reason") or "Gemini's own read matches the proposed setup."})
@@ -465,7 +504,7 @@ def local_fallback_review(decision, gemini=None):
     need_crit = 5
     import entry_quality as _eqm
     chase_block, chase_why = _eqm.fallback_blocks(d.get("entry_quality"))
-    ok = (ev >= need_ev and crit >= need_crit and conflicts <= max_conflicts and rr >= 1.5 and not chase_block)
+    ok = ((ev >= need_ev or bool(d.get("momentum_lane"))) and crit >= need_crit and conflicts <= max_conflicts and rr >= 1.5 and not chase_block)
     tier = "strong" if strong else "normal"
     why = (f"[{tier} tier] expectancy {ev:+.2f}R (need {need_ev:+.2f}R), {crit} direct confirmations (need {need_crit}), "
            f"{conflicts} major conflicts (max {max_conflicts}), R:R {rr:.2f} (need 1.5)"
@@ -508,12 +547,98 @@ _GATE_PATTERNS = (
 
 
 # ---------------------------------------------------------------------------
+# v42 GOOGLE-SEARCH RESEARCH BRIEF.  Every approval used to say "no search": the review asked Gemini for JSON *and* Google Search in
+# ONE call, which fails silently on many models (search + JSON do not mix) and the code quietly retried without search.  Now the search
+# is its own small call that returns a short plain-text brief (news / events / global cues), cached for NEWS_TTL_S and pre-warmed in the
+# background, and the JSON review simply receives that brief.  Faster (no 40 s grounded call per review) and the search is provable:
+# the brief, its age and whether Google actually returned grounding data are shown with the verdict.
+# ---------------------------------------------------------------------------
+NEWS_TTL_S = 600.0
+NEWS_RETRY_S = 120.0
+_NEWS = {"ts": 0.0, "text": "", "grounded": False, "model": None, "err": "", "fail_ts": 0.0, "busy": False}
+_NEWS_LOCK = _threading.Lock()
+
+
+def _news_prompt():
+    try:
+        _d = trade_learning._now_ist().strftime("%A %d %B %Y, %H:%M IST")
+    except Exception:
+        _d = "today"
+    return (f"Now: {_d}. Use Google Search. In MAX 140 words, plain text, give a factual brief for an NIFTY 50 INTRADAY trader: "
+            "(1) any scheduled event today that can move the index (RBI, Fed/US data, results of index heavyweights, expiry), "
+            "(2) the biggest India/global news of the last 3 hours, (3) overnight/Asian/US/Europe cues and crude/USDINR/US-yields mood, "
+            "(4) one line: risk-on or risk-off. No trade advice, no price targets.")
+
+
+def get_news_brief(api_keys, force=False):
+    """Cached Google-Search brief.  Returns {"text","grounded","age_s","model","err"}.  Never raises."""
+    now = time.time()
+    with _NEWS_LOCK:
+        if not force and _NEWS["text"] and now - _NEWS["ts"] < NEWS_TTL_S:
+            return {"text": _NEWS["text"], "grounded": _NEWS["grounded"], "age_s": int(now - _NEWS["ts"]), "model": _NEWS["model"], "err": ""}
+        if not force and now - _NEWS["fail_ts"] < NEWS_RETRY_S:
+            return {"text": _NEWS["text"], "grounded": _NEWS["grounded"], "age_s": int(now - _NEWS["ts"]) if _NEWS["ts"] else None,
+                    "model": _NEWS["model"], "err": _NEWS["err"]}
+        if _NEWS["busy"]:
+            return {"text": _NEWS["text"], "grounded": _NEWS["grounded"], "age_s": int(now - _NEWS["ts"]) if _NEWS["ts"] else None,
+                    "model": _NEWS["model"], "err": "brief refresh already running"}
+        _NEWS["busy"] = True
+    keys = [k for k in (api_keys or []) if k]
+    try:
+        body = {"contents": [{"parts": [{"text": _news_prompt()}]}], "tools": [{"google_search": {}}]}
+
+        def _one(key, model):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            resp = requests.post(url, headers={"Content-Type": "application/json", "x-goog-api-key": key}, json=body, timeout=35)
+            if resp.status_code != 200:
+                try:
+                    msg = (resp.json().get("error", {}) or {}).get("message", "")[:200]
+                except Exception:
+                    msg = resp.text[:200]
+                # a 400 "search not supported on this model" must NOT mark the model dead for the JSON review -> use a neutral code
+                raise gemini_pool.PoolHTTPError(499 if resp.status_code == 400 else resp.status_code, msg)
+            cand = (resp.json().get("candidates") or [{}])[0]
+            parts = (cand.get("content") or {}).get("parts") or []
+            text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+            if not text:
+                raise gemini_pool.PoolHTTPError(499, "empty search brief")
+            gm = cand.get("groundingMetadata") or {}
+            grounded = bool(gm.get("webSearchQueries") or gm.get("groundingChunks") or gm.get("searchEntryPoint"))
+            return {"text": text[:1800], "grounded": grounded}
+
+        val, _i, model = gemini_pool.run(keys, gemini_pool.REVIEW_MODELS, _one, max_attempts=8, deadline_s=60)
+        with _NEWS_LOCK:
+            _NEWS.update({"ts": time.time(), "text": val["text"], "grounded": val["grounded"], "model": model, "err": "", "busy": False})
+        return {"text": val["text"], "grounded": val["grounded"], "age_s": 0, "model": model, "err": ""}
+    except Exception as exc:
+        with _NEWS_LOCK:
+            _NEWS.update({"fail_ts": time.time(), "err": f"{type(exc).__name__}: {exc}"[:200], "busy": False})
+            return {"text": _NEWS["text"], "grounded": _NEWS["grounded"], "age_s": int(time.time() - _NEWS["ts"]) if _NEWS["ts"] else None,
+                    "model": _NEWS["model"], "err": _NEWS["err"]}
+
+
+def prewarm_news_brief(api_keys):
+    """Non-blocking: refresh the research brief in the background when it is older than NEWS_TTL_S (call every dashboard refresh)."""
+    try:
+        now = time.time()
+        if _NEWS["busy"] or (_NEWS["text"] and now - _NEWS["ts"] < NEWS_TTL_S - 60) or now - _NEWS["fail_ts"] < NEWS_RETRY_S:
+            return
+        _threading.Thread(target=get_news_brief, args=(list(api_keys or []),), daemon=True, name="gemini-news-brief").start()
+    except Exception:
+        logger.exception("prewarm_news_brief failed (ignored)")
+
+
+def news_brief_status():
+    with _NEWS_LOCK:
+        return dict(_NEWS)
+
+
+# ---------------------------------------------------------------------------
 # NON-BLOCKING GEMINI REVIEW.  The dashboard is one Streamlit script that re-runs every 30 s; the review used to run
 # INSIDE it, so a slow/overloaded Gemini froze the whole page ("Stop" button, nothing loads).  Now the review runs in a
 # background thread: the page renders immediately, and the finished verdict is picked up on the next refresh (30 s).
 # Gemini remains the final block: while the verdict is pending, there is simply no trade.
 # ---------------------------------------------------------------------------
-import threading as _threading
 
 _REVIEW_JOBS = {}            # sig -> {"state": "RUNNING"|"DONE", "t0": ts, "result": dict|None}
 _REVIEW_LOCK = _threading.Lock()
@@ -613,7 +738,7 @@ def apply_gemini_verdict(decision, review, now=None):
         flags["external_ai_aligned"] = ok
         # PERMANENT PROOF stored with the trade: which review approved it (shown in the Recent AI Setups table).
         flags["_gemini"] = {"status": str(r.get("status", "")), "model": r.get("model"),
-                            "search_used": bool(r.get("search_used")),
+                            "search_used": bool(r.get("search_used")), "search_error": r.get("search_error"),
                             "confidence": r.get("confidence"),
                             "reason": str(r.get("reason") or "")[:500],
                             "gemini_error": str(r.get("gemini_error") or "")[:300] or None,   # why Gemini was unreachable (fallback only)
@@ -1118,6 +1243,17 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     bias_lower = lp['directional_bias'].lower()
     level_confirms = ("bullish" in bias_lower and direction == "BUY") or \
                       ("bearish" in bias_lower and direction == "SELL")
+    if not level_confirms and strategy_path:
+        # v42: a strategy-led entry (strategy + AI research + live price action agree) must not be vetoed by the legacy
+        # nearest-level predictor merely reading the other way.  Use a neutral location and charge a small probability penalty.
+        lp = {"status": "APPROACHING_LEVEL", "approaching": "support" if direction == "BUY" else "resistance",
+              "level_price": live_price, "distance_pts": 0.0,
+              "break_pct": max(65.0, float(strategy_result.get("score", 0))), "bounce_pct": max(65.0, float(strategy_result.get("score", 0))),
+              "directional_bias": "Bullish" if direction == "BUY" else "Bearish",
+              "factors": ["Strategy engine validated setup (nearest-level read disagreed -> ignored)"]}
+        soft_flags.append("nearest-level read disagrees")
+        bias_lower = lp['directional_bias'].lower()
+        level_confirms = True
     if not level_confirms:
         return {"has_setup": False, "reason": "Main signal and nearest level's read disagree -- staying flat.",
                 "context_audit": context_audit}
@@ -1286,6 +1422,8 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     except Exception:
         logger.exception("structure-aware SL failed; keeping ATR stop")
 
+    sl_distance = min(float(sl_distance), MAX_SL_PTS)      # hard ceiling: the stop is never wider than MAX_SL_PTS (28) points
+
     # Minimum acceptable reward:risk ratio -- target must be at least this
     # many times FARTHER than the stop-loss, or the setup isn't worth
     # taking even if confidence looks fine. Fixes the bug where the
@@ -1312,22 +1450,29 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     # target near the next meaningful OI barrier. Structural/ladder levels remain
     # fallback references when the live option chain has no usable wall.
     _oi_raw = raw_option_chain if raw_option_chain is not None else dashboard_context.get("RAW Option Chain (all loaded strikes)")
-    _oi_hit = _oi_wall_target(_oi_raw, live_price, direction, atr=atr)
     oi_wall_note = None
     oi_wall_penalty = 0.0
     oi_target = None
-    if _oi_hit is not None:
-        _oi_t, _wall_strike = _oi_hit
-        oi_dist = (_oi_t - live_price) if direction == "BUY" else (live_price - _oi_t)
-        if oi_dist >= OI_MIN_RR * sl_distance:
-            oi_target = _oi_t
-            target = oi_target
-            oi_wall_note = f"Target {_oi_t:g} sits just before the {_wall_strike:g} OI wall ({oi_dist:.0f} pts away)."
-        else:
-            # a strong wall is sitting right in front of the entry: price is likely to stall there.  Do not invent a
-            # farther target through it; keep the normal target but charge the trade some probability (soft).
-            oi_wall_penalty = 0.25
-            oi_wall_note = f"Strong OI wall at {_wall_strike:g} only {abs(_wall_strike - live_price):.0f} pts ahead -- probability reduced."
+    try:
+        _oi_t, _wall_strike, _block_strike, _oi_rr = _oi_pick_target(_oi_raw, live_price, direction, sl_distance, atr=atr)
+    except Exception:
+        logger.exception("OI target pick failed (ignored)")
+        _oi_t, _wall_strike, _block_strike, _oi_rr = None, None, None, None
+    if _oi_t is not None:
+        oi_target = _oi_t
+        target = oi_target
+        oi_dist = abs(_oi_t - live_price)
+        oi_wall_note = f"Target {_oi_t:g} sits just before the {_wall_strike:g} OI wall ({oi_dist:.0f} pts away, {_oi_rr:.1f}R)."
+        if _block_strike is not None:
+            oi_wall_penalty = 0.15
+            oi_wall_note += f" A nearer wall at {_block_strike:g} may slow price first."
+        elif _oi_rr is not None and _oi_rr < OI_MIN_RR:
+            oi_wall_penalty = 0.10
+    elif _block_strike is not None:
+        # a strong wall is sitting right in front of the entry: price is likely to stall there.  Do not invent a
+        # farther target through it; keep the normal target but charge the trade some probability (soft).
+        oi_wall_penalty = 0.25
+        oi_wall_note = f"Strong OI wall at {_block_strike:g} only {abs(_block_strike - live_price):.0f} pts ahead -- probability reduced."
 
     # Prefer the next VALIDATED structural boundary as target when no usable OI
     # wall was found. Round-number ladder levels are secondary.
@@ -1408,7 +1553,9 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     breakout_entry = (direction == 'BUY' and loc_for_distance in ('AT_RESISTANCE', 'NEAR_RESISTANCE')) or \
                      (direction == 'SELL' and loc_for_distance in ('AT_SUPPORT', 'NEAR_SUPPORT'))
     max_entry_distance = max((0.80 if not breakout_entry else 0.90) * float(atr), 8.0 if not breakout_entry else 10.0)
-    if level_distance > max_entry_distance:
+    if level_distance > max_entry_distance and strategy_path:
+        soft_flags.append(f"entry {level_distance:.0f} pts from the level")     # v42: strategy-led -> penalty, not a veto
+    elif level_distance > max_entry_distance:
         return {"has_setup": False, "reason": f"Entry is too far from the validated level ({level_distance:.1f} pts > {max_entry_distance:.1f} pts). Setup may be directionally correct but the location is poor; waiting for a better entry.", "context_audit": context_audit}
 
     # ------------------------------------------------------------------
@@ -1478,7 +1625,8 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     except Exception:
         logger.exception("learned adjustment failed (ignored)")
         _adj = {"delta_logit": 0.0, "note": "", "nn": {}, "memory": {}}
-    _penalty -= float(_adj.get("delta_logit", 0.0))
+    # v42: the learned adjustment can lower / raise the win-logit only within a cap, so a bad stretch can never push every setup to ~13%
+    _penalty -= max(-LEARNED_DRAG_CAP, min(LEARNED_BONUS_CAP, float(_adj.get("delta_logit", 0.0))))
     # REPEAT-MISTAKE CHECK: tags (extended entry, late session, huge day move ...) that have already lost often -> small penalty
     _tags = trade_diagnostics.risk_tags(factor_flags, _feats, hour=_now.hour + _now.minute / 60.0)
     try:
@@ -1486,7 +1634,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     except Exception:
         logger.exception("tag penalty failed (ignored)")
         _tag_pen, _tag_note = 0.0, ""
-    _penalty += _tag_pen
+    _penalty += min(TAG_PENALTY_CAP, float(_tag_pen or 0.0))
     edge = trade_learning.compute_edge(factor_flags, rr, _penalty)
     edge["learning_note"] = _adj.get("note", "")
     confidence_pct = edge["confidence_pct"]
@@ -1513,7 +1661,34 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     edge["bar_notes"] = _bar_notes
     edge["required_probability"] = round(edge_model.required_probability(rr, _min_ev), 4)
 
-    if edge["expectancy_r"] < _min_ev:
+    # ------------------------------------------------------------------
+    # v42 MOMENTUM CAPTURE LANE.  A clean continuation move is confirmed by LIVE evidence (price action score, VWAP/EMA side,
+    # >= 3 live strategies on the same side, no major conflict, not a severe chase).  The learned EV bar is built from the
+    # engine's own older losses and can not see that, so for such a move it no longer vetoes.  Still applied after this lane:
+    # Gemini final review, self-learning segment pause, cooldown, one-setup-one-trade, chase checks, event risk, session window.
+    # ------------------------------------------------------------------
+    _momentum, _mom_note = False, ""
+    try:
+        if strategy_path:
+            _sgn = 1.0 if direction == "BUY" else -1.0
+            _lscore = _sgn * float(((strategy_result.get("live_state") or {}).get("score", 0)) or 0)
+            _cons = float(strategy_result.get("buy_consensus" if direction == "BUY" else "sell_consensus", 0) or 0)
+            _cnt = int(strategy_result.get("buy_live_count" if direction == "BUY" else "sell_live_count", 0) or 0)
+            _chase_n = len((_eq or {}).get("chase_flags") or [])
+            _confirmed = bool((_eq or {}).get("confirm_flags"))
+            _severe = bool((_eq or {}).get("severe"))
+            if (_lscore >= MOMENTUM_MIN_LIVE and _cons >= MOMENTUM_MIN_CONSENSUS and _cnt >= MOMENTUM_MIN_COUNT
+                    and hard_conflicts == 0 and not _severe and (_chase_n <= 2 or _confirmed) and rr >= MOMENTUM_MIN_RR):
+                _momentum = True
+                _mom_note = (f"Momentum-capture lane: live price action {_lscore:+.0f}/100 in the trade direction, "
+                             f"{_cnt} live strategies (consensus {_cons:.0f}), no major conflict, entry not a severe chase "
+                             f"-> the learned EV/win-floor bar (model says {100 * float(edge.get('win_probability') or 0):.0f}% / "
+                             f"{edge['expectancy_r']:+.2f}R) is not allowed to veto it; Gemini still reviews it.")
+    except Exception:
+        logger.exception("momentum lane check failed (ignored)")
+    edge["momentum_lane"] = _momentum
+
+    if edge["expectancy_r"] < _min_ev and not _momentum:
         return {"has_setup": False,
                 "reason": (f"No positive edge: estimated win chance {confidence_pct:.1f}% at R:R {rr:.2f} gives expectancy "
                            f"{edge['expectancy_r']:+.2f}R, below the required {_min_ev:+.2f}R "
@@ -1527,7 +1702,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
 
     _wp = float(edge.get("win_probability") or 0.0)
     _floor, _floor_note = _win_floor(_now)
-    if _wp < _floor:
+    if _wp < _floor and not _momentum:
         return {"has_setup": False,
                 "reason": (f"Win-chance floor: the engine's own win probability for this setup is {100 * _wp:.1f}%, below the minimum "
                            f"{100 * _floor:.0f}%{(' (' + _floor_note + ')') if _floor_note else ''}. Even with a positive-looking R:R it would lose about {100 * (1 - _wp):.0f} of 100 times. "
@@ -1543,7 +1718,8 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     _playbook = (strategy_result.get("selected_strategies") or ["none"])[0] if strategy_path else "ai_only"
     _grade = "A" if (critical_true >= 7 and hard_conflicts == 0) else ("B" if critical_true >= 5 else "C")
     _entry_meta = {"playbook": str(_playbook), "grade": _grade, "hour_bucket": f"{_now.hour:02d}h",
-                   "side": direction, "probe": False, "logic_version": trade_learning.LOGIC_VERSION}
+                   "side": direction, "probe": False, "logic_version": trade_learning.LOGIC_VERSION,
+                   "lane": "momentum" if _momentum else "edge"}
     _seg_blocked, _seg_reason = trade_learning.segment_gate(_entry_meta)
     if _seg_blocked:
         return {"has_setup": False, "reason": _seg_reason, "context_audit": context_audit,
@@ -1561,6 +1737,9 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     else:
         confidence_note = (f"Rule-based prior only -- no resolved trades yet, so this is a conservative estimate, not a measured win rate. "
                            f"Expectancy {edge['expectancy_r']:+.2f}R at R:R {rr:.2f}.")
+    if _momentum:
+        confidence_note = _mom_note + " | " + confidence_note
+        factor_flags["_momentum_lane"] = True
     factor_flags["_entry_meta"] = _entry_meta
     factor_flags["_playbook_label"] = str(_playbook)
     factor_flags["_setup_score"] = round(_sscore, 1)
@@ -1611,6 +1790,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         "target_note": oi_wall_note, "learning_note": edge.get("learning_note", ""),
         "entry_quality": _eq, "pcr_velocity": _pv or None,
         "oi_buildup": _oib, "event_risk": _event, "risk_tags": factor_flags.get("_risk_tags"), "repeat_mistake_note": _tag_note,
+        "momentum_lane": bool(_momentum), "momentum_note": _mom_note,
         "expectancy_r": edge["expectancy_r"], "win_probability": edge["win_probability"],
         "breakeven_probability": edge["breakeven_probability"], "required_ev_r": edge["required_ev_r"],
         "edge": edge,

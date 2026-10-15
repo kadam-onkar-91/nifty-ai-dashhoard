@@ -48,6 +48,7 @@ from alert_manager import AlertManager
 from ai_chat import render_ai_chat
 import ui_theme
 import live_chart
+import tick_guard
 
 # Page Configuration
 st.set_page_config(page_title="Nifty 50 Real-Time AI Predictor", page_icon="⚡", layout="wide")
@@ -162,6 +163,12 @@ with st.sidebar:
         st.caption("Abhi Nifty 50 dashboard dikh raha hai.")
 
 ACTIVE_SYMBOL = st.session_state.get("active_symbol") or None
+
+# SL / target are checked on the LIVE price every ~2 s by a background thread (independent of the heavy 30 s refresh below).
+try:
+    tick_guard.ensure_started()
+except Exception:
+    logger.exception("tick_guard could not start (ignored)")
 
 # -------------------------------------------------------------
 # LIVE DASHBOARD -- runs as an independent st.fragment that refreshes
@@ -1287,7 +1294,7 @@ def _live_dashboard():
                        f"SELL {strategy_result.get('sell_consensus')} ({strategy_result.get('sell_live_count')} live) | "
                        f"{strategy_result.get('blocked_count', 0)} stale/against-the-move signal(s) blocked")
         if _strategy_rows:
-            with st.expander(f"🧩 Named Strategy Library — {len(_strategy_rows)} strategies scanned, {len(_ranked)} live", expanded=bool(_ranked)):
+            with st.expander(f"🧩 Named Strategy Library — {len(_strategy_rows)} strategies scanned, {len(_ranked)} live", expanded=False):
                 st.dataframe(pd.DataFrame(_strategy_rows), hide_index=True, width="stretch")
                 st.caption("Win rate sirf resolved historical samples se aata hai. Naya strategy/history insufficient ho to N/A dikhaya jata hai; fake accuracy nahi.")
 
@@ -1361,6 +1368,10 @@ def _live_dashboard():
                 _pcr_vel = pcr_velocity.bias()
             except Exception:
                 _pcr_vel = None
+            try:
+                ai_trade_decision.prewarm_news_brief(GEMINI_API_KEYS)     # Google-Search research brief, refreshed in the background
+            except Exception:
+                logger.exception('news brief prewarm failed (ignored)')
             _decision = ai_trade_decision.generate_trade_decision(
                 live_price=live_price, level_prediction=level_prediction,
                 atr=ai_analysis['tech_metrics'].get('atr', 15.0), max_pain=max_pain,
@@ -1512,6 +1523,8 @@ def _live_dashboard():
                     st.caption(("⚠️ " if _eqd.get('chase_flags') else "✅ ") + "Entry quality: " + str(_eqd['summary']))
                 if (_decision.get('pcr_velocity') or {}).get('note'):
                     st.caption("📈 " + str(_decision['pcr_velocity']['note']))
+                if _decision.get('momentum_lane'):
+                    st.caption("🚀 " + str(_decision.get('momentum_note')))
                 if _decision.get('target_note'):
                     st.caption("🎯 " + str(_decision['target_note']))
                 if _decision.get('learning_note'):
@@ -1532,6 +1545,10 @@ def _live_dashboard():
                 _gr = _decision.get('gemini_review') or {}
                 if _gr.get('status') == 'APPROVED':
                     st.success(f"🧠 Gemini Final Review ({'with Google Search' if _gr.get('search_used') else 'no search'}): APPROVED {_gr.get('direction')} | {str(_gr.get('reason',''))[:900]}")
+                    if _gr.get('news_brief'):
+                        st.caption(f"🌐 Google research brief ({_gr.get('news_brief_age_s')}s purana, {'grounded' if _gr.get('search_grounded') else 'ungrounded'}): {str(_gr.get('news_brief'))[:600]}")
+                    elif _gr.get('search_error'):
+                        st.caption(f"🌐 Google search nahi chala: {_gr.get('search_error')}")
                 elif _gr.get('status') == 'LOCAL_FALLBACK_APPROVED':
                     st.info(f"🧠 Gemini unreachable -> strict local review APPROVED | {str(_gr.get('reason',''))[:900]}")
                 elif _gr.get('status') in ('REJECTED','NO_TRADE','LOCAL_FALLBACK_BLOCKED'):
@@ -1708,9 +1725,9 @@ def _live_dashboard():
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("📊 Institutional Order Flow Chart (VWAP & Volume Profile)")
 
-        st.session_state["_live_poc"] = float(df['POC_Level'].iloc[-1])   # shown on the live 1-minute chart
+        st.session_state["_live_poc"] = float(df['POC_Level'].iloc[-1])   # shown on the live 5-minute chart
         if _LIVE_CHART_ON:
-            st.caption("📈 Live 1-minute candle chart (TradingView style) dashboard ke sabse upar hai.")
+            st.caption("📈 Live 5-minute candle chart dashboard ke sabse upar hai -- ek line ka ON/OFF switch (jab dekhna ho tab ON karo).")
         else:
             chart_df = df.tail(100)
             fig = go.Figure()
