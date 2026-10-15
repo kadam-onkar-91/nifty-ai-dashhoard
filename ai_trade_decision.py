@@ -56,6 +56,9 @@ FLOOR_RELAX_AFTER_TRADING_DAYS = 2   # safety valve against the old "no trade fo
 FLOOR_RELAXED_PROB = 0.31            # without a logged setup the win-chance floor eases to this (never lower)
 DROUGHT_RELIEF_MIN_PROB = 0.40  # the dry-spell relief may only ease the EV bar for setups that are at least this likely to win
 ENFORCE_SESSION_WINDOW = True
+PERSIST = {}                    # v47: server-memory store (survives the keeper's 30-min page reloads; st.session_state does NOT).
+                                # holds fast-lane carry, pre-plan approvals + their hourly/daily Gemini budget, and the review cache.
+PRESSING_LEVEL_BLOCK = True     # v47: no entry INTO a ceiling/floor that is rejecting price (break not confirmed yet). Entry comes after the break closes.
 # v44 FAST LANE (price-action momentum / reversal / pullback entries that do NOT wait for the history-calibrated EV bar,
 # the global veto or the S/R-location gate -- see fast_lane.py).  Safety kept: stale data, entry window, event risk,
 # cooldown, one-signal-one-trade, structure SL, min R:R.
@@ -585,6 +588,7 @@ _GATE_PATTERNS = (
     ("Strong global veto", "Global research is STRONGLY"),
     ("Falling/rising knife", "will not buy the turning point"),
     ("Falling/rising knife", "will not sell the turning point"),
+    ("Pressing into level (break not closed yet)", "Pressing into level"),
     ("S/R location / confirmation", "needs"),
     ("S/R location / confirmation", "rejection"),
     ("S/R map unclear", "S/R"),
@@ -1758,6 +1762,11 @@ def _generate_trade_decision_classic(live_price, level_prediction, atr, max_pain
     # ENTRY QUALITY (price-action): chasing an extended move costs probability; a sweep / rejection / pullback earns some back.
     _eq = (entry_quality or {}).get(direction) if isinstance(entry_quality, dict) and direction in entry_quality else entry_quality
     _eq = _eq if isinstance(_eq, dict) and ("penalty_logit" in _eq) else None
+    if _eq and PRESSING_LEVEL_BLOCK and isinstance(_eq.get("pressing"), dict):
+        _pr = _eq["pressing"]
+        return {"has_setup": False, "context_audit": context_audit,
+                "reason": ("Pressing into level: " + str(_pr.get("why")) + ". A break must CLOSE beyond " + f"{_pr.get('level'):g}" +
+                           " first (then retest), or a bounce setup must form on the other side -- no entry before the break.")}
     if _eq:
         _penalty += float(_eq.get("penalty_logit", 0.0))
         factor_flags["entry_not_extended"] = not _eq.get("chase_flags")

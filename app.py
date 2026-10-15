@@ -1382,23 +1382,23 @@ def _live_dashboard():
                 strategy_result=strategy_result,
                 raw_option_chain=df_option_chain,
                 entry_quality=_entry_q, pcr_velocity=_pcr_vel,
-                price_df=df, fl_carry=st.session_state.get('_fl_carry'),
+                price_df=df, fl_carry=ai_trade_decision.PERSIST.get('_fl_carry'),
                 prev_day=({'pdh': pivots.get('pdh'), 'pdl': pivots.get('pdl')} if isinstance(pivots, dict) and pivots.get('status') == 'OK' else None),
             )
 
             # v44: a fast-lane candidate must survive while Gemini reviews it (the move may keep running for a few candles)
             try:
                 if _decision.get('has_setup') and _decision.get('fast_lane'):
-                    _cr = st.session_state.get('_fl_carry') or {}
+                    _cr = ai_trade_decision.PERSIST.get('_fl_carry') or {}
                     if (_cr.get('cand') or {}).get('formed_at') != _decision.get('fast_lane_formed_at'):
-                        st.session_state['_fl_carry'] = {'cand': _decision.get('fast_lane_candidate'), 't': time.time()}
+                        ai_trade_decision.PERSIST['_fl_carry'] = {'cand': _decision.get('fast_lane_candidate'), 't': time.time()}
             except Exception:
                 pass
 
             # v45 PRE-PLANS: bounce / rejection / breakout / breakdown set-ups that are FORMING get their report to Gemini BEFORE the
             # trigger, so the approval is already there when price triggers (no review delay at the moment that matters).
             try:
-                _pl_state = st.session_state.setdefault('_fl_plans', {})
+                _pl_state = ai_trade_decision.PERSIST.setdefault('_fl_plans', {})
                 _pl_day = str(df.index[-1])[:10]
                 for _k in [k for k, v in _pl_state.items() if (time.time() - v['t']) > 2700 or not k.endswith(_pl_day)]:
                     _pl_state.pop(_k, None)
@@ -1406,7 +1406,7 @@ def _live_dashboard():
                     for _p in fast_lane.plans(df, sr_context=sr_context, prev_day=({'pdh': pivots.get('pdh'), 'pdl': pivots.get('pdl')} if isinstance(pivots, dict) and pivots.get('status') == 'OK' else None)):
                         if _p['id'] not in _pl_state and len(_pl_state) < 6:
                             _pl_state[_p['id']] = {'plan': _p, 't': time.time(), 'review': None}
-                    _bud = st.session_state.setdefault('_fl_plan_budget', {'h': None, 'n': 0, 'd': None, 'dn': 0})
+                    _bud = ai_trade_decision.PERSIST.setdefault('_fl_plan_budget', {'h': None, 'n': 0, 'd': None, 'dn': 0})
                     _hk = time.strftime('%Y%m%d%H')
                     if _bud['h'] != _hk:
                         _bud['h'], _bud['n'] = _hk, 0
@@ -1494,12 +1494,12 @@ def _live_dashboard():
                 # v35: one Gemini review per candle + direction (strategy list/formed_at no longer part of the key),
                 # so switching/re-ranking strategies inside the same candle never triggers a new call.
                 _sig = (str(_decision.get('fast_lane_formed_at') if _decision.get('fast_lane') else df.index[-1]), str(_decision.get('direction')))
-                _cache = st.session_state.setdefault('_gemini_trade_review_cache', {})
+                _cache = ai_trade_decision.PERSIST.setdefault('_gemini_trade_review_cache', {})
                 _pre = None
                 if _decision.get('fast_lane'):
                     try:
                         _atr_m = float(_decision.get('fast_lane_candidate', {}).get('atr') or 12.0)
-                        for _pid, _pv in (st.session_state.get('_fl_plans') or {}).items():
+                        for _pid, _pv in (ai_trade_decision.PERSIST.get('_fl_plans') or {}).items():
                             _rv = _pv.get('review') or {}
                             _pp = _pv['plan']
                             if (_rv.get('status') == 'APPROVED' and _pp['direction'] == _decision.get('direction')
@@ -1563,8 +1563,8 @@ def _live_dashboard():
             else:
                 _decision['gemini_review'] = _gemini_review
             try:    # fast-lane carry ends once the candidate is taken or Gemini/local review said no
-                if st.session_state.get('_fl_carry') and (_decision.get('has_setup') or _gemini_review.get('status') in ('REJECTED', 'LOCAL_FALLBACK_BLOCKED')):
-                    st.session_state.pop('_fl_carry', None)
+                if ai_trade_decision.PERSIST.get('_fl_carry') and (_decision.get('has_setup') or _gemini_review.get('status') in ('REJECTED', 'LOCAL_FALLBACK_BLOCKED')):
+                    ai_trade_decision.PERSIST.pop('_fl_carry', None)
             except Exception:
                 pass
             # v44: replay of the fast lane over today's candles vs the real 50+ pt swings ("kaun sa move pakda / chhoota")

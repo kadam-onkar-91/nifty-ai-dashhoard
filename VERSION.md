@@ -1,3 +1,17 @@
+# NIFTY AI -- v47: no entry INTO a rejecting level, quieter/faster refresh, review state survives reloads
+
+- **Problem (15 Oct ~13:48):** Nifty was +419 pts (+1.84%) and the engine opened BUY 23050 CE (conf 39.7%) at 23,041, a few points under a 23,046-23,050 ceiling that had just
+  rejected price 3-4 candles in a row. The engine's own rule is "break first, enter AFTER the break" -- this was the entry BEFORE the break.
+- **`entry_quality.py` (new check 8):** BUY a few points under a ceiling (or SELL just above a floor) that rejected price in >= 2 of the last 4 candles, after price actually ran
+  >= 1.5 ATR into it, and no closed candle has closed beyond it yet -> `pressing`. Bounce/rejection trades (the other side of the level) are never touched; once two candles close
+  beyond the level it clears by itself. `ai_trade_decision.PRESSING_LEVEL_BLOCK = True` makes the classic path refuse it ("Pressing into level"); set False to make it advice only.
+  Fires on ~0.5% of candle checks in a synthetic replay, so it cannot freeze the engine.
+- **`market_breadth.py`:** `TATAMOTORS.NS` (delisted after the demerger) -> `TMPV.NS`. A ticker Yahoo cannot serve is now skipped for 6 h instead of being re-requested (and logged as
+  "No data found") on every refresh -- that repeated failing 49-ticker download was part of the slow refresh.
+- **`ai_trade_decision.PERSIST` / `app.py`:** fast-lane carry, pre-plan approvals, their hourly/daily Gemini budget and the review cache moved from `st.session_state` to server memory.
+  The keeper reloads the page every 30 min, which used to wipe them (lost approvals, quota counters reset).
+- Tests: `python -m unittest tests_v47` (8). All older suites still pass.
+
 # NIFTY AI -- v44: FAST LANE (catch the big moves, bounce/rejection, pullbacks)
 
 - **Problem (14 Oct):** Nifty fell ~130 pts (22753 -> 22624) with SELL consensus 97 and live price action DOWN, but the engine showed "No positive edge: win chance 11-22%"
