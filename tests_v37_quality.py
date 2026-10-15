@@ -136,14 +136,14 @@ class WinFloorValve(unittest.TestCase):
             tl.get_recent_setups = orig
 
     def test_normal_floor_after_recent_trade(self):
-        self.assertEqual(self._floor("2026-10-08 14:20:16", datetime(2026, 10, 9, 10, 0))[0], 0.33)
+        self.assertEqual(self._floor("2026-10-08 14:20:16", datetime(2026, 10, 9, 10, 0))[0], 0.35)
 
     def test_floor_eases_after_two_trading_days_without_setup(self):
         f, note = self._floor("2026-10-06 10:00:00", datetime(2026, 10, 8, 11, 0))
         self.assertEqual(f, 0.31); self.assertIn("eased", note)
 
     def test_weekend_does_not_count_as_drought(self):
-        self.assertEqual(self._floor("2026-10-09 14:00:00", datetime(2026, 10, 12, 10, 0))[0], 0.33)   # Fri -> Mon
+        self.assertEqual(self._floor("2026-10-09 14:00:00", datetime(2026, 10, 12, 10, 0))[0], 0.35)   # Fri -> Mon
 
 
 class LateSessionWindow(unittest.TestCase):

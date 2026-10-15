@@ -31,8 +31,6 @@ import market_status
 import sniper_setup
 import trade_learning
 import ai_trade_decision
-import gemini_pool
-import fast_lane
 import strategy_engine
 import order_flow
 import backtest_engine
@@ -183,7 +181,7 @@ try:
     _REFRESH_IS_LIVE = market_status.get_market_status()["state"] in ("OPEN", "PRE_OPEN")
 except Exception:
     _REFRESH_IS_LIVE = True
-_REFRESH_SEC = 45 if _REFRESH_IS_LIVE else 180   # 45 s: a full cycle takes 10-25 s, so 30 s made refreshes pile up/late
+_REFRESH_SEC = 30 if _REFRESH_IS_LIVE else 180
 
 
 @st.fragment(run_every=_REFRESH_SEC)
@@ -1289,8 +1287,7 @@ def _live_dashboard():
                        f"SELL {strategy_result.get('sell_consensus')} ({strategy_result.get('sell_live_count')} live) | "
                        f"{strategy_result.get('blocked_count', 0)} stale/against-the-move signal(s) blocked")
         if _strategy_rows:
-            with st.expander("🧩 Named Strategy Library (strategy table)", expanded=False):   # fixed label = open/closed state survives refresh
-                st.caption(f"{len(_strategy_rows)} strategies scanned, {len(_ranked)} live")
+            with st.expander(f"🧩 Named Strategy Library — {len(_strategy_rows)} strategies scanned, {len(_ranked)} live", expanded=bool(_ranked)):
                 st.dataframe(pd.DataFrame(_strategy_rows), hide_index=True, width="stretch")
                 st.caption("Win rate sirf resolved historical samples se aata hai. Naya strategy/history insufficient ho to N/A dikhaya jata hai; fake accuracy nahi.")
 
@@ -1382,77 +1379,7 @@ def _live_dashboard():
                 strategy_result=strategy_result,
                 raw_option_chain=df_option_chain,
                 entry_quality=_entry_q, pcr_velocity=_pcr_vel,
-                price_df=df, fl_carry=ai_trade_decision.PERSIST.get('_fl_carry'),
-                prev_day=({'pdh': pivots.get('pdh'), 'pdl': pivots.get('pdl')} if isinstance(pivots, dict) and pivots.get('status') == 'OK' else None),
             )
-
-            # v44: a fast-lane candidate must survive while Gemini reviews it (the move may keep running for a few candles)
-            try:
-                if _decision.get('has_setup') and _decision.get('fast_lane'):
-                    _cr = ai_trade_decision.PERSIST.get('_fl_carry') or {}
-                    if (_cr.get('cand') or {}).get('formed_at') != _decision.get('fast_lane_formed_at'):
-                        ai_trade_decision.PERSIST['_fl_carry'] = {'cand': _decision.get('fast_lane_candidate'), 't': time.time()}
-            except Exception:
-                pass
-
-            # v45 PRE-PLANS: bounce / rejection / breakout / breakdown set-ups that are FORMING get their report to Gemini BEFORE the
-            # trigger, so the approval is already there when price triggers (no review delay at the moment that matters).
-            try:
-                _pl_state = ai_trade_decision.PERSIST.setdefault('_fl_plans', {})
-                _pl_day = str(df.index[-1])[:10]
-                for _k in [k for k, v in _pl_state.items() if (time.time() - v['t']) > 2700 or not k.endswith(_pl_day)]:
-                    _pl_state.pop(_k, None)
-                if not _open_setup:
-                    for _p in fast_lane.plans(df, sr_context=sr_context, prev_day=({'pdh': pivots.get('pdh'), 'pdl': pivots.get('pdl')} if isinstance(pivots, dict) and pivots.get('status') == 'OK' else None)):
-                        if _p['id'] not in _pl_state and len(_pl_state) < 6:
-                            _pl_state[_p['id']] = {'plan': _p, 't': time.time(), 'review': None}
-                    _bud = ai_trade_decision.PERSIST.setdefault('_fl_plan_budget', {'h': None, 'n': 0, 'd': None, 'dn': 0})
-                    _hk = time.strftime('%Y%m%d%H')
-                    if _bud['h'] != _hk:
-                        _bud['h'], _bud['n'] = _hk, 0
-                    if _bud.get('d') != _pl_day:
-                        _bud['d'], _bud['dn'] = _pl_day, 0
-                    _in_flight = any((v.get('review') or {}).get('status') == 'PENDING' for v in _pl_state.values())
-                    try:
-                        _cool = gemini_pool.seconds_until_available(GEMINI_API_KEYS, gemini_pool.REVIEW_MODELS) > 0
-                    except Exception:
-                        _cool = False
-                    for _pid, _pv in list(_pl_state.items()):
-                        _rst = (_pv.get('review') or {}).get('status')
-                        if _rst is None:        # NEW review: quota guard (imminent only, hourly budget, one at a time, not while keys cool down)
-                            _pp0 = _pv['plan']
-                            if (_cool or _in_flight or _bud['n'] >= ai_trade_decision.FAST_LANE_PLAN_REVIEWS_PER_HOUR or _bud['dn'] >= ai_trade_decision.FAST_LANE_PLAN_REVIEWS_PER_DAY
-                                    or _pp0['score'] < ai_trade_decision.FAST_LANE_PLAN_MIN_SCORE
-                                    or abs(float(live_price) - _pp0['trigger']) > ai_trade_decision.FAST_LANE_PLAN_IMMINENT_ATR * float(_pp0.get('atr') or 12.0)):
-                                continue
-                            _bud['n'] += 1
-                            _bud['dn'] += 1
-                            _in_flight = True
-                        if _rst in ('APPROVED', 'REJECTED'):
-                            continue
-                        if _rst == 'UNAVAILABLE' and (time.time() - _pv.get('t_try', 0)) < 120:
-                            continue
-                        _pv['t_try'] = time.time()
-                        _pp = _pv['plan']
-                        _pdec = {'fast_lane': True, 'fast_lane_playbook': _pp['kind'], 'fast_lane_score': _pp['score'],
-                                 'fast_lane_why': _pp['why'] + ' | PRE-PLAN (conditional, not triggered yet)', 'direction': _pp['direction'],
-                                 'underlying_entry': _pp['trigger'], 'stop_loss': _pp['stop_loss'], 'target': _pp['target'],
-                                 'risk_reward': _pp['risk_reward'], 'level_price': _pp['level'], 'soft_flags': []}
-                        _rv = ai_trade_decision.gemini_review_async(
-                            ('PLAN', _pid), GEMINI_API_KEYS, st.session_state.get('dashboard_context', {}), {}, _pp['direction'],
-                            live_price=live_price, strategy_formed_at=_pp['created_at'], decision=_pdec,
-                            use_search=ai_trade_decision.FAST_LANE_REVIEW_SEARCH)
-                        _pv['review'] = _rv
-                        if _rv.get('status') != 'PENDING':
-                            ai_trade_decision.review_job_forget(('PLAN', _pid))
-                if _pl_state:
-                    _bits = []
-                    for _pid, _pv in _pl_state.items():
-                        _rs = (_pv.get('review') or {}).get('status', 'PENDING')
-                        _bits.append(f"{_pv['plan']['direction']} {_pv['plan']['kind'].replace('PLAN_', '')} @ {_pv['plan']['trigger']:g} ({'✅ approved' if _rs == 'APPROVED' else '❌ rejected' if _rs == 'REJECTED' else '⏳ review'})")
-                    st.caption("👀 Watch-plans (trigger se pehle Gemini ko dikhaye): " + " | ".join(_bits))
-            except Exception:
-                logger.exception('fast-lane plans failed (ignored)')
 
             # v35: if the AI engine matched a different live strategy to its own direction, use that one.
             if isinstance(_decision.get('strategy_engine'), dict) and _decision['strategy_engine'].get('rebased_from'):
@@ -1475,43 +1402,15 @@ def _live_dashboard():
                     shadow_trades.log(_decision['candidate'], ai_trade_decision.classify_block(_decision.get('reason')))
                 except Exception:
                     logger.exception('shadow log failed (ignored)')
-            if _decision.get('has_setup') and _decision.get('fast_lane') and not ai_trade_decision.FAST_LANE_REQUIRES_GEMINI:
-                # v44 FAST LANE: price-action entry executes immediately (a Gemini round-trip would be 1-3 candles late on a fast move).
-                _gemini_review = {"status": "FAST_LANE", "approved": True, "model": "fast_lane_v44",
-                                  "reason": "Fast-lane price-action rules: " + str(_decision.get('fast_lane_why') or '')}
-                _decision = ai_trade_decision.apply_gemini_verdict(_decision, _gemini_review)
-                _fl_flags = dict(_decision.get('factor_flags') or {})
-                _fl_flags['_gemini'] = {"status": "FAST_LANE", "model": "fast_lane_v44", "reviewer": "FAST_LANE_RULES",
-                                        "reason": str(_decision.get('fast_lane_why') or '')[:500], "at": trade_learning._now_str()}
-                _fl_flags['gemini_final_review_approved'] = False
-                _fl_flags['external_ai_aligned'] = False
-                _decision['factor_flags'] = _fl_flags
-            elif _decision.get('has_setup') and (strategy_result.get('has_setup') or _decision.get('fast_lane')):
-                _formed_at = (_decision.get('fast_lane_formed_at') if _decision.get('fast_lane') else None) or strategy_result.get('formed_at') or str(df.index[-1])
+            if _decision.get('has_setup') and strategy_result.get('has_setup'):
+                _formed_at = strategy_result.get('formed_at') or str(df.index[-1])
                 # Signature = WHICH setup (strategy time + direction + strategy names). The live price is
                 # deliberately NOT part of it: it changes every 30 s refresh and used to trigger a brand-new
                 # Gemini call each time, burning the quota of all 5 keys on one and the same setup.
                 # v35: one Gemini review per candle + direction (strategy list/formed_at no longer part of the key),
                 # so switching/re-ranking strategies inside the same candle never triggers a new call.
-                _sig = (str(_decision.get('fast_lane_formed_at') if _decision.get('fast_lane') else df.index[-1]), str(_decision.get('direction')))
-                _cache = ai_trade_decision.PERSIST.setdefault('_gemini_trade_review_cache', {})
-                _pre = None
-                if _decision.get('fast_lane'):
-                    try:
-                        _atr_m = float(_decision.get('fast_lane_candidate', {}).get('atr') or 12.0)
-                        for _pid, _pv in (ai_trade_decision.PERSIST.get('_fl_plans') or {}).items():
-                            _rv = _pv.get('review') or {}
-                            _pp = _pv['plan']
-                            if (_rv.get('status') == 'APPROVED' and _pp['direction'] == _decision.get('direction')
-                                    and (time.time() - _pv['t']) <= 2700
-                                    and (abs(float(_decision['underlying_entry']) - _pp['trigger']) <= 1.6 * _atr_m
-                                         or abs(float(_decision.get('level_price') or 0) - _pp['level']) <= 1.0 * _atr_m)):
-                                _pre = dict(_rv, reason="PRE-APPROVED plan (" + _pp['kind'] + " @ " + str(_pp['trigger']) + "): " + str(_rv.get('reason') or ''))
-                                break
-                    except Exception:
-                        _pre = None
-                if _pre is not None:
-                    _cache[_sig] = (time.time(), _pre)
+                _sig = (str(df.index[-1]), str(_decision.get('direction')))
+                _cache = st.session_state.setdefault('_gemini_trade_review_cache', {})
                 _hit = _cache.get(_sig)
                 _ttl = 45 if (_hit and _hit[1].get('status') == 'UNAVAILABLE') else 300 if (_hit and _hit[1].get('status') == 'REJECTED') else 600   # retry outages sooner
                 if _hit and (time.time() - _hit[0]) < _ttl:
@@ -1528,7 +1427,6 @@ def _live_dashboard():
                         live_price=live_price,
                         strategy_formed_at=_formed_at,
                         decision=dict(_decision),
-                        use_search=(ai_trade_decision.FAST_LANE_REVIEW_SEARCH if _decision.get('fast_lane') else True),
                     )
                     if _gemini_review.get('status') != 'PENDING':
                         _cache[_sig] = (time.time(), _gemini_review)
@@ -1541,7 +1439,7 @@ def _live_dashboard():
                 # Any other failure (404 retired model, 5xx, bad key...) -> NO trade without Gemini's own review.
                 _att = _gemini_review.get('attempts') or []
                 _quota_only = bool(_att) and all(str(a).strip().endswith('429') for a in _att)
-                if _gemini_review.get('status') == 'UNAVAILABLE' and ai_trade_decision.GEMINI_FAIL_OPEN and (_quota_only or _decision.get('fast_lane')):
+                if _gemini_review.get('status') == 'UNAVAILABLE' and ai_trade_decision.GEMINI_FAIL_OPEN and _quota_only:
                     # Gemini is genuinely OUT OF QUOTA on every key -> strict local review (with chase protection) decides
                     _fb = ai_trade_decision.local_fallback_review(_decision, _gemini_review)
                     _fb['gemini_error'] = _gemini_review.get('reason')
@@ -1562,34 +1460,6 @@ def _live_dashboard():
                         logger.exception('shadow log (gemini) failed (ignored)')
             else:
                 _decision['gemini_review'] = _gemini_review
-            try:    # fast-lane carry ends once the candidate is taken or Gemini/local review said no
-                if ai_trade_decision.PERSIST.get('_fl_carry') and (_decision.get('has_setup') or _gemini_review.get('status') in ('REJECTED', 'LOCAL_FALLBACK_BLOCKED')):
-                    ai_trade_decision.PERSIST.pop('_fl_carry', None)
-            except Exception:
-                pass
-            # v44: replay of the fast lane over today's candles vs the real 50+ pt swings ("kaun sa move pakda / chhoota")
-            try:
-                with st.expander("🔎 Fast-lane replay — aaj ke bade moves (pakda / chhoota)", expanded=False):
-                    _mm = st.number_input("Minimum move (points)", min_value=20, max_value=200, value=50, step=10, key="fl_replay_min")
-                    _rk = (str(df.index[-1]), int(_mm))
-                    if st.session_state.get('_fl_replay_key') != _rk:
-                        st.session_state['_fl_replay'] = fast_lane.replay(
-                            df, float(_mm), prev_day=({'pdh': pivots.get('pdh'), 'pdl': pivots.get('pdl')} if isinstance(pivots, dict) and pivots.get('status') == 'OK' else None))
-                        st.session_state['_fl_replay_key'] = _rk
-                    _rp = st.session_state.get('_fl_replay') or {}
-                    _stt = _rp.get('stats') or {}
-                    if _stt:
-                        st.caption(f"Price-action replay (Gemini/research votes ke bina): {_stt['moves']} moves ({_mm}+ pts) -> pakde {_stt['caught']}, chhoote {_stt['missed']} | "
-                                   f"signals {_stt['signals']} (win {_stt['wins']} / loss {_stt['losses']} / open {_stt['open']}), net {_stt['net_pts']:+.0f} pts")
-                        if _rp.get('moves'):
-                            st.dataframe(pd.DataFrame(_rp['moves']), use_container_width=True, hide_index=True)
-                        if _rp.get('signals'):
-                            st.dataframe(pd.DataFrame(_rp['signals'])[['time', 'direction', 'playbook', 'score', 'entry', 'sl', 'tp', 'result', 'pts']],
-                                         use_container_width=True, hide_index=True)
-                    else:
-                        st.caption("Replay ke liye abhi kaafi candles nahi hain.")
-            except Exception:
-                logger.exception('fast-lane replay failed (ignored)')
             # Chat box + Gemini see the FINAL AI trade decision/report (entry, SL, target, review verdict)
             try:
                 st.session_state['dashboard_context']['AI TRADE DECISION (final)'] = str({
@@ -1630,12 +1500,8 @@ def _live_dashboard():
                 dc1, dc2, dc3 = st.columns(3)
                 dc1.metric("Direction", f"{_decision['direction']} ({_decision['option_type']})")
                 dc2.metric("Strike", f"₹{_decision['strike']:,}")
-                if _decision.get('fast_lane'):
-                    dc3.metric("Fast lane score", f"{_decision.get('fast_lane_score', 0):.0f}/100",
-                               delta=f"{_decision.get('fast_lane_playbook')} @ RR {_decision.get('risk_reward', 0)}")
-                else:
-                    dc3.metric("Win chance (calibrated)", f"{_decision['confidence_pct']}%",
-                               delta=f"EV {(_decision.get('expectancy_r') or 0):+.2f}R @ RR {_decision.get('risk_reward', 0)}")
+                dc3.metric("Win chance (calibrated)", f"{_decision['confidence_pct']}%",
+                           delta=f"EV {_decision.get('expectancy_r', 0):+.2f}R @ RR {_decision.get('risk_reward', 0)}")
                 st.write(f"**Underlying Entry:** ₹{_decision['underlying_entry']:,.2f} | "
                         f"**Stop-Loss:** ₹{_decision['stop_loss']:,.2f} | **Target:** ₹{_decision['target']:,.2f}")
                 st.caption(f"Checklist: {_decision['factors_true']}/{_decision['factors_total']} factors aligned | "
@@ -1842,9 +1708,9 @@ def _live_dashboard():
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("📊 Institutional Order Flow Chart (VWAP & Volume Profile)")
 
-        st.session_state["_live_poc"] = float(df['POC_Level'].iloc[-1])   # shown on the live 5-minute chart
+        st.session_state["_live_poc"] = float(df['POC_Level'].iloc[-1])   # shown on the live 1-minute chart
         if _LIVE_CHART_ON:
-            st.caption("📈 Live 5-minute candle chart (TradingView style) dashboard ke sabse upar hai.")
+            st.caption("📈 Live 1-minute candle chart (TradingView style) dashboard ke sabse upar hai.")
         else:
             chart_df = df.tail(100)
             fig = go.Figure()
@@ -2142,8 +2008,7 @@ def _live_dashboard():
 
 _LIVE_CHART_ON = False
 if not ACTIVE_SYMBOL:
-    with st.expander("📈 Live 5-minute chart (kholne ke liye dabao)", expanded=False):   # closed by default; you open it when needed
-        _LIVE_CHART_ON = live_chart.render()   # own fast refresh; False -> old chart is used
+    _LIVE_CHART_ON = live_chart.render()   # own fast refresh; False -> old chart is used
     _live_dashboard()
 else:
     st.info(f"📌 Abhi **{ACTIVE_SYMBOL}** dashboard active hai (neeche dekho). Nifty 50 index dashboard par wapas jaane ke liye sidebar mein '⬅ Nifty 50' dabao.")

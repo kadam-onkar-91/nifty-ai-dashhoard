@@ -3,7 +3,6 @@ logger = get_logger(__name__)
 import pandas as pd
 import requests
 import urllib.parse
-import time
 import yfinance as yf
 import streamlit as st
 from datetime import datetime, timedelta
@@ -27,7 +26,7 @@ NIFTY50_YF = [
     "HDFCBANK.NS", "RELIANCE.NS", "ICICIBANK.NS", "INFY.NS", "TCS.NS",
     "BHARTIARTL.NS", "ITC.NS", "LT.NS", "KOTAKBANK.NS", "AXISBANK.NS",
     "SBIN.NS", "HINDUNILVR.NS", "BAJFINANCE.NS", "M&M.NS", "SUNPHARMA.NS",
-    "NTPC.NS", "HCLTECH.NS", "MARUTI.NS", "TITAN.NS", "TMPV.NS",
+    "NTPC.NS", "HCLTECH.NS", "MARUTI.NS", "TITAN.NS", "TATAMOTORS.NS",
     "ULTRACEMCO.NS", "POWERGRID.NS", "BAJAJFINSV.NS", "ASIANPAINT.NS",
     "NESTLEIND.NS", "ONGC.NS", "ADANIPORTS.NS", "COALINDIA.NS", "WIPRO.NS",
     "JSWSTEEL.NS", "TATASTEEL.NS", "INDUSINDBK.NS", "GRASIM.NS", "TECHM.NS",
@@ -36,29 +35,6 @@ NIFTY50_YF = [
     "TATACONSUM.NS", "HDFCLIFE.NS", "SHRIRAMFIN.NS", "TRENT.NS",
     "ADANIENT.NS", "LTIM.NS", "HEROMOTOCO.NS",
 ]
-
-
-# v47: a ticker Yahoo cannot serve (delisted / renamed / index change) used to be requested again on EVERY refresh, printing
-# "No data found" each time and slowing the page.  After one failure it is skipped for 6 hours.
-_YF_DEAD = {}
-_YF_DEAD_TTL = 6 * 3600
-
-
-def _yf_alive(tickers):
-    now = time.time()
-    return [t for t in tickers if now - _YF_DEAD.get(t, 0.0) > _YF_DEAD_TTL]
-
-
-def _yf_mark_dead(data, tickers):
-    for t in tickers:
-        try:
-            ok = len(data[t]["Close"].dropna()) > 0
-        except Exception:
-            ok = False
-        if not ok:
-            _YF_DEAD[t] = time.time()
-            logger.warning("Yahoo has no data for %s -> skipped for %dh", t, _YF_DEAD_TTL // 3600)
-
 
 
 # =====================================================================
@@ -81,7 +57,7 @@ SECTOR_MAP = {
     "LT": "Infra / Capital Goods / Power", "ADANIPORTS": "Infra / Capital Goods / Power",
     "POWERGRID": "Infra / Capital Goods / Power", "NTPC": "Infra / Capital Goods / Power",
     "ADANIENT": "Infra / Capital Goods / Power",
-    "MARUTI": "Auto", "TATAMOTORS": "Auto", "TMPV": "Auto", "M&M": "Auto", "EICHERMOT": "Auto",
+    "MARUTI": "Auto", "TATAMOTORS": "Auto", "M&M": "Auto", "EICHERMOT": "Auto",
     "BAJAJ-AUTO": "Auto", "HEROMOTOCO": "Auto",
     "SUNPHARMA": "Pharma / Healthcare", "CIPLA": "Pharma / Healthcare", "DRREDDY": "Pharma / Healthcare",
     "DIVISLAB": "Pharma / Healthcare", "APOLLOHOSP": "Pharma / Healthcare",
@@ -187,10 +163,9 @@ def _get_prev_close_reference_map():
     "previous close" denominator comes from this reference.
     """
     try:
-        all_tickers = _yf_alive(list(set(NIFTY50_YF)))
+        all_tickers = list(set(NIFTY50_YF))
         data = yf.download(tickers=all_tickers, period="5d", interval="1d",
                             group_by="ticker", progress=False, threads=True)
-        _yf_mark_dead(data, all_tickers)
         ref = {}
         for t in all_tickers:
             try:
@@ -435,12 +410,10 @@ def _fetch_full50_upstox(access_token):
 @st.cache_data(ttl=90, show_spinner=False)
 def _fetch_full50_yfinance():
     try:
-        _alive = _yf_alive(NIFTY50_YF)
-        data = yf.download(tickers=_alive, period="5d", interval="1d",
+        data = yf.download(tickers=NIFTY50_YF, period="5d", interval="1d",
                             group_by="ticker", progress=False, threads=True)
-        _yf_mark_dead(data, _alive)
         rows = []
-        for sym in _alive:
+        for sym in NIFTY50_YF:
             try:
                 closes = data[sym]["Close"].dropna()
                 if len(closes) < 2:

@@ -31,11 +31,6 @@ STREAK_CANDLES = 4        # same-colour closed candles in a row
 DAY_MOVE_PCT = 1.0        # the day has ALREADY moved this % (from yesterday's close) in the trade direction
 DAY_MOVE_SEVERE_PCT = 1.4 # ... this much AND price sits at the day's low/high = chasing the very end of the move
 DAY_POS_EXTREME = 0.12    # 0 = exactly at the day's low (SELL) / high (BUY); within this fraction of the day's range = "at the extreme"
-PRESS_LOOKBACK = 26        # candles scanned for the ceiling (BUY) / floor (SELL) price is pressing against
-PRESS_NEAR_ATR = 0.8       # live price within this many ATR of that ceiling/floor (still on the wrong side of it)
-PRESS_MIN_REJECTIONS = 2   # of the last 4 closed candles, this many must show a rejection wick at the level
-PRESS_MIN_RUN_ATR = 1.5    # price must have actually RUN into the level (>= this many ATR over the lookback); a dead flat range is not 'pressing'
-PRESS_WICK_FRAC = 0.40     # a rejection wick = at least this fraction of the candle's range
 SHOCK_ATR = 3.0           # a closed candle in the last 3 this many ATR long = news/volatility shock: wait until it settles
 
 
@@ -137,40 +132,6 @@ def assess_entry(df, direction, atr=None):
                 flags.append(f"volatility shock in the last 15 min (a candle {max(rngs):.1f} ATR long) - wait for it to settle")
         except Exception:
             pass
-
-
-        # 8) PRESSING A CEILING / FLOOR: BUY a few points under a level that keeps rejecting price (or SELL just above a floor).
-        #    The engine's own rule is "break first, entry AFTER the break" -- this is the entry BEFORE the break.
-        #    Not flagged once a closed candle has already closed beyond the level (break confirmed), and a bounce trade
-        #    (opposite direction to the level) is never touched.
-        out["pressing"] = None
-        try:
-            if len(closed) >= 12:
-                base = closed.iloc[-PRESS_LOOKBACK:-2] if len(closed) > PRESS_LOOKBACK else closed.iloc[:-2]
-                lvl = float(base["High"].max()) if buy else float(base["Low"].min())
-                last2_beyond = all((float(c) > lvl) if buy else (float(c) < lvl) for c in closed["Close"].iloc[-2:])
-                gap = (lvl - live) if buy else (live - lvl)          # >0 = still on the wrong side of the level
-                tail = closed.iloc[-4:]
-                touched = (float(tail["High"].max()) >= lvl - 0.3 * a) if buy else (float(tail["Low"].min()) <= lvl + 0.3 * a)
-                rej = 0
-                for _, r in tail.iterrows():
-                    r_rng = float(r["High"]) - float(r["Low"])
-                    if r_rng <= 0:
-                        continue
-                    w = (float(r["High"]) - max(float(r["Open"]), float(r["Close"]))) if buy else (min(float(r["Open"]), float(r["Close"])) - float(r["Low"]))
-                    if w / r_rng >= PRESS_WICK_FRAC:
-                        rej += 1
-                win = closed.iloc[-PRESS_LOOKBACK:]
-                run_in = (lvl - float(win["Low"].min())) if buy else (float(win["High"].max()) - lvl)
-                m["press_level"], m["press_gap_atr"], m["press_rejections"] = round(lvl, 1), round(gap / a, 2), rej
-                if run_in >= PRESS_MIN_RUN_ATR * a and (not last2_beyond) and touched and 0 <= gap <= PRESS_NEAR_ATR * a and rej >= PRESS_MIN_REJECTIONS:
-                    word = "ceiling" if buy else "floor"
-                    txt = (f"price is pressing a {word} at {lvl:.0f} ({gap:.0f} pts away) that rejected it {rej} times in the last 4 candles "
-                           f"- the break is not confirmed yet, entry comes AFTER a close beyond it")
-                    out["pressing"] = {"level": round(lvl, 1), "gap_pts": round(gap, 1), "rejections": rej, "why": txt}
-                    flags.append(txt)
-        except Exception:
-            out["pressing"] = None
 
         # 5) streak of same-colour candles
         streak = 0

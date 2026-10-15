@@ -54,7 +54,7 @@ def log(msg: str) -> None:
 
 
 HEARTBEAT_RE = re.compile(r"IST Time:\s*(\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2})")
-MAX_LAG_S = 300            # the dashboard prints its own IST clock every cycle (~30 s); older than this = it stopped processing
+MAX_LAG_S = 180            # the dashboard prints its own IST clock every cycle (~30 s); older than this = it stopped processing
 
 
 def parse_heartbeat(body: str, now: datetime):
@@ -93,7 +93,6 @@ def main() -> int:
 
     wake_btn = re.compile(r"get this app back up", re.I)
     bad_text = ("Connection error", "Disconnected", "Oh no.", "This app has gone to sleep")
-    booting_text = ("is being deployed", "Your app is in the oven", "Please wait", "Spinning up")
     with sync_playwright() as p:
         browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = browser.new_context(viewport={"width": 1366, "height": 900})
@@ -148,16 +147,6 @@ def main() -> int:
             log("Streamlit app not visible yet (app may still be starting).")
             diag("open")
 
-        def act_like_user() -> None:
-            """Small real-user actions (mouse move + tiny scroll) so the tab never looks idle."""
-            try:
-                page.mouse.move(300 + int(time.time()) % 400, 300 + int(time.time()) % 200)
-                page.mouse.wheel(0, 80)
-                page.wait_for_timeout(300)
-                page.mouse.wheel(0, -80)
-            except Exception:
-                pass
-
         def healthy():
             """-> (ok, note).  ok=False when the page is broken OR the dashboard's own IST clock stopped moving (engine not cycling)."""
             try:
@@ -165,8 +154,6 @@ def main() -> int:
                 if scope is None:
                     return False, "no Streamlit page"
                 body = scope.locator("body").inner_text(timeout=15000)
-                if any(t in body for t in booting_text) and "IST Time:" not in body:
-                    return True, "app is (re)starting -> waiting"
                 if any(t in body for t in bad_text):
                     return False, "error/disconnected text on page"
                 lag = parse_heartbeat(body, ist_now())
@@ -204,12 +191,9 @@ def main() -> int:
                         diag("unhealthy")
                         continue
                     log(f"Page not healthy (#{fails}): {note} -> reloading.")
-                    if fails >= 3:           # app is probably down/redeploying: do not hammer it, wait longer
-                        time.sleep(min(60 * fails, 240))
                     open_app(); last_reload = time.time()
                     continue
                 fails = 0
-                act_like_user()
                 if time.time() - last_reload > RELOAD_EVERY_MIN * 60:
                     log("Periodic refresh of the tab.")
                     open_app(); last_reload = time.time()
