@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, time as dtime
 # ---------------------------------------------------------------------------
 MIN_EV_R = 0.05                 # expected value (in R) a trade must show to be taken
 DROUGHT_EV_RELIEF = 0.06        # in a dry spell the bar eases a little, but never below ~break-even
-DROUGHT_AFTER_MIN = 75          # "dry spell" = no setup logged for this long inside the session ...
+DROUGHT_AFTER_MIN = 120         # "dry spell" = no setup logged for this long inside the session ...
 DROUGHT_CHECK_FROM = dtime(11, 30)   # ... or none at all today by this time
 BAD_FORM_EV_EXTRA = 0.0         # was 0.10: demanding MORE after losses froze the engine (no trades -> no data -> no recovery).
                                 # Recovery now comes from shadow trades + the mistake memory instead of a higher wall.
@@ -47,7 +47,7 @@ OI_FRONT_RUN_ATR = 0.25
 TARGET_REACH_ATR = 0.7         # realistic reach inside the holding window = this x ATR x sqrt(hold bars)
 OI_MIN_RR = 1.2                 # wall closer than this many R -> not a usable target (soft penalty, no new gate)
 MAX_TARGET_R = 2.2              # cap for wall/structure targets; the ATR fallback stays at 1.5R
-MIN_WIN_PROB = 0.33             # HARD floor on the calibrated win probability.  A trade the engine itself rates at ~31% (it loses
+MIN_WIN_PROB = 0.35             # HARD floor on the calibrated win probability.  A trade the engine itself rates at ~31% (it loses
                                 # 2 of 3) can still show a hair of positive EV at 2.2R and, with the dry-spell relief, used to slip through.
                                 # Shadow trades now supply learning data, so the engine no longer needs low-quality trades to learn.
 ROUND_TRIP_COST_PTS = 2.0       # bid-ask spread + brokerage/STT, as underlying points per trade.  Charged against EV: a setup must beat its costs.
@@ -55,7 +55,7 @@ FLOOR_RELAX_AFTER_TRADING_DAYS = 2   # safety valve against the old "no trade fo
 FLOOR_RELAXED_PROB = 0.31            # without a logged setup the win-chance floor eases to this (never lower)
 DROUGHT_RELIEF_MIN_PROB = 0.40  # the dry-spell relief may only ease the EV bar for setups that are at least this likely to win
 ENFORCE_SESSION_WINDOW = True
-NO_ENTRY_BEFORE = dtime(9, 20)  # first 10 min: opening auction noise / wide spreads
+NO_ENTRY_BEFORE = dtime(9, 25)  # first 10 min: opening auction noise / wide spreads
 NO_ENTRY_AFTER = dtime(15, 10)  # entries allowed until the market's last minutes; the tool auto-closes open trades at 15:20
                                 # (trade_learning.EOD_SQUAREOFF), so nothing opened after 15:10 could do anything.  Was 14:45.
 
@@ -374,8 +374,6 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
         "2b) REJECT if the entry would CHASE a move: e.g. a SELL after the index has already fallen sharply today and is at/below its nearest support or has just bounced, or a BUY after a sharp rise at/above resistance or just after a pullback starts. Prefer a pullback/retest entry.\n"
         "2c) The candle table is chronological (oldest first, LAST row = current candle) and spans several days: "
         "older rows at different price levels are NORMAL, never a data mismatch. Judge price from the LAST rows and the Live price given above.\n"
-        "2d) A MOMENTUM-CONTINUATION entry (strong impulse, then a shallow pullback that holds VWAP/EMA20, or a fresh break of the last swing) is NOT a chase - approve it when the main evidence agrees. "
-        "A CONFIRMED REVERSAL (price stretched far from EMA20, rejection candle, reclaim of EMA9/prior extreme, listed in the strategy summary as a reversal strategy) is also valid - judge it on the rejection + reclaim, not on 'the trend is the other way'.\n"
         "3) Secondary factors may disagree; require the MAIN evidence (structure, VWAP, order flow, option OI, regime) to lean your way.\n"
         "3b) Do NOT reject only because a minor/secondary factor disagrees or because a pullback is possible. Reject for: stale data, "
         "price chasing, or MAIN evidence leaning the opposite way. If the setup is a retest/pullback entry that is NOT extended, approve it.\n"
@@ -876,19 +874,14 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     # candle has started reversing the immediately preceding move, the raw
     # signal is vetoed unless the opposite direction has a full-context
     # structural reversal at the correct boundary.
-    # v43: a formed REVERSAL strategy (stretch + rejection + reclaim) IS the structural turn -> it only needs a few
-    # independent confirmations, not the full 5/7 + exact support location.  Everything else keeps the strict rule.
-    _rev_sel = set(strategy_result.get("selected_strategies") or []) & set(strategy_engine.REVERSAL_KEYS)
     if raw_direction == 'BUY' and _bearish_transition and not (
-        (_bullish_reversal_score >= 5 and _loc_preview in ('AT_SUPPORT', 'NEAR_SUPPORT'))
-        or (_rev_sel and _bullish_reversal_score >= 3)
+        _bullish_reversal_score >= 5 and _loc_preview in ('AT_SUPPORT', 'NEAR_SUPPORT')
     ):
         return {"has_setup": False,
                 "reason": "BUY blocked: price has started turning down after the prior rise. The engine will not buy the turning point; it will wait for full-context bullish reversal/support defence.",
                 "context_audit": context_audit}
     if raw_direction == 'SELL' and _bullish_transition and not (
-        (_bearish_reversal_score >= 5 and _loc_preview in ('AT_RESISTANCE', 'NEAR_RESISTANCE'))
-        or (_rev_sel and _bearish_reversal_score >= 3)
+        _bearish_reversal_score >= 5 and _loc_preview in ('AT_RESISTANCE', 'NEAR_RESISTANCE')
     ):
         return {"has_setup": False,
                 "reason": "SELL blocked: price has started turning up after the prior fall. The engine will not sell the turning point; it will wait for full-context bearish reversal/resistance rejection.",
@@ -1263,10 +1256,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     unknown_major = int(regime_bias == "UNKNOWN") + int(mtf_bias == "UNKNOWN") + int(order_pressure == "")
     _unknown_limit = 3 if strategy_path else 2   # strategy-led: a missing module is unknown, not a veto
     _timing_block = (not factor_flags.get('entry_timing_safe') and not _early_entry_ok and not strategy_path)
-    # v43: with a formed strategy and >= 4 direct confirmations, TWO conflicting modules no longer veto the trade
-    # (the old rule blocked "4 confirmations / 2 conflicts" setups all day, incl. the big opening rally).  Three conflicts still do.
-    _max_hard = 2 if (strategy_path and critical_true >= 4) else 1
-    if critical_true < 3 or hard_conflicts > _max_hard or unknown_major >= _unknown_limit or not factor_flags.get('no_opposite_transition') or _timing_block or (reversal_used and ((direction == "SELL" and _bearish_reversal_score < 5) or (direction == "BUY" and _bullish_reversal_score < 5))):
+    if critical_true < 3 or hard_conflicts >= 2 or unknown_major >= _unknown_limit or not factor_flags.get('no_opposite_transition') or _timing_block or (reversal_used and ((direction == "SELL" and _bearish_reversal_score < 5) or (direction == "BUY" and _bullish_reversal_score < 5))):
         return {"has_setup": False,
                 "reason": f"Full-context confluence is not strong enough ({critical_true} direct confirmations; {hard_conflicts} major conflicts). Waiting for a cleaner setup.",
                 "context_audit": context_audit}

@@ -1,8 +1,8 @@
-"""TradingView-style LIVE 5-minute candle chart for NIFTY 50.
+"""TradingView-style LIVE 1-minute candle chart for NIFTY 50.
 
-* 5-minute candles (Upstox intraday feed), last ~1.5 days shown, zoom/pan stays put.
+* 1-minute candles (Upstox intraday feed), last ~3 hours shown, zoom/pan stays put.
 * The candle that is forming RIGHT NOW moves up/down every few seconds from the live LTP
-  (its High / Low stretch as price moves) and a new candle opens every 5 minutes.
+  (its High / Low stretch as price moves) and a new candle opens when the minute changes.
 * Own tiny auto-refresh (TICK_SECONDS) that only fetches the live price -- it does NOT re-run the
   heavy dashboard pipeline.  While the market is closed there is no timer: the last session is shown.
 
@@ -21,10 +21,10 @@ import market_data
 import market_status
 import upstox_auth
 
-TICK_SECONDS = 5        # live refresh speed while market is OPEN. 0 = feature off (old chart is used)
-MAX_CANDLES = 300       # candles kept in memory / on chart
-VISIBLE_CANDLES = 75    # candles visible when the chart first opens
-CANDLE_TTL = 30         # seconds before 5-minute history is re-fetched from broker
+TICK_SECONDS = 2        # live refresh speed while market is OPEN. 0 = feature off (old chart is used)
+MAX_CANDLES = 240       # candles kept in memory / on chart
+VISIBLE_CANDLES = 90    # candles visible when the chart first opens
+CANDLE_TTL = 20         # seconds before 1-minute history is re-fetched from broker
 
 UP, DOWN = "#26A69A", "#EF5350"
 
@@ -35,8 +35,8 @@ def enabled() -> bool:
 
 # ----------------------------------------------------------------------------- data
 @st.cache_data(ttl=CANDLE_TTL, show_spinner=False)
-def _history_5m(token: str):
-    return market_data.fetch_candles_for_timeframe(token, "minutes", "5", days_back=6)
+def _history_1m(token: str):
+    return market_data.fetch_candles_for_timeframe(token, "minutes", "1", days_back=4)
 
 
 @st.cache_data(ttl=1, show_spinner=False)
@@ -54,12 +54,12 @@ def _to_naive_ist(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def apply_live_tick(df: pd.DataFrame, ltp: float, now_naive: pd.Timestamp, forming: dict | None):
-    """Merge the live price into the 5-minute frame.
+    """Merge the live price into the 1-minute frame.
 
-    Returns (df, forming).  `forming` remembers the running High/Low of the current 5-minute candle so the
+    Returns (df, forming).  `forming` remembers the running High/Low of the current minute so the
     candle keeps stretching tick after tick even between broker history refreshes.
     """
-    minute = now_naive.floor("5min")
+    minute = now_naive.floor("min")
     prev_close = float(df["Close"].iloc[-1]) if len(df) and df.index[-1] < minute else None
 
     if not forming or forming.get("minute") != minute:
@@ -100,7 +100,7 @@ def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None):
 
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
-        x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Nifty 50 · 5m",
+        x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Nifty 50 · 1m",
         increasing=dict(line=dict(color=UP, width=1), fillcolor=UP),
         decreasing=dict(line=dict(color=DOWN, width=1), fillcolor=DOWN),
         whiskerwidth=0.4))
@@ -124,10 +124,10 @@ def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None):
     vis = d.tail(VISIBLE_CANDLES)
     lo, hi = float(vis["Low"].min()), float(vis["High"].max())
     pad = max((hi - lo) * 0.08, 5.0)
-    x_end = d.index[-1] + pd.Timedelta(minutes=25)
+    x_end = d.index[-1] + pd.Timedelta(minutes=6)
 
     fig.update_layout(
-        template="plotly_dark", height=520, uirevision="nifty-live-5m",
+        template="plotly_dark", height=520, uirevision="nifty-live-1m",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=4, r=4, t=36, b=8), hovermode="x unified", dragmode="pan",
         xaxis_rangeslider_visible=False,
@@ -152,10 +152,10 @@ def _header(ltp, prev_day_close, is_open):
     pct = (chg / prev_day_close * 100) if prev_day_close else 0.0
     col = UP if chg >= 0 else DOWN
     arrow = "▲" if chg >= 0 else "▼"
-    _n = pd.Timestamp.now(tz="Asia/Kolkata"); secs = 300 - ((_n.minute % 5) * 60 + _n.second)
+    secs = 60 - pd.Timestamp.now(tz="Asia/Kolkata").second
     badge = ('<span class="lc-live"><i></i>LIVE</span>' if is_open
              else '<span class="lc-live off">MARKET CLOSED</span>')
-    timer = f'<span class="lc-t">candle closes in {secs//60}m {secs%60:02d}s</span>' if is_open else ""
+    timer = f'<span class="lc-t">candle closes in {secs}s</span>' if is_open else ""
     st.markdown(f"""
 <style>
 .lc-bar{{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px;margin:2px 0 6px}}
@@ -189,9 +189,9 @@ def _body(was_open: bool):
         st.info("⏳ Live chart: broker login hone ka wait... (dashboard login hote hi chalu ho jaayega)")
         return
 
-    hist = _history_5m(token)
+    hist = _history_1m(token)
     if hist is None or len(hist) == 0:
-        st.warning("5-minute candles abhi broker se nahi mile -- thodi der mein dobara try hoga.")
+        st.warning("1-minute candles abhi broker se nahi mile -- thodi der mein dobara try hoga.")
         return
 
     df = _to_naive_ist(hist)
@@ -215,9 +215,9 @@ def _body(was_open: bool):
         width="stretch", key="live_candle_chart",
         config={"displaylogo": False, "scrollZoom": True,
                 "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"]})
-    st.caption("5-minute candles · Upstox live feed · chalti hui candle har "
+    st.caption("1-minute candles · Upstox live feed · chalti hui candle har "
                f"{TICK_SECONDS}s mein update hoti hai" if is_open else
-               "5-minute candles · Upstox · market band hai, aakhri session dikh raha hai")
+               "1-minute candles · Upstox · market band hai, aakhri session dikh raha hai")
 
 
 def render() -> bool:
