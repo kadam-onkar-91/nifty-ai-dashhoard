@@ -24,6 +24,7 @@ import pandas as pd
 import edge_model
 import trade_learning as tl
 import ai_trade_decision as atd
+atd.ADVISORY_GATES = False   # v45 made the heuristic gates advisory by default; these tests verify the strict (legacy) gate code paths
 
 KEYS = tl.ALL_FACTOR_KEYS
 

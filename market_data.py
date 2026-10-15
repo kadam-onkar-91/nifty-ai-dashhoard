@@ -98,7 +98,7 @@ def fetch_nifty_futures_volume(access_token):
     return fut_df['Volume']
 
 
-def fetch_candles_for_timeframe(access_token, unit, interval, days_back=5, instrument_key=NIFTY_INSTRUMENT_KEY):
+def fetch_candles_for_timeframe(access_token, unit, interval, days_back=8, instrument_key=NIFTY_INSTRUMENT_KEY):
     """Public wrapper -- PHASE 4's multi_timeframe.py needs real candles at
     several different unit/interval combinations (1D, 1H, 30M, 15M, 5M),
     so it reuses this module's existing, already-fixed V3 candle fetch
@@ -130,7 +130,7 @@ def _fetch_upstox_ltp(access_token, instrument_key=NIFTY_INSTRUMENT_KEY):
         return None
 
 
-def _fetch_upstox_candles(access_token, instrument_key=NIFTY_INSTRUMENT_KEY, unit="minutes", interval="5", days_back=5):
+def _fetch_upstox_candles(access_token, instrument_key=NIFTY_INSTRUMENT_KEY, unit="minutes", interval="5", days_back=8):
     """Real live 5-minute candles from Upstox.
 
     Previously this called the V2 `/historical-candle/.../5minute/...`
@@ -199,7 +199,7 @@ def fetch_live_market_data(access_token):
         # Dashboard-only fallback. It is explicitly marked non-tradable so no
         # strategy/AI decision can mistake Yahoo data for the authenticated
         # Upstox feed requested by the trading engine.
-        df = yf.download("^NSEI", period="5d", interval="5m", progress=False)
+        df = yf.download("^NSEI", period="8d", interval="5m", progress=False)
         market_source = "YAHOO_FALLBACK_NON_TRADABLE"
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)

@@ -20,6 +20,7 @@ import event_calendar
 import oi_buildup
 import trade_diagnostics
 import strategy_engine
+import fast_lane
 import gemini_pool
 import json
 import time
@@ -33,7 +34,7 @@ from datetime import datetime, timedelta, time as dtime
 # ---------------------------------------------------------------------------
 MIN_EV_R = 0.05                 # expected value (in R) a trade must show to be taken
 DROUGHT_EV_RELIEF = 0.06        # in a dry spell the bar eases a little, but never below ~break-even
-DROUGHT_AFTER_MIN = 120         # "dry spell" = no setup logged for this long inside the session ...
+DROUGHT_AFTER_MIN = 75          # "dry spell" = no setup logged for this long inside the session ...
 DROUGHT_CHECK_FROM = dtime(11, 30)   # ... or none at all today by this time
 BAD_FORM_EV_EXTRA = 0.0         # was 0.10: demanding MORE after losses froze the engine (no trades -> no data -> no recovery).
                                 # Recovery now comes from shadow trades + the mistake memory instead of a higher wall.
@@ -47,7 +48,7 @@ OI_FRONT_RUN_ATR = 0.25
 TARGET_REACH_ATR = 0.7         # realistic reach inside the holding window = this x ATR x sqrt(hold bars)
 OI_MIN_RR = 1.2                 # wall closer than this many R -> not a usable target (soft penalty, no new gate)
 MAX_TARGET_R = 2.2              # cap for wall/structure targets; the ATR fallback stays at 1.5R
-MIN_WIN_PROB = 0.35             # HARD floor on the calibrated win probability.  A trade the engine itself rates at ~31% (it loses
+MIN_WIN_PROB = 0.33             # HARD floor on the calibrated win probability.  A trade the engine itself rates at ~31% (it loses
                                 # 2 of 3) can still show a hair of positive EV at 2.2R and, with the dry-spell relief, used to slip through.
                                 # Shadow trades now supply learning data, so the engine no longer needs low-quality trades to learn.
 ROUND_TRIP_COST_PTS = 2.0       # bid-ask spread + brokerage/STT, as underlying points per trade.  Charged against EV: a setup must beat its costs.
@@ -55,7 +56,31 @@ FLOOR_RELAX_AFTER_TRADING_DAYS = 2   # safety valve against the old "no trade fo
 FLOOR_RELAXED_PROB = 0.31            # without a logged setup the win-chance floor eases to this (never lower)
 DROUGHT_RELIEF_MIN_PROB = 0.40  # the dry-spell relief may only ease the EV bar for setups that are at least this likely to win
 ENFORCE_SESSION_WINDOW = True
-NO_ENTRY_BEFORE = dtime(9, 25)  # first 10 min: opening auction noise / wide spreads
+# v44 FAST LANE (price-action momentum / reversal / pullback entries that do NOT wait for the history-calibrated EV bar,
+# the global veto or the S/R-location gate -- see fast_lane.py).  Safety kept: stale data, entry window, event risk,
+# cooldown, one-signal-one-trade, structure SL, min R:R.
+FAST_LANE_ENABLED = True
+# v45 ADVISORY GATES: the history/heuristic gates below stop being VETOES and become notes in the report that Gemini reads
+# (Gemini + Google research is the judge).  Only real safety stays hard: stale data, entry window, event risk, cooldown,
+# one-signal-one-trade, R:R, and a playbook that has PROVEN to lose (segment pause).
+ADVISORY_GATES = True
+FAST_LANE_REQUIRES_GEMINI = True    # True  = fast-lane setups get a report and need Gemini's APPROVE like every other trade (default).
+                                    # False = they execute at once on the rules alone (1-3 candles earlier, but no Gemini opinion).
+FAST_LANE_CARRY_MIN = 12            # a fast-lane candidate stays valid this many minutes while Gemini reviews it (the move may run on)
+FAST_LANE_PLAN_REVIEWS_PER_HOUR = 5  # v45b quota guard: max NEW pre-plan reviews per hour (each = 1 Gemini call)
+FAST_LANE_PLAN_IMMINENT_ATR = 1.2    # a plan is only shown to Gemini once price is within this many ATR of its trigger
+FAST_LANE_PLAN_MIN_SCORE = 58.0
+FAST_LANE_PLAN_REVIEWS_PER_DAY = 20  # hard daily cap on pre-plan calls; real trade reviews are never counted against it
+FAST_LANE_REVIEW_DEADLINE_S = 45.0   # fast-lane Gemini review gives up after this (then the strict local review decides) -> no long waits
+FAST_LANE_PLAN_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest"]
+                                     # plans use the cheap/fast lite buckets first, keeping the strong-model quota for real trade decisions
+FAST_LANE_PLAN_PACKET_CHARS = 30000  # smaller packet for plan pre-reviews (fewer tokens, faster)
+FAST_LANE_REVIEW_SEARCH = True      # Google-Search grounded review is slow (up to 40 s); fast lane uses the plain-JSON review for speed
+FAST_LANE_RESEARCH_VETO = 5          # continuation trades: blocked when the other research is net this many votes AGAINST
+FAST_LANE_RESEARCH_VETO_REVERSAL = 7 # reversal/bounce trades are counter-trend by nature: only a much stronger opposing read blocks them
+FAST_LANE_BAD_FORM_N = 4            # if the last N resolved fast-lane trades were ALL losses the bar rises (self-protection, never a freeze)
+FAST_LANE_BAD_FORM_SCORE = 68.0
+NO_ENTRY_BEFORE = dtime(9, 20)  # first 10 min: opening auction noise / wide spreads
 NO_ENTRY_AFTER = dtime(15, 10)  # entries allowed until the market's last minutes; the tool auto-closes open trades at 15:20
                                 # (trade_learning.EOD_SQUAREOFF), so nothing opened after 15:10 could do anything.  Was 14:45.
 
@@ -328,6 +353,8 @@ def _gemini_extract_json(text):
 
 def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_direction,
                         live_price=None, strategy_formed_at=None, decision=None, use_search=True):
+    _is_fl = bool((decision or {}).get("fast_lane"))
+    _is_plan_call = str((decision or {}).get("fast_lane_playbook") or "").startswith("PLAN_")
     """Independent Gemini second opinion, called ONLY after a live named strategy and the
     self-learning AI engine already agree.  Gemini first forms its OWN view from the live
     packet, then approves only if that view matches the proposal.
@@ -340,7 +367,7 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
     direction = str(proposed_direction).upper()
     if direction not in ("BUY", "SELL"):
         return {"status": "REJECTED", "approved": False, "reason": "Invalid proposed direction."}
-    packet = _gemini_compact_context(dashboard_context)
+    packet = _gemini_compact_context(dashboard_context, max_total_chars=FAST_LANE_PLAN_PACKET_CHARS) if _is_plan_call else _gemini_compact_context(dashboard_context)
     brief = (strategy_result or {}).get("strategy_brief") or {}
     strategy_json = json.dumps({
         "direction": (strategy_result or {}).get("direction"), "score": (strategy_result or {}).get("score"),
@@ -350,7 +377,7 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
     _dec = {k: (decision or {}).get(k) for k in (
         "direction", "underlying_entry", "strike", "option_type", "level_price", "confidence_note", "entry", "entry_price", "stop_loss", "sl", "target", "target_1", "target_2", "risk_reward",
         "confidence_pct", "critical_confirmations", "major_conflicts", "reason", "reasons", "factor_flags",
-        "option_symbol", "strategy_names") if (decision or {}).get(k) is not None}
+        "option_symbol", "strategy_names", "soft_flags", "fast_lane_playbook", "fast_lane_score", "fast_lane_why") if (decision or {}).get(k) is not None}
     decision_json = json.dumps(_dec, ensure_ascii=False, default=str)[:6000]
     # Locally computed LIVE price-action facts so Gemini judges direction on the same evidence the engine used.
     try:
@@ -363,7 +390,37 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
                                 "strategy_switched_to_match_ai": bool((strategy_result or {}).get("rebased_from"))}, default=str)
     except Exception:
         live_json = "{}"
-    prompt = (
+    if (decision or {}).get("fast_lane"):
+        fl_report = json.dumps({k: (decision or {}).get(k) for k in (
+            "fast_lane_playbook", "fast_lane_score", "fast_lane_why", "direction", "underlying_entry", "stop_loss", "target",
+            "risk_reward", "strike", "option_type", "level_price", "target_note", "soft_flags")}, ensure_ascii=False, default=str)
+        _is_plan = str((decision or {}).get("fast_lane_playbook") or "").startswith("PLAN_")
+        _plan_note = ("THIS IS A PRE-APPROVAL of a CONDITIONAL PLAN: nothing has triggered yet. The trade will be placed ONLY IF price triggers it "
+                      "(entry = the trigger price in the report). APPROVE if, on the packet and your own research, you would TAKE this trade when it triggers "
+                      "(structure, level, trend, order flow, OI and news agree); REJECT if the plan is poor or the likely move is the other way.\n\n") if _is_plan else ""
+        prompt = (
+            "You are the FINAL independent reviewer for an intraday NIFTY trading system.\n\n"
+            + _plan_note +
+            f"The engine's PRICE-ACTION FAST LANE (momentum break / flag break / level break / reversal-bounce / trend pullback) proposes: {direction}.\n"
+            "The report below says which playbook fired, why, and how the rest of the dashboard research voted (research net: + supports, - opposes).\n"
+            "STEP 1: From the LIVE RESEARCH PACKET (look hardest at the LAST candles: structure, VWAP, EMA9/20, order flow, option OI, regime) form your OWN view: BUY, SELL or NO_TRADE.\n"
+            "STEP 2: APPROVE only if your own view equals the proposed direction. You cannot invent a trade or flip direction.\n\n"
+            "Rules:\n"
+            "1) Use only the supplied packet; never treat missing data as bullish/bearish. REJECT if data is stale/frozen.\n"
+            "2) These playbooks exist to catch REAL moves early. A fresh displacement/flag/level break, or a confirmed rejection/bounce at a key level, is valid -- do NOT reject only because 'the move already started', because a pullback is possible, or because a minor factor disagrees.\n"
+            "3) REJECT when the MAIN evidence (structure, VWAP, order flow, option OI, regime) leans clearly the other way, when the entry is a genuine late CHASE far from its break level/EMA20 with no pullback, "
+            "when a reversal has no rejection/reclaim, or when entry/SL/target are not sensible for the live price (SL too tight, target unrealistic).\n"
+            "4) Items in soft_flags / research votes are ADVICE from the engine's own heuristics (they are no longer vetoes). Weigh them together with your own research; you are the decider.\n"
+            "5) No certainty claims.\n\n"
+            f"Live price: {live_price}\nSetup candle: {strategy_formed_at}\n\n"
+            f"FAST LANE REPORT (playbook, reasons, research votes, entry / SL / target):\n{fl_report}\n\n"
+            f"FULL DECISION REPORT:\n{decision_json}\n\n"
+            f"LIVE RESEARCH PACKET:\n{packet}\n\n"
+            "Return ONLY JSON with keys: own_direction (BUY/SELL/NO_TRADE), approved (boolean), verdict (APPROVE/REJECT), "
+            "confidence (0-100), reason (short string), risk_flags (array of strings)."
+        )
+    else:
+      prompt = (
         "You are the FINAL independent reviewer for an intraday NIFTY trading system.\n\n"
         f"A named strategy is live and the self-learning AI engine agrees. Proposed direction: {direction}.\n"
         "STEP 1: From the LIVE RESEARCH PACKET alone, form your OWN independent view: BUY, SELL or NO_TRADE.\n"
@@ -374,6 +431,8 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
         "2b) REJECT if the entry would CHASE a move: e.g. a SELL after the index has already fallen sharply today and is at/below its nearest support or has just bounced, or a BUY after a sharp rise at/above resistance or just after a pullback starts. Prefer a pullback/retest entry.\n"
         "2c) The candle table is chronological (oldest first, LAST row = current candle) and spans several days: "
         "older rows at different price levels are NORMAL, never a data mismatch. Judge price from the LAST rows and the Live price given above.\n"
+        "2d) A MOMENTUM-CONTINUATION entry (strong impulse, then a shallow pullback that holds VWAP/EMA20, or a fresh break of the last swing) is NOT a chase - approve it when the main evidence agrees. "
+        "A CONFIRMED REVERSAL (price stretched far from EMA20, rejection candle, reclaim of EMA9/prior extreme, listed in the strategy summary as a reversal strategy) is also valid - judge it on the rejection + reclaim, not on 'the trend is the other way'.\n"
         "3) Secondary factors may disagree; require the MAIN evidence (structure, VWAP, order flow, option OI, regime) to lean your way.\n"
         "3b) Do NOT reject only because a minor/secondary factor disagrees or because a pullback is possible. Reject for: stale data, "
         "price chasing, or MAIN evidence leaning the opposite way. If the setup is a retest/pullback entry that is NOT extended, approve it.\n"
@@ -425,7 +484,9 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
         return out
 
     try:
-        parsed, _idx, model = gemini_pool.run(keys, gemini_pool.REVIEW_MODELS, _one, max_attempts=30, deadline_s=REVIEW_DEADLINE_S)
+        parsed, _idx, model = gemini_pool.run(keys, (FAST_LANE_PLAN_MODELS if _is_plan_call else gemini_pool.REVIEW_MODELS), _one,
+                                              max_attempts=(12 if _is_fl else 30),
+                                              deadline_s=(FAST_LANE_REVIEW_DEADLINE_S if _is_fl else REVIEW_DEADLINE_S))
     except gemini_pool.GeminiUnavailable as gu:
         return {"status": "UNAVAILABLE", "approved": False, "direction": "NO_TRADE", "verdict": "UNAVAILABLE",
                 "confidence": 0, "reason": f"{gu.last_exc}"[:200], "attempts": gu.attempts[-6:],
@@ -455,6 +516,13 @@ def local_fallback_review(decision, gemini=None):
       * strong tier : >= 8 direct confirmations -> up to 1 major conflict allowed (still no chase)
     """
     d = decision or {}
+    if d.get("fast_lane"):
+        sc = float(d.get("fast_lane_score") or 0)
+        rr_f = float(d.get("risk_reward") or 0)
+        ok_f = sc >= 70.0 and rr_f >= 1.5 and "against" not in " ".join(map(str, d.get("soft_flags") or []))
+        note = f"[fast lane] score {sc:.0f} (need 70), R:R {rr_f:.2f} (need 1.5)"
+        return {"status": "LOCAL_FALLBACK_APPROVED" if ok_f else "LOCAL_FALLBACK_BLOCKED", "approved": ok_f, "direction": d.get("direction"),
+                "reason": "Gemini out of quota; local review " + ("APPROVED: " if ok_f else "BLOCKED: ") + note}
     ev = float(d.get("expectancy_r", -1.0) or -1.0)
     crit = int(d.get("critical_confirmations", 0) or 0)
     conflicts = int(d.get("major_conflicts", 0) or 0)
@@ -482,8 +550,29 @@ def local_fallback_review(decision, gemini=None):
             "reason": ("Gemini out of quota; local review " + ("APPROVED: " if ok else "BLOCKED: ") + why + g)}
 
 
+
+import threading as _thr_fl
+_FL_TLS = _thr_fl.local()
+
+
+def generate_trade_decision(*args, **kwargs):
+    """Fast lane first (price action + full-research check), classic engine otherwise.  When nothing is taken, the message
+    also says WHY the fast lane stood aside, so 'koi setup nahi' is never a mystery."""
+    d = _generate_trade_decision_classic(*args, **kwargs)
+    try:
+        fl_reason = getattr(_FL_TLS, "reason", None)
+        if fl_reason and isinstance(d, dict) and not d.get("has_setup"):
+            d = dict(d)
+            d["fast_lane_block"] = fl_reason
+            d["reason"] = str(d.get("reason") or "") + " | FAST LANE: " + str(fl_reason)
+    except Exception:
+        pass
+    return d
+
+
 _GATE_PATTERNS = (
     ("Gemini review pending (background)", "background me"),
+    ("Fast lane: research against", "rest of the research is against it"),
     ("Gemini final review", "Final review did not approve"),
     ("No strategy formed", "No named strategy"),
     ("Strategy vs AI direction mismatch", "AI research is"),
@@ -663,7 +752,196 @@ def _is_drought(now):
     return (now - last) >= timedelta(minutes=DROUGHT_AFTER_MIN)
 
 
-def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
+def _fast_lane_recent_form():
+    """Last resolved fast-lane trades (newest first) -> list of 'WIN'/'LOSS'.  Used only to RAISE the score bar after a bad streak."""
+    out = []
+    try:
+        for r in trade_learning.get_recent_setups(limit=30):
+            if r.get("status") not in ("WIN", "LOSS"):
+                continue
+            if str(r.get("playbook") or "").startswith("FL_"):
+                out.append(r.get("status"))
+            if len(out) >= 8:
+                break
+    except Exception:
+        pass
+    return out
+
+
+def _fast_lane_research(direction, playbook, dashboard_context, sr_context, breadth_advances=None, breadth_declines=None,
+                        global_avg_change=None, sniper_bias=None, global_research=None, ml_agrees=False, raw_option_chain=None,
+                        pcr_velocity=None, strategy_result=None):
+    """v44c: the fast lane is price-action, but it must not trade AGAINST the rest of the dashboard's research.
+    Each module votes +1 (supports this trade), -1 (opposes) or 0 (neutral/unknown).  Returns (net, supports, opposes, votes)."""
+    want = 1 if direction == "BUY" else -1
+    votes = []
+
+    def lean(x):            # x > 0 = bullish lean, x < 0 = bearish lean -> +1 if it supports `direction`, -1 if it opposes
+        return 0 if x == 0 else (1 if x * want > 0 else -1)
+
+    ctx = dashboard_context or {}
+    op, _ = _extract_order_flow(ctx)
+    votes.append(("order flow", lean(1 if op == "BUYING PRESSURE" else -1 if op == "SELLING PRESSURE" else 0)))
+    rg = _extract_regime(ctx)
+    votes.append(("regime", lean(1 if rg == "BULLISH" else -1 if rg == "BEARISH" else 0)))
+    mt = _extract_mtf(ctx)
+    votes.append(("multi-timeframe", lean(1 if mt == "BULLISH" else -1 if mt == "BEARISH" else 0)))
+    if breadth_advances is not None and breadth_declines is not None:
+        votes.append(("market breadth", lean(breadth_advances - breadth_declines)))
+    if global_avg_change is not None:
+        votes.append(("global markets", lean(1 if global_avg_change > 0.1 else -1 if global_avg_change < -0.1 else 0)))
+    sn = str(sniper_bias or "").upper()
+    votes.append(("sniper setup", lean(1 if "BULLISH" in sn else -1 if "BEARISH" in sn else 0)))
+    gr = global_research if isinstance(global_research, dict) else ctx.get("RAW Global Research")
+    if isinstance(gr, dict) and str(gr.get("status", "")).upper() == "AVAILABLE":
+        gb = str(gr.get("directional_bias", "")).upper()
+        w = 2 if str(gr.get("strength", "")).upper() == "STRONG" else 1
+        votes.append(("global research", w * lean(1 if gb == "BUY" else -1 if gb == "SELL" else 0)))
+    pv = str((pcr_velocity or {}).get("bias", "NEUTRAL")).upper() if isinstance(pcr_velocity, dict) else "NEUTRAL"
+    votes.append(("PCR velocity", lean(1 if pv == "BUY" else -1 if pv == "SELL" else 0)))
+    try:
+        ls = float(((strategy_result or {}).get("live_state") or {}).get("score", 0) or 0)
+        votes.append(("live strategy price-action", lean(ls if abs(ls) >= 25 else 0)))
+    except Exception:
+        pass
+    net = sum(x for _, x in votes)
+    return net, [n for n, x in votes if x > 0], [n for n, x in votes if x < 0], votes
+
+
+def _try_fast_lane(price_df, live_price, atr, sr_context, dashboard_context, context_audit, now, strategy_result,
+                   prev_day=None, level_ladder=None, raw_option_chain=None, entry_quality=None, research=None, carry=None):
+    """Returns (decision_or_None, blocked_reason_or_None).  A decision means: take this trade now."""
+    if not FAST_LANE_ENABLED or price_df is None:
+        return None, None
+    cand = fast_lane.analyze(price_df, sr_context=sr_context, prev_day=prev_day)
+    if not cand and isinstance(carry, dict) and carry.get("cand"):
+        # A candidate seen a moment ago is still being reviewed (Gemini) -> keep it alive while price has not invalidated it.
+        try:
+            c0 = dict(carry["cand"])
+            age_min = (time.time() - float(carry.get("t", 0))) / 60.0
+            d0 = 1 if c0["direction"] == "BUY" else -1
+            lp = float(live_price)
+            ran = (lp - c0["underlying_entry"]) * d0                    # points the move already gave
+            hit_sl = (lp - c0["stop_loss"]) * d0 <= 0
+            hit_tp = (c0["target"] - lp) * d0 <= 0
+            atr0 = float(c0.get("atr") or 10.0)
+            if age_min <= FAST_LANE_CARRY_MIN and not hit_sl and not hit_tp and ran <= 1.6 * atr0:
+                shift = lp - c0["underlying_entry"]
+                c0["underlying_entry"] = round(lp, 2)
+                risk = abs(lp - c0["stop_loss"])
+                reward = abs(c0["target"] - lp)
+                if risk > 0 and reward / risk >= 1.2:
+                    c0["risk_reward"] = round(reward / risk, 2)
+                    c0["why"] = str(c0.get("why", "")) + f" | carried {age_min:.0f} min while under review"
+                    cand = c0
+        except Exception:
+            cand = None
+    if not cand:
+        return None, None
+    direction, score = cand["direction"], float(cand["score"])
+    form = _fast_lane_recent_form()
+    bar = fast_lane.MIN_SCORE
+    form_note = ""
+    if len(form) >= FAST_LANE_BAD_FORM_N and all(f == "LOSS" for f in form[:FAST_LANE_BAD_FORM_N]):
+        bar = FAST_LANE_BAD_FORM_SCORE
+        form_note = f" (last {FAST_LANE_BAD_FORM_N} fast-lane trades lost -> bar raised to {bar:.0f})"
+    if score < bar:
+        return None, f"Fast lane saw a {cand['playbook']} {direction} (score {score:.0f}) but the bar is {bar:.0f}{form_note}."
+    # FULL-RESEARCH CHECK: price action found the setup; the rest of the tool's research must not be clearly AGAINST it.
+    net, sup_names, opp_names, _votes = _fast_lane_research(direction, cand["playbook"], dashboard_context, sr_context,
+                                                            **(research or {}))
+    is_reversal = cand["playbook"].startswith("FL_REVERSAL")
+    veto_at = -FAST_LANE_RESEARCH_VETO_REVERSAL if is_reversal else -FAST_LANE_RESEARCH_VETO
+    if net <= veto_at:
+        return None, (f"Fast lane saw {cand['playbook']} {direction} (score {score:.0f}) but the rest of the research is against it: "
+                      f"net {net:+d} (against: {', '.join(opp_names) or '-'}; for: {', '.join(sup_names) or '-'}). Waiting.")
+    score = round(min(95.0, score + max(-6.0, min(8.0, 2.0 * net))), 1)
+    cand["score"] = score
+    cand["why"] = cand["why"] + f" | research net {net:+d} (for: {', '.join(sup_names) or '-'}; against: {', '.join(opp_names) or '-'})"
+    if score < bar:
+        return None, f"Fast lane saw a {cand['playbook']} {direction} but after the research check its score {score:.0f} is below the bar {bar:.0f}{form_note}."
+    freshness = str((dashboard_context or {}).get("Data Freshness", "")).upper()
+    if "STALE" in freshness or "FROZEN" in freshness:
+        return None, "Dashboard data is STALE/FROZEN. Full-data trade engine will not open a fresh setup until live data is fresh."
+    if ENFORCE_SESSION_WINDOW and not (NO_ENTRY_BEFORE <= now.time() <= NO_ENTRY_AFTER):
+        return None, (f"Outside the entry window ({NO_ENTRY_BEFORE.strftime('%H:%M')}-{NO_ENTRY_AFTER.strftime('%H:%M')} IST): "
+                      "late entries cannot play out before the end-of-day square-off.")
+    ev = event_calendar.event_risk(now)
+    if ev.get("level") == "BLOCK":
+        return None, f"Event risk window: {ev.get('reason')}. No NEW entries until the news has been absorbed."
+    cd_blocked, cd_reason = trade_learning.entry_cooldown(direction, now=now)
+    if cd_blocked:
+        return None, cd_reason
+    used, used_reason = trade_learning.signal_already_traded(direction, cand.get("formed_at"))
+    if used:
+        return None, used_reason
+    entry, sl, tp = cand["underlying_entry"], cand["stop_loss"], cand["target"]
+    # never place the trade at a stale quote: the live price must still be close to the candle close we analysed
+    try:
+        if abs(float(live_price) - float(entry)) > 0.6 * float(cand["atr"]):
+            entry_shift = float(live_price) - float(entry)
+            entry, sl, tp = round(entry + entry_shift, 2), round(sl + entry_shift, 2), round(tp + entry_shift, 2)
+    except Exception:
+        pass
+    # target may not run into a very close, strong OI wall: stop short of it (never below 1.2R)
+    oi_note = None
+    try:
+        hit = _oi_wall_target(raw_option_chain, entry, direction, atr=atr)
+        if hit is not None:
+            wall_t, wall_k = hit
+            d_wall = (wall_t - entry) if direction == "BUY" else (entry - wall_t)
+            risk = abs(entry - sl)
+            if 1.2 * risk <= d_wall < abs(tp - entry):
+                tp = round(wall_t, 2)
+                oi_note = f"Target trimmed to {wall_t:g}, just before the {wall_k:g} OI wall."
+    except Exception:
+        pass
+    rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
+    if rr < 1.2:
+        return None, "Fast lane: reward:risk too small after the OI-wall check."
+    playbook = cand["playbook"]
+    adv = []
+    if opp_names:
+        adv.append(f"Research against this {direction}: {', '.join(opp_names)} (net {net:+d}) (advisory)")
+    try:
+        _fl_rows = [r for r in trade_learning.get_recent_setups(limit=60) if str(r.get("playbook") or "") == playbook and r.get("status") in ("WIN", "LOSS")]
+        if len(_fl_rows) >= 4:
+            _w = sum(1 for r in _fl_rows if r.get("status") == "WIN")
+            adv.append(f"Self-learning: this playbook ({playbook}) is {_w}/{len(_fl_rows)} wins in the engine's own record (advisory)")
+    except Exception:
+        pass
+    meta = {"playbook": playbook, "grade": "A" if score >= 72 else "B", "hour_bucket": f"{now.hour:02d}h",
+            "side": direction, "probe": False, "logic_version": trade_learning.LOGIC_VERSION}
+    seg_blocked, seg_reason = trade_learning.segment_gate(meta)
+    if seg_blocked:
+        return None, seg_reason
+    conf = round(min(62.0, 28.0 + 0.42 * score), 1)
+    flags = {"_fast_lane": True, "fast_lane_playbook": True, "main_signal_aligned": True, "data_quality_pass": True,
+             "_entry_meta": meta, "_playbook_label": playbook, "_setup_score": score, "_reasons": [cand["why"]],
+             "_edge": {"p": None, "ev_r": None, "rr": round(rr, 2)}, "_fast_lane_candidates": cand.get("all_candidates")}
+    if oi_note:
+        flags["_oi_wall_note"] = oi_note
+    d = {
+        "has_setup": True, "direction": direction, "strike": _round_to_strike(entry),
+        "option_type": "CE" if direction == "BUY" else "PE",
+        "underlying_entry": round(entry, 2), "stop_loss": sl, "target": tp, "confidence_pct": conf,
+        "confidence_note": (f"FAST LANE {playbook}: {cand['why']}. Rule-based price-action score {score:.0f}/100 (NOT a measured win rate; "
+                            f"the engine's own track record decides how this playbook is judged from now on).{form_note}"),
+        "factor_flags": flags, "factors_true": sum(1 for v in flags.values() if v is True), "factors_total": len(flags),
+        "level_price": cand.get("level"), "level_pct": score, "context_audit": context_audit,
+        "score_model": "fast_lane_v44", "strategy_engine": strategy_result or {}, "strategy_path": False, "fast_lane": True,
+        "fast_lane_playbook": playbook, "fast_lane_score": score, "fast_lane_why": cand["why"],
+        "fast_lane_formed_at": cand.get("formed_at"), "fast_lane_candidate": cand,
+        "risk_reward": round(rr, 2), "analysis_mode": "FAST_LANE_PRICE_ACTION", "raw_direction": direction,
+        "soft_flags": (["opposite fast-lane signal also present"] if cand.get("conflicting_signal") else []) + adv,
+        "entry_location_quality": "PRICE_ACTION_" + playbook, "level_distance_pts": 0.0, "critical_confirmations": 0,
+        "major_conflicts": 0, "target_note": oi_note, "event_risk": ev,
+        "expectancy_r": 0.0, "win_probability": None, "required_ev_r": None,
+    }
+    return d, None
+
+
+def _generate_trade_decision_classic(live_price, level_prediction, atr, max_pain=None,
                              signal_code=0, ml_agrees=False, banknifty_correlation_note=None,
                              breadth_advances=None, breadth_declines=None,
                              global_avg_change=None, live_vix=None, india_news_sentiment=None,
@@ -671,7 +949,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
                              dashboard_context=None, global_research=None,
                              nifty50_news_sentiment=None, nifty50_fundamentals_bias=None,
                              strategy_result=None, raw_option_chain=None, now_ist=None,
-                             entry_quality=None, pcr_velocity=None):
+                             entry_quality=None, pcr_velocity=None, price_df=None, prev_day=None, fl_carry=None):
     """
     Returns a dict:
       If NO qualifying setup right now:
@@ -710,6 +988,27 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         "missing_sections": missing_context_sections,
         "complete": not missing_context_sections,
     }
+
+    # v44 FAST LANE first: price-action momentum / reversal / pullback.  If it fires (and passes safety) the trade is taken now;
+    # if it is blocked by a safety rule the classic path below still gets its chance.
+    _fl_block_reason = None
+    _FL_TLS.reason = None
+    _adv_notes = []     # v45: gates that became advice for Gemini instead of vetoes
+    try:
+        _fl_now = now_ist or trade_learning._now_ist()
+        _fl_dec, _fl_block_reason = _try_fast_lane(price_df, live_price, atr, sr_context or dashboard_context.get("RAW Comprehensive S/R Zones"),
+                                                   dashboard_context, context_audit, _fl_now, strategy_result, prev_day=prev_day, carry=fl_carry,
+                                                   level_ladder=level_ladder, raw_option_chain=raw_option_chain, entry_quality=entry_quality,
+                                                   research=dict(breadth_advances=breadth_advances, breadth_declines=breadth_declines,
+                                                                 global_avg_change=global_avg_change, sniper_bias=sniper_bias,
+                                                                 global_research=global_research, ml_agrees=ml_agrees,
+                                                                 raw_option_chain=raw_option_chain, pcr_velocity=pcr_velocity,
+                                                                 strategy_result=strategy_result))
+        _FL_TLS.reason = _fl_block_reason
+        if _fl_dec is not None:
+            return _fl_dec
+    except Exception:
+        logger.exception("fast lane failed (ignored) - classic path continues")
 
     # Do not let a lagging top-level signal freeze the engine.  If the
     # validated level predictor already has a strong directional read, use it
@@ -874,14 +1173,29 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     # candle has started reversing the immediately preceding move, the raw
     # signal is vetoed unless the opposite direction has a full-context
     # structural reversal at the correct boundary.
+    # v43: a formed REVERSAL strategy (stretch + rejection + reclaim) IS the structural turn -> it only needs a few
+    # independent confirmations, not the full 5/7 + exact support location.  Everything else keeps the strict rule.
+    _rev_sel = set(strategy_result.get("selected_strategies") or []) & set(strategy_engine.REVERSAL_KEYS)
     if raw_direction == 'BUY' and _bearish_transition and not (
-        _bullish_reversal_score >= 5 and _loc_preview in ('AT_SUPPORT', 'NEAR_SUPPORT')
+        (_bullish_reversal_score >= 5 and _loc_preview in ('AT_SUPPORT', 'NEAR_SUPPORT'))
+        or (_rev_sel and _bullish_reversal_score >= 3)
+    ) and ADVISORY_GATES:
+        _adv_notes.append("BUY while price has started turning down after the prior rise (advisory)")
+    elif raw_direction == 'BUY' and _bearish_transition and not (
+        (_bullish_reversal_score >= 5 and _loc_preview in ('AT_SUPPORT', 'NEAR_SUPPORT'))
+        or (_rev_sel and _bullish_reversal_score >= 3)
     ):
         return {"has_setup": False,
                 "reason": "BUY blocked: price has started turning down after the prior rise. The engine will not buy the turning point; it will wait for full-context bullish reversal/support defence.",
                 "context_audit": context_audit}
     if raw_direction == 'SELL' and _bullish_transition and not (
-        _bearish_reversal_score >= 5 and _loc_preview in ('AT_RESISTANCE', 'NEAR_RESISTANCE')
+        (_bearish_reversal_score >= 5 and _loc_preview in ('AT_RESISTANCE', 'NEAR_RESISTANCE'))
+        or (_rev_sel and _bearish_reversal_score >= 3)
+    ) and ADVISORY_GATES:
+        _adv_notes.append("SELL while price has started turning up after the prior fall (advisory)")
+    elif raw_direction == 'SELL' and _bullish_transition and not (
+        (_bearish_reversal_score >= 5 and _loc_preview in ('AT_RESISTANCE', 'NEAR_RESISTANCE'))
+        or (_rev_sel and _bearish_reversal_score >= 3)
     ):
         return {"has_setup": False,
                 "reason": "SELL blocked: price has started turning up after the prior fall. The engine will not sell the turning point; it will wait for full-context bearish reversal/resistance rejection.",
@@ -923,7 +1237,9 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         _gs = str(_gr.get("strength", "")).upper()
         _g_oppose = (_gb == "SELL" and direction == "BUY") or (_gb == "BUY" and direction == "SELL")
         _gr_aligned = not _g_oppose
-        if _g_oppose and _gs == "STRONG":
+        if _g_oppose and _gs == "STRONG" and ADVISORY_GATES:
+            _adv_notes.append(f"Global research is STRONGLY {_gb} against this {direction} (advisory)")
+        elif _g_oppose and _gs == "STRONG":
             return {"has_setup": False,
                     "reason": f"Global research is STRONGLY {_gb} against this {direction}; domestic setup alone is not enough.",
                     "context_audit": context_audit}
@@ -932,7 +1248,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     # directly into resistance or sell directly into support.  The engine
     # must first prove the level was accepted/rejected with price action.
     sr_context = sr_context or dashboard_context.get("RAW Comprehensive S/R Zones")
-    soft_flags = []   # strategy-led entries: S/R location problems are penalties, not vetoes
+    soft_flags = list(_adv_notes)   # strategy-led entries: S/R location problems are penalties, not vetoes
     if strategy_path and (not isinstance(sr_context, dict) or sr_context.get('status') not in ('OK', 'READY', 'SUFFICIENT')):
         soft_flags.append("S/R map unavailable")
         sr_context = {}
@@ -1256,7 +1572,10 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     unknown_major = int(regime_bias == "UNKNOWN") + int(mtf_bias == "UNKNOWN") + int(order_pressure == "")
     _unknown_limit = 3 if strategy_path else 2   # strategy-led: a missing module is unknown, not a veto
     _timing_block = (not factor_flags.get('entry_timing_safe') and not _early_entry_ok and not strategy_path)
-    if critical_true < 3 or hard_conflicts >= 2 or unknown_major >= _unknown_limit or not factor_flags.get('no_opposite_transition') or _timing_block or (reversal_used and ((direction == "SELL" and _bearish_reversal_score < 5) or (direction == "BUY" and _bullish_reversal_score < 5))):
+    # v43: with a formed strategy and >= 4 direct confirmations, TWO conflicting modules no longer veto the trade
+    # (the old rule blocked "4 confirmations / 2 conflicts" setups all day, incl. the big opening rally).  Three conflicts still do.
+    _max_hard = 2 if (strategy_path and critical_true >= 4) else 1
+    if critical_true < 3 or hard_conflicts > _max_hard or unknown_major >= _unknown_limit or not factor_flags.get('no_opposite_transition') or _timing_block or (reversal_used and ((direction == "SELL" and _bearish_reversal_score < 5) or (direction == "BUY" and _bullish_reversal_score < 5))):
         return {"has_setup": False,
                 "reason": f"Full-context confluence is not strong enough ({critical_true} direct confirmations; {hard_conflicts} major conflicts). Waiting for a cleaner setup.",
                 "context_audit": context_audit}
@@ -1408,7 +1727,9 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     breakout_entry = (direction == 'BUY' and loc_for_distance in ('AT_RESISTANCE', 'NEAR_RESISTANCE')) or \
                      (direction == 'SELL' and loc_for_distance in ('AT_SUPPORT', 'NEAR_SUPPORT'))
     max_entry_distance = max((0.80 if not breakout_entry else 0.90) * float(atr), 8.0 if not breakout_entry else 10.0)
-    if level_distance > max_entry_distance:
+    if level_distance > max_entry_distance and ADVISORY_GATES:
+        soft_flags.append(f"Entry is {level_distance:.1f} pts from the validated level (> {max_entry_distance:.1f}) (advisory)")
+    elif level_distance > max_entry_distance:
         return {"has_setup": False, "reason": f"Entry is too far from the validated level ({level_distance:.1f} pts > {max_entry_distance:.1f} pts). Setup may be directionally correct but the location is poor; waiting for a better entry.", "context_audit": context_audit}
 
     # ------------------------------------------------------------------
@@ -1513,7 +1834,10 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     edge["bar_notes"] = _bar_notes
     edge["required_probability"] = round(edge_model.required_probability(rr, _min_ev), 4)
 
-    if edge["expectancy_r"] < _min_ev:
+    if edge["expectancy_r"] < _min_ev and ADVISORY_GATES:
+        soft_flags.append(f"History-based edge is weak: est. win chance {confidence_pct:.1f}% at R:R {rr:.2f} -> expectancy {edge['expectancy_r']:+.2f}R "
+                          f"(bar {_min_ev:+.2f}R). The estimate comes from the engine's own recent record, not from this chart (advisory)")
+    elif edge["expectancy_r"] < _min_ev:
         return {"has_setup": False,
                 "reason": (f"No positive edge: estimated win chance {confidence_pct:.1f}% at R:R {rr:.2f} gives expectancy "
                            f"{edge['expectancy_r']:+.2f}R, below the required {_min_ev:+.2f}R "
@@ -1527,7 +1851,9 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
 
     _wp = float(edge.get("win_probability") or 0.0)
     _floor, _floor_note = _win_floor(_now)
-    if _wp < _floor:
+    if _wp < _floor and ADVISORY_GATES:
+        soft_flags.append(f"Engine's own win probability {100 * _wp:.1f}% is below its usual floor {100 * _floor:.0f}% (advisory)")
+    elif _wp < _floor:
         return {"has_setup": False,
                 "reason": (f"Win-chance floor: the engine's own win probability for this setup is {100 * _wp:.1f}%, below the minimum "
                            f"{100 * _floor:.0f}%{(' (' + _floor_note + ')') if _floor_note else ''}. Even with a positive-looking R:R it would lose about {100 * (1 - _wp):.0f} of 100 times. "

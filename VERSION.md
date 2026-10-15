@@ -1,3 +1,17 @@
+# NIFTY AI -- v44: FAST LANE (catch the big moves, bounce/rejection, pullbacks)
+
+- **Problem (14 Oct):** Nifty fell ~130 pts (22753 -> 22624) with SELL consensus 97 and live price action DOWN, but the engine showed "No positive edge: win chance 11-22%"
+  (history-calibrated, so after a losing streak it blocks everything), "Strong global veto" and "S/R location". It also took BUY 22700CE at the top of a chop and lost.
+- **New `fast_lane.py`:** pure price-action on 5-min candles, both directions: MOMENTUM_BREAK (displacement that breaks the 12-bar extreme, refuses to chase and
+  refuses a candle that is already rejecting the move), REVERSAL_BOUNCE / REJECTION (>=2 ATR stretch + wick/engulfing at prev-day / session / S/R level),
+  TREND_PULLBACK (EMA20/VWAP pullback that resumes). Returns entry, structure SL (14-30 pts), target 1.8R (trimmed before a near OI wall).
+- **`ai_trade_decision.py`:** fast lane runs first. It skips the EV bar / win-chance floor / global veto / S/R-location gate, but keeps stale-data, entry window,
+  event-risk, cooldown, one-signal-one-trade and the self-learning segment pause. If the last 4 fast-lane trades all lost, its score bar rises (never a freeze).
+  If fast lane is blocked or finds nothing, the classic path runs exactly as before.
+- **`app.py`:** passes the 5-min candles + prev-day levels; fast-lane trades execute immediately (`FAST_LANE_REQUIRES_GEMINI = False`). Set it to True to send them through Gemini too.
+  Reviewer is stored as FAST_LANE_RULES. Trades are logged as playbook FL_* so the track record shows them separately.
+- Tests: `python -m unittest tests_fast_lane_v44` (5). Older suites still pass.
+
 # NIFTY AI -- v41: "why no trade?" is now answered from disk (no trading rule changed)
 
 - **Problem:** a big morning move and no trade, but the only evidence was a per-session table that restarts on every page reload (the keeper robot reloads

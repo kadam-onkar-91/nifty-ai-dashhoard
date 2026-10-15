@@ -6,7 +6,7 @@ khol ke rakhta hai -- jaise tum phone pe website khule rakhte ho.
 ## Ek baar setup (5 minute)
 1. Ye 3 cheezein repo me upload karo (folders ke saath):
    - `.github/workflows/keep_app_awake.yml`
-   - `.github/keeper/keep_open.py`
+   - `keep_open.py   (repo ke root me, app.py ke saath)`
    - `KEEPER_SETUP.md` (optional)
    (GitHub me Add file -> Create new file -> naam me `.github/workflows/keep_app_awake.yml` likho, content paste karo.)
 2. Repo -> **Settings -> Secrets and variables -> Actions -> Variables tab -> New repository variable**
