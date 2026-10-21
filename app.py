@@ -1287,7 +1287,7 @@ def _live_dashboard():
                        f"SELL {strategy_result.get('sell_consensus')} ({strategy_result.get('sell_live_count')} live) | "
                        f"{strategy_result.get('blocked_count', 0)} stale/against-the-move signal(s) blocked")
         if _strategy_rows:
-            with st.expander(f"🧩 Named Strategy Library — {len(_strategy_rows)} strategies scanned, {len(_ranked)} live", expanded=bool(_ranked)):
+            with st.expander(f"🧩 Named Strategy Library — {len(_strategy_rows)} strategies scanned, {len(_ranked)} live", expanded=False):
                 st.dataframe(pd.DataFrame(_strategy_rows), hide_index=True, width="stretch")
                 st.caption("Win rate sirf resolved historical samples se aata hai. Naya strategy/history insufficient ho to N/A dikhaya jata hai; fake accuracy nahi.")
 
@@ -1708,9 +1708,9 @@ def _live_dashboard():
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("📊 Institutional Order Flow Chart (VWAP & Volume Profile)")
 
-        st.session_state["_live_poc"] = float(df['POC_Level'].iloc[-1])   # shown on the live 1-minute chart
+        st.session_state["_live_poc"] = float(df['POC_Level'].iloc[-1])   # shown on the live 5-minute chart
         if _LIVE_CHART_ON:
-            st.caption("📈 Live 1-minute candle chart (TradingView style) dashboard ke sabse upar hai.")
+            st.caption("📈 Live 5-minute candle chart dashboard ke sabse upar ek-line switch ke andar hai (ON karke dekho).")
         else:
             chart_df = df.tail(100)
             fig = go.Figure()
@@ -2005,6 +2005,12 @@ def _live_dashboard():
 
     _sp.done()
 
+
+try:                                   # SL / target are checked on the live price every ~2 s (idempotent: one thread per server process)
+    import tick_guard
+    tick_guard.ensure_started()
+except Exception:
+    logger.exception("tick_guard could not start (ignored)")
 
 _LIVE_CHART_ON = False
 if not ACTIVE_SYMBOL:

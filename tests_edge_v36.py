@@ -261,12 +261,14 @@ class DecisionTests(DbCase):
         late = _decide(now=dtime(15, 12))   # entry window now runs to 15:10 (was 14:45)
         self.assertFalse(late["has_setup"]); self.assertIn("entry window", late["reason"])
 
-    def test_strong_opposite_global_research_vetoes(self):
+    def test_strong_opposite_global_research_is_a_penalty_not_a_veto(self):
+        """v43: a strong opposite global read used to hard-block; it now only costs probability (Gemini judges global news)."""
+        base = _decide("BUY")
         gr = {"status": "AVAILABLE", "directional_bias": "SELL", "strength": "STRONG"}
         out = _decide("BUY", global_research=gr)
-        self.assertFalse(out["has_setup"]); self.assertIn("Global research", out["reason"])
-        mild = {"status": "AVAILABLE", "directional_bias": "SELL", "strength": "MODERATE"}
-        self.assertTrue(_decide("BUY", global_research=mild)["has_setup"])
+        self.assertTrue(out["has_setup"], out.get("reason"))
+        self.assertLess(out["win_probability"], base["win_probability"])
+        self.assertIn("Global research", out["confidence_note"])
 
     def test_losing_record_stops_the_engine_by_itself(self):
         """With a real 15% win rate the calibrated expectancy turns negative and the engine refuses."""

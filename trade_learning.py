@@ -643,6 +643,48 @@ def resolve_open_setups(live_price, df=None):
                 print(f"[trade_learning] Could not close setup {setup_id}: {e}")
 
 
+def resolve_tick(live_price):
+    """Cheap, price-only check used by tick_guard every ~2 s: close an OPEN trade the moment the LIVE price touches its
+    original stop-loss or its target.  Never applies time exits (those stay in resolve_open_setups) and never trails the stop.
+    Only trades opened today are touched here; a carried-over trade is handled by the heavy path."""
+    try:
+        live_price = float(live_price)
+    except Exception:
+        return 0
+    if not live_price or live_price != live_price:
+        return 0
+    try:
+        open_rows = _sb_get_open() if _is_supabase_configured() else _sqlite_get_open()
+    except Exception:
+        logger.exception("resolve_tick: could not fetch open setups")
+        try:
+            open_rows = _sqlite_get_open()
+        except Exception:
+            return 0
+    now = _now_ist()
+    closed = 0
+    for row in open_rows or []:
+        try:
+            opened_at = datetime.strptime(str(row["timestamp"])[:19], "%Y-%m-%d %H:%M:%S")
+            if opened_at.date() != now.date():
+                continue
+            is_buy = row["direction"] == "BUY"
+            sl, target = float(row["stop_loss"]), float(row["target"])
+            if is_buy:
+                outcome = "WIN" if live_price >= target else ("LOSS" if live_price <= sl else None)
+            else:
+                outcome = "WIN" if live_price <= target else ("LOSS" if live_price >= sl else None)
+            if outcome:
+                if _is_supabase_configured():
+                    _sb_close(row["id"], outcome, live_price)
+                else:
+                    _sqlite_close(row["id"], outcome, live_price)
+                closed += 1
+        except Exception:
+            logger.exception("resolve_tick: row failed (ignored)")
+    return closed
+
+
 def get_open_setup():
     if _is_supabase_configured():
         try:
@@ -943,7 +985,8 @@ def _entry_meta_rows():
         except Exception:
             continue
         meta = f.get("_entry_meta")
-        if isinstance(meta, dict):
+        # v43: only trades made by the CURRENT decision logic describe the current engine (same rule as recent_performance)
+        if isinstance(meta, dict) and meta.get("logic_version") == LOGIC_VERSION:
             out.append((meta, status))
     return out
 
@@ -977,15 +1020,39 @@ def get_segment_stats(force=False):
     return stats
 
 
+COARSE_SEGMENTS = ("grade", "hour_bucket", "side")   # v43: too broad to HARD-block (a whole grade / side / hour-of-day) -> soft penalty
+COARSE_SEGMENT_PENALTY = 0.12
+
+
+def segment_soft_penalty(meta):
+    """(penalty_logit, note).  A whole grade / side / hour bucket with a losing record costs a little probability instead of blocking
+    every trade of that kind (that was the 'every setup blocked, again and again' effect).  Never raises."""
+    try:
+        stats = get_segment_stats()
+        pen, notes = 0.0, []
+        for key in COARSE_SEGMENTS:
+            if not meta.get(key):
+                continue
+            d = stats.get(f"{key}={meta[key]}")
+            if d and d["n"] >= SEGMENT_MIN_SAMPLES and d["win_rate"] is not None and d["win_rate"] < SEGMENT_BLOCK_WINRATE:
+                pen += COARSE_SEGMENT_PENALTY
+                notes.append(f"{key}={meta[key]} {d['wins']}W/{d['losses']}L")
+        return round(min(pen, 0.30), 3), ("weak segment(s): " + ", ".join(notes)) if notes else ""
+    except Exception:
+        return 0.0, ""
+
+
 def segment_gate(meta):
-    """(blocked, reason).  Blocks a trade only when its segment has ENOUGH resolved trades
-    and a clearly losing record.  Not enough history => allowed (that is how it learns)."""
+    """(blocked, reason).  Blocks a trade only when its (specific) segment has ENOUGH resolved trades
+    and a clearly losing record.  Not enough history => allowed (that is how it learns).
+    v43: only the specific segments hard-block (playbook, playbook|grade combo, probe); the coarse ones
+    (grade / side / hour) are a soft probability penalty -- see segment_soft_penalty()."""
     try:
         stats = get_segment_stats()
     except Exception:
         return False, ""
     checks = []
-    for key in ("playbook", "grade", "hour_bucket", "side"):
+    for key in ("playbook",):
         if meta.get(key):
             checks.append((f"{key}={meta[key]}", SEGMENT_MIN_SAMPLES, SEGMENT_BLOCK_WINRATE))
     if meta.get("playbook") and meta.get("grade"):

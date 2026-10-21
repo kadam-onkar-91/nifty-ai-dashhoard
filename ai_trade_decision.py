@@ -54,6 +54,18 @@ ROUND_TRIP_COST_PTS = 2.0       # bid-ask spread + brokerage/STT, as underlying 
 FLOOR_RELAX_AFTER_TRADING_DAYS = 2   # safety valve against the old "no trade for days" problem: after this many trading days
 FLOOR_RELAXED_PROB = 0.31            # without a logged setup the win-chance floor eases to this (never lower)
 DROUGHT_RELIEF_MIN_PROB = 0.40  # the dry-spell relief may only ease the EV bar for setups that are at least this likely to win
+LEARNED_DRAG_CAP = 0.30         # v42: the learned adjustment (mistake memory + NN) may cost at most this much log-odds.  Small, noisy samples
+                                # (7 losses in 8 trades) used to push EVERY setup under the EV bar -> the engine never traded again.
+TAG_PENALTY_CAP = 0.20          # v42: same idea for the repeat-mistake tag penalty
+GLOBAL_OPPOSE_PENALTY = 0.20    # v43: a STRONG opposite global read is a probability penalty (was a hard veto that blocked a falling market
+                                # for an hour because macro points said "BUY").  Gemini (with Google Search) is the judge of global news.
+# v42 MOMENTUM-CAPTURE LANE: when the live price action and the named strategies are all pushing hard the same way, the learned
+# win-rate bar (which only knows the engine's past, mostly losing, record) is not allowed to veto it on its own.  Every structural
+# gate, the no-chase rule, the 28-pt stop, the cooldowns and Gemini's final review still apply.
+LANE_MIN_LIVE = 45.0            # |live price-action score| (0-100) in the trade direction
+LANE_MIN_CONSENSUS = 80.0       # strategy consensus % in the trade direction
+LANE_MIN_LIVE_STRATEGIES = 3    # live strategies agreeing
+LANE_MAX_OPPOSITE_CONSENSUS = 30.0
 ENFORCE_SESSION_WINDOW = True
 NO_ENTRY_BEFORE = dtime(9, 25)  # first 10 min: opening auction noise / wide spreads
 NO_ENTRY_AFTER = dtime(15, 10)  # entries allowed until the market's last minutes; the tool auto-closes open trades at 15:20
@@ -239,6 +251,100 @@ def _oi_wall_target(raw_chain, live_price, direction, min_pts=12.0, max_pts=140.
     return round(tgt, 2), float(strike)
 
 
+def _oi_pick_target(raw_chain, live_price, direction, sl_distance, atr=None, min_pts=12.0, max_pts=140.0):
+    """Walk the opposing OI walls nearest-first and put the target just IN FRONT of the FIRST significant wall that still pays
+    (>= OI_MIN_RR x the stop).  A closer wall that does not pay is reported as `blocking` (price may stall there).
+    Returns (target | None, wall_strike | None, blocking_strike | None, rr)."""
+    walls = [w for w in _oi_walls(raw_chain, live_price, direction, min_pts, max_pts) if w[3]]
+    buf = max(OI_FRONT_RUN_MIN_PTS, OI_FRONT_RUN_ATR * float(atr)) if atr else OI_FRONT_RUN_MIN_PTS
+    blocking = None
+    risk = max(float(sl_distance or 0.0), 1e-9)
+    for dist, strike, _oi, _sig in walls:
+        tgt = strike - buf if direction == "BUY" else strike + buf
+        reach = (tgt - live_price) if direction == "BUY" else (live_price - tgt)
+        if reach / risk >= OI_MIN_RR:
+            return round(tgt, 2), float(strike), blocking, round(reach / risk, 2)
+        if blocking is None:
+            blocking = float(strike)
+    return None, None, blocking, 0.0
+
+
+def _momentum_lane_ok(strategy_result, direction, entry_quality):
+    """True when the live market is moving hard in `direction` with broad strategy agreement and the entry is not a severe chase."""
+    try:
+        sr = strategy_result or {}
+        buy = direction == "BUY"
+        score = float((sr.get("live_state") or {}).get("score", 0) or 0) * (1.0 if buy else -1.0)
+        cons = float(sr.get("buy_consensus" if buy else "sell_consensus", 0) or 0)
+        opp = float(sr.get("sell_consensus" if buy else "buy_consensus", 0) or 0)
+        cnt = int(sr.get("buy_live_count" if buy else "sell_live_count", 0) or 0)
+        eq = entry_quality if isinstance(entry_quality, dict) else {}
+        severe = bool(eq.get("severe")) or len(eq.get("chase_flags") or []) >= 3
+        return (score >= LANE_MIN_LIVE and cons >= LANE_MIN_CONSENSUS and cnt >= LANE_MIN_LIVE_STRATEGIES
+                and opp <= LANE_MAX_OPPOSITE_CONSENSUS and not severe)
+    except Exception:
+        return False
+
+
+# Cached, Google-Search-grounded news brief (refreshed in the background, never blocks a refresh or a trade).
+NEWS_TTL_S = 600.0
+NEWS_RETRY_S = 120.0
+_NEWS = {"ts": 0.0, "text": "", "grounded": False, "model": None, "err": "", "fail_ts": 0.0, "busy": False}
+_NEWS_LOCK = __import__("threading").Lock()
+
+
+def _news_refresh(keys):
+    try:
+        prompt = ("Using Google Search, give a SHORT factual brief (max 8 bullet lines) of what matters for the Indian NIFTY 50 market "
+                  "RIGHT NOW (today): global cues (US/Asia/Europe, crude, dollar, yields), India news, scheduled events, FII/DII flows. "
+                  "No trade advice, no price targets. Say 'no search data' if you could not search.")
+        body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}]}
+
+        def _one(key, model):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            resp = requests.post(url, headers={"Content-Type": "application/json", "x-goog-api-key": key}, json=body, timeout=40)
+            if resp.status_code != 200:
+                raise gemini_pool.PoolHTTPError(resp.status_code, resp.text[:200])
+            cand = (resp.json().get("candidates") or [{}])[0]
+            txt = "".join(p.get("text", "") for p in ((cand.get("content") or {}).get("parts") or []) if not p.get("thought")).strip()
+            if not txt:
+                raise gemini_pool.PoolHTTPError(502, "empty brief")
+            grounded = bool((cand.get("groundingMetadata") or {}).get("webSearchQueries") or (cand.get("groundingMetadata") or {}).get("groundingChunks"))
+            return {"text": txt[:2500], "grounded": grounded}
+
+        parsed, _i, model = gemini_pool.run(keys, gemini_pool.REVIEW_MODELS, _one, max_attempts=10, deadline_s=60.0)
+        with _NEWS_LOCK:
+            _NEWS.update({"ts": time.time(), "text": parsed["text"], "grounded": parsed["grounded"], "model": model, "err": "", "fail_ts": 0.0})
+    except Exception as exc:
+        with _NEWS_LOCK:
+            _NEWS.update({"err": f"{exc}"[:160] or "news brief failed", "fail_ts": time.time()})
+    finally:
+        with _NEWS_LOCK:
+            _NEWS["busy"] = False
+
+
+def get_news_brief(api_keys):
+    """Return the cached brief immediately ({"text","grounded","model","err","age_s"}); start a background refresh when it is stale.
+    Never raises, never waits for Gemini."""
+    keys = [k for k in (api_keys or []) if k]
+    now = time.time()
+    with _NEWS_LOCK:
+        fresh = bool(_NEWS["text"]) and (now - _NEWS["ts"]) < NEWS_TTL_S
+        recently_failed = _NEWS["fail_ts"] and (now - _NEWS["fail_ts"]) < NEWS_RETRY_S
+        if not keys:
+            if not _NEWS["text"]:
+                _NEWS["err"] = "No Gemini API key configured."
+        elif not fresh and not recently_failed and not _NEWS["busy"]:
+            _NEWS["busy"] = True
+            try:
+                __import__("threading").Thread(target=_news_refresh, args=(keys,), daemon=True, name="news-brief").start()
+            except Exception:
+                _NEWS["busy"] = False
+        out = dict(_NEWS)
+    out["age_s"] = round(now - out["ts"]) if out.get("ts") else None
+    return out
+
+
 def _gemini_compact_context(dashboard_context, max_total_chars=70000):
     """Build a bounded but broad live-data packet for Gemini.
 
@@ -350,7 +456,7 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
     _dec = {k: (decision or {}).get(k) for k in (
         "direction", "underlying_entry", "strike", "option_type", "level_price", "confidence_note", "entry", "entry_price", "stop_loss", "sl", "target", "target_1", "target_2", "risk_reward",
         "confidence_pct", "critical_confirmations", "major_conflicts", "reason", "reasons", "factor_flags",
-        "option_symbol", "strategy_names") if (decision or {}).get(k) is not None}
+        "option_symbol", "strategy_names", "momentum_lane") if (decision or {}).get(k) is not None}
     decision_json = json.dumps(_dec, ensure_ascii=False, default=str)[:6000]
     # Locally computed LIVE price-action facts so Gemini judges direction on the same evidence the engine used.
     try:
@@ -363,6 +469,11 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
                                 "strategy_switched_to_match_ai": bool((strategy_result or {}).get("rebased_from"))}, default=str)
     except Exception:
         live_json = "{}"
+    try:
+        _nb = get_news_brief(keys)
+        news_block = (f"FRESH NEWS BRIEF (Google Search, {_nb.get('age_s')} s old):\n{_nb['text']}\n\n" if _nb.get("text") else "")
+    except Exception:
+        news_block = ""
     prompt = (
         "You are the FINAL independent reviewer for an intraday NIFTY trading system.\n\n"
         f"A named strategy is live and the self-learning AI engine agrees. Proposed direction: {direction}.\n"
@@ -384,6 +495,7 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
         "You may ALSO use Google Search for fresh NIFTY news / global cues / events today to add your own research, "
         "but price levels and indicators must come from the packet. Check the entry, SL and target levels are sensible "
         "for the live price (not already extended, SL not too tight, target realistic).\n\n"
+        f"{news_block}"
         f"LIVE RESEARCH PACKET:\n{packet}\n\n"
         "Return ONLY JSON with keys: own_direction (BUY/SELL/NO_TRADE), approved (boolean), verdict (APPROVE/REJECT), "
         "confidence (0-100), reason (short string), risk_flags (array of strings)."
@@ -465,9 +577,10 @@ def local_fallback_review(decision, gemini=None):
     need_crit = 5
     import entry_quality as _eqm
     chase_block, chase_why = _eqm.fallback_blocks(d.get("entry_quality"))
-    ok = (ev >= need_ev and crit >= need_crit and conflicts <= max_conflicts and rr >= 1.5 and not chase_block)
+    lane = bool(d.get("momentum_lane"))      # v42: a confirmed momentum-lane setup is not judged on the (history-driven) EV number
+    ok = ((ev >= need_ev or lane) and crit >= need_crit and conflicts <= max_conflicts and rr >= 1.5 and not chase_block)
     tier = "strong" if strong else "normal"
-    why = (f"[{tier} tier] expectancy {ev:+.2f}R (need {need_ev:+.2f}R), {crit} direct confirmations (need {need_crit}), "
+    why = (("[momentum lane] " if lane else "") + f"[{tier} tier] expectancy {ev:+.2f}R (need {need_ev:+.2f}R), {crit} direct confirmations (need {need_crit}), "
            f"{conflicts} major conflicts (max {max_conflicts}), R:R {rr:.2f} (need 1.5)"
            + (f", CHASE BLOCK: {chase_why}" if chase_block else ""))
     g = ""
@@ -914,8 +1027,12 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     if _used:
         return {"has_setup": False, "reason": _used_reason, "context_audit": context_audit}
 
-    # GLOBAL RESEARCH VETO (documented in v29 but never implemented): a STRONG opposite global read
-    # blocks the trade; moderate/neutral global context only shapes the learned confidence.
+    # GLOBAL RESEARCH (v43): a STRONG opposite global read used to HARD-BLOCK the trade -- even while the index was falling
+    # for an hour with every named strategy saying SELL, because macro points (VIX/DXY/yields/crude) added up to "BUY".
+    # Global data is yesterday's close for US/Asia and is secondary to live price action, so it now costs probability
+    # (soft) and Gemini -- which does its own Google-Search research -- stays the judge of the global picture.
+    _global_pen = 0.0
+    _global_note = ""
     _gr = global_research if isinstance(global_research, dict) else dashboard_context.get("RAW Global Research")
     _gr_aligned = False
     if isinstance(_gr, dict) and str(_gr.get("status", "")).upper() == "AVAILABLE":
@@ -924,9 +1041,8 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         _g_oppose = (_gb == "SELL" and direction == "BUY") or (_gb == "BUY" and direction == "SELL")
         _gr_aligned = not _g_oppose
         if _g_oppose and _gs == "STRONG":
-            return {"has_setup": False,
-                    "reason": f"Global research is STRONGLY {_gb} against this {direction}; domestic setup alone is not enough.",
-                    "context_audit": context_audit}
+            _global_pen = GLOBAL_OPPOSE_PENALTY
+            _global_note = f"Global research reads {_gb} (strong) against this {direction}: probability reduced, not blocked."
 
     # LOCATION-FIRST HARD GATE.  A directional score is not enough to buy
     # directly into resistance or sell directly into support.  The engine
@@ -1312,22 +1428,23 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     # target near the next meaningful OI barrier. Structural/ladder levels remain
     # fallback references when the live option chain has no usable wall.
     _oi_raw = raw_option_chain if raw_option_chain is not None else dashboard_context.get("RAW Option Chain (all loaded strikes)")
-    _oi_hit = _oi_wall_target(_oi_raw, live_price, direction, atr=atr)
     oi_wall_note = None
     oi_wall_penalty = 0.0
     oi_target = None
-    if _oi_hit is not None:
-        _oi_t, _wall_strike = _oi_hit
-        oi_dist = (_oi_t - live_price) if direction == "BUY" else (live_price - _oi_t)
-        if oi_dist >= OI_MIN_RR * sl_distance:
-            oi_target = _oi_t
-            target = oi_target
-            oi_wall_note = f"Target {_oi_t:g} sits just before the {_wall_strike:g} OI wall ({oi_dist:.0f} pts away)."
-        else:
-            # a strong wall is sitting right in front of the entry: price is likely to stall there.  Do not invent a
-            # farther target through it; keep the normal target but charge the trade some probability (soft).
-            oi_wall_penalty = 0.25
-            oi_wall_note = f"Strong OI wall at {_wall_strike:g} only {abs(_wall_strike - live_price):.0f} pts ahead -- probability reduced."
+    _oi_t, _oi_wall, _oi_block, _oi_rr = _oi_pick_target(_oi_raw, live_price, direction, sl_distance, atr=atr)
+    if _oi_t is not None:
+        oi_target = _oi_t
+        target = oi_target
+        oi_wall_note = f"Target {_oi_t:g} sits just before the {_oi_wall:g} OI wall ({abs(_oi_t - live_price):.0f} pts, {_oi_rr:.1f}R)."
+        if _oi_block is not None:
+            # a closer wall sits between entry and that target: price may stall there first -> small, soft cost
+            oi_wall_penalty = 0.12
+            oi_wall_note += f" A thinner-payoff OI wall at {_oi_block:g} is in the way -- probability reduced a little."
+    elif _oi_block is not None:
+        # a strong wall is sitting right in front of the entry and nothing farther pays: price is likely to stall there.
+        # Do not invent a farther target through it; keep the normal target but charge the trade some probability (soft).
+        oi_wall_penalty = 0.25
+        oi_wall_note = f"Strong OI wall at {_oi_block:g} only {abs(_oi_block - live_price):.0f} pts ahead -- probability reduced."
 
     # Prefer the next VALIDATED structural boundary as target when no usable OI
     # wall was found. Round-number ladder levels are secondary.
@@ -1434,6 +1551,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     _penalty += 0.15 if is_choppy else 0.0                 # squeezed/choppy volatility: more false breaks
     _penalty += 0.10 if (not regime_ok and regime_bias == "RANGE") else 0.0
     _penalty += oi_wall_penalty
+    _penalty += _global_pen
     # ENTRY QUALITY (price-action): chasing an extended move costs probability; a sweep / rejection / pullback earns some back.
     _eq = (entry_quality or {}).get(direction) if isinstance(entry_quality, dict) and direction in entry_quality else entry_quality
     _eq = _eq if isinstance(_eq, dict) and ("penalty_logit" in _eq) else None
@@ -1478,7 +1596,8 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     except Exception:
         logger.exception("learned adjustment failed (ignored)")
         _adj = {"delta_logit": 0.0, "note": "", "nn": {}, "memory": {}}
-    _penalty -= float(_adj.get("delta_logit", 0.0))
+    _delta = float(_adj.get("delta_logit", 0.0))
+    _penalty -= max(_delta, -LEARNED_DRAG_CAP)         # bonus is allowed in full; the DRAG is capped (v42)
     # REPEAT-MISTAKE CHECK: tags (extended entry, late session, huge day move ...) that have already lost often -> small penalty
     _tags = trade_diagnostics.risk_tags(factor_flags, _feats, hour=_now.hour + _now.minute / 60.0)
     try:
@@ -1486,7 +1605,13 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     except Exception:
         logger.exception("tag penalty failed (ignored)")
         _tag_pen, _tag_note = 0.0, ""
+    _tag_pen = min(float(_tag_pen), TAG_PENALTY_CAP)
     _penalty += _tag_pen
+    # v43: weak coarse segments (whole grade / side / hour) are a small probability cost, not a block
+    _grade_pre = "A" if (critical_true >= 7 and hard_conflicts == 0) else ("B" if critical_true >= 5 else "C")
+    _seg_pen, _seg_note = trade_learning.segment_soft_penalty(
+        {"grade": _grade_pre, "hour_bucket": f"{_now.hour:02d}h", "side": direction})
+    _penalty += _seg_pen
     edge = trade_learning.compute_edge(factor_flags, rr, _penalty)
     edge["learning_note"] = _adj.get("note", "")
     confidence_pct = edge["confidence_pct"]
@@ -1513,7 +1638,15 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     edge["bar_notes"] = _bar_notes
     edge["required_probability"] = round(edge_model.required_probability(rr, _min_ev), 4)
 
-    if edge["expectancy_r"] < _min_ev:
+    # v42 momentum-capture lane (see constants).  It only waives the LEARNED edge/win-chance bar; it needs strong live evidence.
+    _lane_ok = bool(strategy_path) and _momentum_lane_ok(strategy_result, direction, _eq)
+    _momentum_lane = False
+    if _lane_ok and (edge["expectancy_r"] < _min_ev or float(edge.get("win_probability") or 0.0) < _win_floor(_now)[0]):
+        _momentum_lane = True
+        _bar_notes.append("momentum-capture lane: live price action + strategies agree strongly -> learned win-rate bar waived")
+        edge["required_ev_r"] = round(_min_ev, 3)
+
+    if edge["expectancy_r"] < _min_ev and not _momentum_lane:
         return {"has_setup": False,
                 "reason": (f"No positive edge: estimated win chance {confidence_pct:.1f}% at R:R {rr:.2f} gives expectancy "
                            f"{edge['expectancy_r']:+.2f}R, below the required {_min_ev:+.2f}R "
@@ -1527,7 +1660,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
 
     _wp = float(edge.get("win_probability") or 0.0)
     _floor, _floor_note = _win_floor(_now)
-    if _wp < _floor:
+    if _wp < _floor and not _momentum_lane:
         return {"has_setup": False,
                 "reason": (f"Win-chance floor: the engine's own win probability for this setup is {100 * _wp:.1f}%, below the minimum "
                            f"{100 * _floor:.0f}%{(' (' + _floor_note + ')') if _floor_note else ''}. Even with a positive-looking R:R it would lose about {100 * (1 - _wp):.0f} of 100 times. "
@@ -1544,6 +1677,8 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     _grade = "A" if (critical_true >= 7 and hard_conflicts == 0) else ("B" if critical_true >= 5 else "C")
     _entry_meta = {"playbook": str(_playbook), "grade": _grade, "hour_bucket": f"{_now.hour:02d}h",
                    "side": direction, "probe": False, "logic_version": trade_learning.LOGIC_VERSION}
+    if _momentum_lane:
+        _entry_meta["lane"] = "momentum"
     _seg_blocked, _seg_reason = trade_learning.segment_gate(_entry_meta)
     if _seg_blocked:
         return {"has_setup": False, "reason": _seg_reason, "context_audit": context_audit,
@@ -1561,6 +1696,12 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     else:
         confidence_note = (f"Rule-based prior only -- no resolved trades yet, so this is a conservative estimate, not a measured win rate. "
                            f"Expectancy {edge['expectancy_r']:+.2f}R at R:R {rr:.2f}.")
+    if _momentum_lane:
+        confidence_note = ("Momentum-capture lane: live price action and the named strategies agree strongly, so the engine's own (history-driven) "
+                           f"win-rate bar was waived for this move. Honest estimate {100 * _wp:.0f}% at R:R {rr:.2f}; Gemini's review and the "
+                           "28-pt stop still apply. " + confidence_note)
+    if _global_note:
+        confidence_note += " " + _global_note
     factor_flags["_entry_meta"] = _entry_meta
     factor_flags["_playbook_label"] = str(_playbook)
     factor_flags["_setup_score"] = round(_sscore, 1)
@@ -1611,6 +1752,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         "target_note": oi_wall_note, "learning_note": edge.get("learning_note", ""),
         "entry_quality": _eq, "pcr_velocity": _pv or None,
         "oi_buildup": _oib, "event_risk": _event, "risk_tags": factor_flags.get("_risk_tags"), "repeat_mistake_note": _tag_note,
+        "momentum_lane": _momentum_lane, "global_note": _global_note,
         "expectancy_r": edge["expectancy_r"], "win_probability": edge["win_probability"],
         "breakeven_probability": edge["breakeven_probability"], "required_ev_r": edge["required_ev_r"],
         "edge": edge,

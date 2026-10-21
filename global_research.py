@@ -148,9 +148,14 @@ def build_global_research(df_markets, df_news=None, india_news_sentiment=None):
         else:
             evidence.append("India news sentiment is mixed/neutral.")
 
-    if bull >= bear + 3:
+    # v43: "STRONG" must be backed by the global EQUITY markets themselves.  VIX / DXY / yields / crude / USD-INR / news can
+    # add up to +3 on their own while most world indices are actually red (the dashboard then said "STRONGLY BUY" next to
+    # a "Mild Bearish" global tracker).  Macro-only points can reach MODERATE at most.
+    equity_backs_buy = positives >= negatives + 2 and (avg_equity is None or avg_equity > 0)
+    equity_backs_sell = negatives >= positives + 2 and (avg_equity is None or avg_equity < 0)
+    if bull >= bear + 3 and equity_backs_buy:
         bias, strength = "BUY", "STRONG"
-    elif bear >= bull + 3:
+    elif bear >= bull + 3 and equity_backs_sell:
         bias, strength = "SELL", "STRONG"
     elif bull > bear:
         bias, strength = "BUY", "MODERATE"

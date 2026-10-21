@@ -1,3 +1,23 @@
+# NIFTY AI -- v43: global research can no longer block a falling market; v42 restored; 5-min chart behind a switch
+
+- **Why "no trade" on 21-Oct:** every candle 10:50-11:10 had SELL strategies live and price action at -55, but the gate said
+  "Global research is STRONGLY BUY against this SELL".  That "STRONG BUY" came from macro points (calm VIX, soft DXY, falling yields, oil down)
+  while the global tracker itself read "Mild Bearish" (4 up / 6 down).  It was also a HARD veto that ran BEFORE Gemini, so Gemini's Google-Search
+  research never even got asked.
+- **Fix 1 (`global_research.py`):** "STRONG" now needs the global EQUITY markets to back it (>= 2 more up than down and a positive/negative average).
+  Macro-only points reach MODERATE at most.
+- **Fix 2 (`ai_trade_decision.py`):** a strong opposite global read is now a probability penalty (`GLOBAL_OPPOSE_PENALTY` 0.20), not a block.
+  Gemini (with Google Search, plus a cached news brief) judges the global picture.
+- **v42 was missing from the repo (only tests + tick_guard.py were there).  Restored to the tests' spec:**
+  momentum-capture lane (live score >= 45, strategy consensus >= 80%, >= 3 live strategies, no severe chase -> the history-driven win-rate bar is
+  waived; Gemini review, 28-pt stop, cooldowns still apply), learned-drag cap 0.30 / tag-penalty cap 0.20, OI target picker (first wall that pays,
+  closer wall = small penalty), `trade_learning.resolve_tick` (SL/target on the live tick, started by `tick_guard` from app.py), Gemini news brief.
+- **Self-learning segments:** a whole grade / side / hour no longer hard-blocks (soft penalty instead); only playbook / playbook+grade / probe
+  can block, and only trades from the CURRENT logic version count.
+- **UI:** live chart is 5-minute and sits behind a one-line "Live 5-min chart dikhao" switch (OFF = not fetched at all);
+  "Named Strategy Library" is always collapsed to one line.
+- Tests: `python -m unittest tests_edge_v36 tests_v37_quality tests_v41_visibility tests_v42_momentum_tick tests_v43_global_chart` -> 143 pass.
+
 # NIFTY AI -- v41: "why no trade?" is now answered from disk (no trading rule changed)
 
 - **Problem:** a big morning move and no trade, but the only evidence was a per-session table that restarts on every page reload (the keeper robot reloads
