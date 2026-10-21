@@ -19,6 +19,7 @@ import safe_io
 import entry_quality
 import pcr_velocity
 import shadow_trades
+import market_brain
 import gate_log
 import trade_diagnostics
 import index_correlation
@@ -1550,6 +1551,16 @@ def _live_dashboard():
                 )
                 if _sid:
                     st.success(f"✅ Automatically logged (id {_sid}) — tracking ho raha hai, outcome se seekhega.")
+
+        # -------------------------------------------------------------
+        # 🧬 MARKET BRAIN (v46): records every 5-min candle + its 60-min outcome, learns patterns, runs the daily autopsy
+        # ("kahan se palta, kyon palta") and a validated next-move forecaster.  ADVISORY ONLY -- it never opens, blocks
+        # or edits a trade, and any error inside it is swallowed.
+        # -------------------------------------------------------------
+        try:
+            market_brain.run(st, df, {**globals(), **locals()})
+        except Exception:
+            logger.exception('market brain failed (ignored)')
 
         with st.expander("🕶️ Shadow trades -- jo setups block hue, unka result (bina paisa lagaye seekhna)", expanded=False):
             try:

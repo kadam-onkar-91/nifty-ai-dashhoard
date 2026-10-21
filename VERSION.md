@@ -1,3 +1,18 @@
+# v46 -- MARKET BRAIN (roz seekhne wala dimaag)  [purely additive; no trade logic changed]
+New files: `market_memory.py` (recorder), `market_learner.py` (patterns + forecaster), `market_autopsy.py`, `market_brain.py` (panel),
+`SUPABASE_MARKET_BRAIN_MIGRATION.sql` (run once).  `app.py`: one import + one guarded call above the Shadow-trades expander.
+- Recorder: every completed 5-min candle -> feature snapshot (price/volume/RSI/EMA/VWAP/day position/opening range, + live OI walls, PCR,
+  VIX, breadth, global mood, strategy state).  60 min later the outcome is added (max up/down, which of +/-25 and +/-50 pts was hit FIRST).
+  First run back-fills the candles the app already has, so learning starts on day one.
+- Autopsy: zig-zag swings for every day; for each reversal the data-visible reasons (stop-hunt wick, prev-day level, volume spike, RSI/EMA
+  stretch, reaction candle, VWAP, round number, OI wall) and whether the engine caught the move.  Finished days are stored permanently.
+- Pattern memory: ~20 named situations with their real 60-min outcome statistics.
+- Forecaster: logistic + small neural net ensemble.  P(+25 first), P(+50 first), P(50-pt move in 60 min).  Rolling-origin tested on the past
+  only; "trusted" needs avg AUC >= 0.58, worst fold >= 0.52 and a win over the majority baseline (0/6 false-trusted on pure noise in tests).
+  Trains in a background thread; live forecasts are stored and scored once their outcome is known (Scorecard).
+- ADVISORY ONLY (`market_learner.FORECAST_GATE = "off"`): it does not open, block or resize any trade.  Switch to a soft penalty only after
+  the scorecard shows it helps on the engine's own trades.
+
 # NIFTY AI -- v43: global research can no longer block a falling market; v42 restored; 5-min chart behind a switch
 
 - **Why "no trade" on 21-Oct:** every candle 10:50-11:10 had SELL strategies live and price action at -55, but the gate said
