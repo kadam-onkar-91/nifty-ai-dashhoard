@@ -266,13 +266,6 @@ def fetch_live_market_data(access_token):
     if live_price is not None and not df.empty:
         try:
             df.iloc[-1, df.columns.get_loc('Close')] = live_price
-            # the forming candle's High/Low must also reach the live price, otherwise a live price above the candle's
-            # old High (or below its Low) is invisible to every indicator/strategy that reads High/Low
-            _hi_i, _lo_i = df.columns.get_loc('High'), df.columns.get_loc('Low')
-            if live_price > float(df.iloc[-1, _hi_i]):
-                df.iloc[-1, _hi_i] = live_price
-            if live_price < float(df.iloc[-1, _lo_i]):
-                df.iloc[-1, _lo_i] = live_price
         except Exception:
             logger.exception("Broad exception caught; fallback path executed")
             pass

@@ -836,7 +836,7 @@ class TargetRealismAndGeminiTimeoutTests(DbCase):
         self.assertGreaterEqual(atd.REVIEW_DEADLINE_S, 120)
         import inspect
         src = inspect.getsource(atd.gemini_trade_review)
-        self.assertIn("body_json, 40", src); self.assertIn("get_news_brief", src)   # v42: search is its own cached call
+        self.assertIn("body_search, 40", src); self.assertIn("body_json, 25", src)
 
 
 import shadow_trades

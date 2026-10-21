@@ -537,17 +537,7 @@ def _bars_since(df, opened_at):
         return []
 
 
-_RESOLVE_LOCK = _sb_threading.RLock()   # heavy refresh + the 2-second tick guard must never close the same trade twice
-
-
-def resolve_tick(live_price):
-    """Fast path, called every ~2 s by tick_guard (independent of the heavy 30 s page refresh): ONLY checks the LIVE price against
-    stop-loss / target.  A stop is therefore hit the moment price touches it -- not when the next page refresh or the next
-    5-min candle happens to notice.  Time stops / candle scans stay in resolve_open_setups()."""
-    return resolve_open_setups(live_price, df=None, tick_only=True)
-
-
-def resolve_open_setups(live_price, df=None, tick_only=False):
+def resolve_open_setups(live_price, df=None):
     """Call every refresh with the current underlying price (and, ideally, the OHLC frame).
 
     Outcome rules (unchanged philosophy, now actually correct):
@@ -557,13 +547,7 @@ def resolve_open_setups(live_price, df=None, tick_only=False):
                        survived into another day.  Stored with its mark-to-market R so the
                        learner can still learn from it (see _resolved_learning_rows).
     No trailing / breakeven stop: SL stays at the original level.
-    tick_only=True: only the live-price SL/target check (see resolve_tick).
     """
-    with _RESOLVE_LOCK:
-        return _resolve_open_setups_locked(live_price, df, tick_only)
-
-
-def _resolve_open_setups_locked(live_price, df, tick_only):
     try:
         open_rows = _sb_get_open() if _is_supabase_configured() else _sqlite_get_open()
     except Exception as e:
@@ -597,7 +581,7 @@ def _resolve_open_setups_locked(live_price, df, tick_only):
 
         # 1) completed candles since entry (catches intrabar SL/target touches)
         outcome, exit_px = (None, None)
-        if opened_at is not None and not tick_only:
+        if opened_at is not None:
             _bars = _bars_since(df, opened_at)
             # best / worst excursion must include candle highs/lows, not only the 30 s snapshots
             for _hi, _lo in _bars:
@@ -612,7 +596,7 @@ def _resolve_open_setups_locked(live_price, df, tick_only):
         # 2) a trade that survived into another session is closed at the last price seen in ITS session --
         #    today's gap-open price is not a price the trade could ever have been filled at
         carried = opened_at is not None and opened_at.date() != now.date()
-        if outcome is None and carried and not tick_only:
+        if outcome is None and carried:
             outcome = "EXPIRED"
             exit_px = float(meta.get("last_seen_price", entry))
             meta["expired_reason"] = "carried_overnight"
@@ -625,7 +609,7 @@ def _resolve_open_setups_locked(live_price, df, tick_only):
                 if live_price <= target: outcome, exit_px = "WIN", live_price
                 elif live_price >= sl: outcome, exit_px = "LOSS", live_price
         # 4) time based exits (same session)
-        if outcome is None and opened_at is not None and not tick_only:
+        if outcome is None and opened_at is not None:
             stagnant = ((now - opened_at) >= timedelta(minutes=TIME_STOP_MIN)
                         and float(meta.get("max_favorable_pts", 0.0)) < TIME_STOP_MIN_FAV_R * risk)
             if now.time() >= EOD_SQUAREOFF or (now - opened_at) > timedelta(minutes=MAX_HOLD_MINUTES) or stagnant:
@@ -641,13 +625,12 @@ def _resolve_open_setups_locked(live_price, df, tick_only):
             meta["expired_r"] = round(pnl / risk, 3)
 
         factors["_learning_meta"] = meta
-        if (not tick_only) or outcome:
-            try:
-                payload = json.dumps(factors)
-                if _is_supabase_configured(): _sb_update_factors(setup_id, payload)
-                else: _sqlite_update_factors(setup_id, payload)
-            except Exception:
-                logger.exception("Could not persist learning excursion metadata")
+        try:
+            payload = json.dumps(factors)
+            if _is_supabase_configured(): _sb_update_factors(setup_id, payload)
+            else: _sqlite_update_factors(setup_id, payload)
+        except Exception:
+            logger.exception("Could not persist learning excursion metadata")
 
         if outcome:
             try:

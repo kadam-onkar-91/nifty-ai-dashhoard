@@ -1,22 +1,3 @@
-# NIFTY AI -- v42: catch the big moves, SL on the live tick, OI-based target, real Google-search brief, 5-min chart switch
-
-- **Why trades were missed:** the edge model is calibrated on the engine's own record, so it sat at 13-15% win chance and printed "No positive edge" even
-  while 3-5 live strategies, VWAP/EMA and price action all pointed one way (e.g. SELL after 23,046 on 15-Oct).  Nothing in the gate log was a bug -- the bar was.
-- **Momentum-capture lane (`ai_trade_decision.py`):** if live price action >= 50/100 in the trade direction, >= 3 live strategies on that side (consensus >= 80),
-  no major conflict, not a severe chase and R:R >= 1.0 -> the learned EV bar and win-floor no longer veto.  Gemini review, segment pause, cooldown,
-  one-setup-one-trade, event risk, session window and chase checks all still apply.  Shown as "Momentum-capture lane" on the trade card.
-- **Soft drag caps:** mistake-memory/NN adjustment capped at +/-0.30 logit, repeat-mistake tag penalty at 0.20.  Strategy-led entries are no longer vetoed
-  by the legacy "nearest level reads the other way" or "entry far from level" checks (probability penalty instead).
-- **SL on the live tick (`tick_guard.py`, `trade_learning.resolve_tick`):** a background thread checks the Upstox LTP every 2 s against the open trade's SL/target
-  (no time exits there).  SL ceiling stays 28 pts (hard clamp).  Live price now also stretches the forming candle's High/Low.
-- **OI target:** target goes just IN FRONT of the nearest significant OI wall that pays >= 1.2R (else >= 1.0R); a nearer wall that is too close is a small
-  probability penalty, never skipped silently.  Cap (2.2R / ATR reach) unchanged.
-- **Google search for Gemini:** the old single call (JSON + search) silently fell back to "no search".  Now a separate cached (10 min, pre-warmed) Google-search
-  brief is sent to the JSON review; verdict shows the brief, its age and whether Google returned grounding data, or the error.
-  Prompt now says a clean continuation after a pullback is not "chasing".
-- **UI:** live chart is 5-minute, behind a one-line ON/OFF switch, with the open trade's entry / SL / target lines.  Named Strategy Library is collapsed (one line).
-- Tests: `python -m unittest tests_edge_v36 tests_v37_quality tests_v41_visibility tests_v42_momentum_tick` (137 pass).
-
 # NIFTY AI -- v41: "why no trade?" is now answered from disk (no trading rule changed)
 
 - **Problem:** a big morning move and no trade, but the only evidence was a per-session table that restarts on every page reload (the keeper robot reloads
