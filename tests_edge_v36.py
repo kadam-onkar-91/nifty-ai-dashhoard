@@ -220,7 +220,18 @@ def _strategy(direction="BUY", score=70.0):
             "live_state": {"score": 45 if direction == "BUY" else -45}}
 
 
-def _decide(direction="BUY", now=dtime(11, 0), global_research=None, is_choppy=False, strategy=None, live=24000.0, atr=14.0, ladder=None, zone_edge=6.0, chain=None):
+def _decide(direction="BUY", now=dtime(11, 0), global_research=None, is_choppy=False, strategy=None, live=24000.0, atr=14.0, ladder=None, zone_edge=6.0, chain=None, macro=False):
+    """macro=False switches Model B (macro_confluence) off so the older tests keep measuring only what they were written for."""
+    import macro_confluence as _mc
+    _old_en = _mc.ENABLED
+    _mc.ENABLED = bool(macro)
+    try:
+        return _decide_inner(direction, now, global_research, is_choppy, strategy, live, atr, ladder, zone_edge, chain)
+    finally:
+        _mc.ENABLED = _old_en
+
+
+def _decide_inner(direction, now, global_research, is_choppy, strategy, live, atr, ladder, zone_edge, chain):
     bull = direction == "BUY"
     sr = {"status": "OK", "location": "AT_SUPPORT" if bull else "AT_RESISTANCE",
           "confirmation": {"support_rejection_confirmed": True, "resistance_rejection_confirmed": True},
@@ -261,14 +272,25 @@ class DecisionTests(DbCase):
         late = _decide(now=dtime(15, 12))   # entry window now runs to 15:10 (was 14:45)
         self.assertFalse(late["has_setup"]); self.assertIn("entry window", late["reason"])
 
-    def test_strong_opposite_global_research_is_a_penalty_not_a_veto(self):
-        """v43: a strong opposite global read used to hard-block; it now only costs probability (Gemini judges global news)."""
-        base = _decide("BUY")
+    def test_strong_opposite_global_research_vetoes_again(self):
+        """v50: the v29..v41 veto is restored (v43 had made it a penalty).  'STRONG' itself now needs world equity markets behind it."""
         gr = {"status": "AVAILABLE", "directional_bias": "SELL", "strength": "STRONG"}
         out = _decide("BUY", global_research=gr)
-        self.assertTrue(out["has_setup"], out.get("reason"))
-        self.assertLess(out["win_probability"], base["win_probability"])
-        self.assertIn("Global research", out["confidence_note"])
+        self.assertFalse(out["has_setup"]); self.assertIn("Global research is STRONGLY SELL", out["reason"])
+        self.assertEqual(atd.classify_block(out["reason"]), "Strong global veto")
+        old = atd.GLOBAL_VETO
+        atd.GLOBAL_VETO = False                       # kill switch -> the v43 soft penalty
+        try:
+            soft = _decide("BUY", global_research=gr)
+        finally:
+            atd.GLOBAL_VETO = old
+        self.assertTrue(soft["has_setup"], soft.get("reason"))
+        self.assertLess(soft["win_probability"], _decide("BUY")["win_probability"])
+
+    def test_moderate_or_aligned_global_research_does_not_veto(self):
+        for gr in ({"status": "AVAILABLE", "directional_bias": "SELL", "strength": "MODERATE"},
+                   {"status": "AVAILABLE", "directional_bias": "BUY", "strength": "STRONG"}):
+            self.assertTrue(_decide("BUY", global_research=gr)["has_setup"])
 
     def test_losing_record_stops_the_engine_by_itself(self):
         """With a real 15% win rate the calibrated expectancy turns negative and the engine refuses."""

@@ -1,3 +1,41 @@
+# v50b -- global veto no longer fires on every refresh: it steps aside (becomes a 0.20 penalty) while live price action + strategies strongly confirm the trade (`GLOBAL_VETO_RELIEF`). It still blocks when the live market does NOT confirm.
+
+# v50 -- TWO MODELS TOGETHER: Model A (structure + strategies) + Model B (macro / global-led, the old v41 idea)  [from the 22-Oct 5-straight-loss review]
+What the diff old(v41) -> v49b showed: v42/v43 loosened the engine in four places at once -- (1) STRONG opposite global research became a 0.20 penalty
+(v29..v41: hard veto), (2) a "momentum lane" waived the learned win-rate bar completely, (3) the learned penalties (mistake memory/NN, repeat-mistake tags)
+were capped at 0.30 / 0.20, (4) coarse segments no longer block.  Result on 22-Oct: 56 resolved trades, 16W/40L (28.6 %), 42 "immediate reversal" cases
+with 16.7 % wins, and three trades taken at 33-44 % honest win chance.
+- NEW `macro_confluence.py` (Model B): global research (strong/moderate) + world-equity average + India news + Nifty-50 news + fundamentals + breadth +
+  order flow + PCR velocity + VIX -> signed score -> STRONG_ALIGNED / ALIGNED / NEUTRAL / OPPOSED / STRONG_OPPOSED.  Pure, no I/O, kill switch `ENABLED`.
+- Global research STRONG against the trade = VETO again (`ai_trade_decision.GLOBAL_VETO`).  The v43 fix is kept: STRONG needs the world EQUITY markets behind it,
+  so VIX/DXY/yield/crude points alone can not create a false STRONG and freeze a trending market (the 21-Oct case).
+- Agreement of both models earns leniency; disagreement gets the old strict behaviour:
+    * Model B agrees -> small probability bonus (-0.08 / -0.15 logit), the v42 caps on learned penalties stay, momentum lane is possible.
+    * Model B opposes -> penalty (+0.15 / +0.30 logit), learned penalties applied in FULL (v41 behaviour), no lane.
+- Momentum lane tightened: needs Model B ALIGNED, win chance >= 36 % (`LANE_MIN_WIN_PROB`), and may waive at most 0.10 R of EV (`LANE_MAX_EV_SHORTFALL`).
+- Opening range: before 09:45 only a trade with Model B STRONG_ALIGNED (global research strong with it); 09:45-10:00 the EV bar is +0.05 R unless Model B agrees.
+  (Market autopsy: "opening volatility" = #1 turn reason, 11 of 31 big moves; two of the five losses were opening SELLs into a V-reversal.)
+- UI: one line under every trade shows both models and whether the lane was used.  Each stored trade has `macro_model_aligned` and `_macro`.
+- Tests: tests_v50_two_models (10 new); tests_edge_v36 / v42 / v43 updated to the new rules (veto restored, lane needs both models).
+- NOT changed: SL, target logic, cooldown + same-zone guard (v49), Gemini final review, post-mortem, Market Brain, gate log.
+
+# v49b -- Google Search visibility (diagnostics only; no trading logic changed)
+Finding (22-Oct screenshot): ALL 9 stored approvals say "no search" -> the grounded (Google Search) call inside the review fails every time and silently
+falls back to plain JSON.  The cause is not visible from the screenshot, so now: each new trade stores WHY the search call failed (`search_error`) and whether the
+separate Google-grounded news brief (which is added to every review prompt) was available and really grounded (`news_brief`); both show under each trade in
+"Har trade ke peeche Gemini ka report".  Gemini scorecard also lists approvals model-wise (jeet/total).
+
+# v49 -- stop the "same failed zone, same side" re-entry + opening whipsaw  [small, narrow; SL / target / other gates UNCHANGED]
+From the 5 straight losses (10-21 13:53, 14:10; 10-22 09:41, 09:57, 10:33):
+- SAME-ZONE GUARD (`trade_learning.ZONE_GUARD`, kill switch = False): after a same-side STOP-OUT, no new same-side entry for 60 min unless price has
+  moved >= 0.5 x that trade's risk beyond the failed entry in our direction.  Two of the five losses were exactly this (SELL 22683.8 -> 22687.1,
+  SELL 22636.1 -> 22629.1, each stopped again).  Reason text starts with "Cooldown", so it is counted under the Cooldown gate.
+- Gemini's review packet now also states: trades stopped out today, clock hour, day move %, position in the day's range; prompt rule 2d asks it to
+  reject a same-zone repeat and to be extra strict before 10:00.  (Google Search was already used first, plain-JSON fallback only if the grounded call fails;
+  each stored trade shows "Google Search ON / no search".)
+- New risk tag `opening_whipsaw` (09:30-10:00).  Like every tag it only costs probability after the user's own trades prove it bad (>= 6 weighted samples, win < 30%).
+- Tests: 175 pass (5 new).
+
 # v48 -- TRADE POST-MORTEM (har trade ka "kyon" seekhna)  [purely additive; trading logic, gates, SL, target UNCHANGED]
 New: `trade_postmortem.py`, `tests_postmortem_v48.py`.  Touched (small, guarded): `trade_learning.py` (+ read-only `get_resolved_full`),
 `market_memory.py` (+ `load_pm_days`; day autopsies ignore `pm-` rows), `market_brain.py` (post-mortem panel + Gemini note).

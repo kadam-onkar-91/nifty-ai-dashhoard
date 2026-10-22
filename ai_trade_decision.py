@@ -21,6 +21,7 @@ import oi_buildup
 import trade_diagnostics
 import strategy_engine
 import gemini_pool
+import macro_confluence
 import json
 import time
 import requests
@@ -66,6 +67,17 @@ LANE_MIN_LIVE = 45.0            # |live price-action score| (0-100) in the trade
 LANE_MIN_CONSENSUS = 80.0       # strategy consensus % in the trade direction
 LANE_MIN_LIVE_STRATEGIES = 3    # live strategies agreeing
 LANE_MAX_OPPOSITE_CONSENSUS = 30.0
+# ---- v50: Model B (macro_confluence.py) works TOGETHER with Model A (structure + strategies).  See VERSION.md. ----
+GLOBAL_VETO = True              # v50: restored (v29..v41 behaviour).  A STRONG opposite global read blocks the trade.  "STRONG" now needs the world EQUITY
+                                #      markets to back it (v43 fix kept), so macro points alone can no longer freeze a trending market.
+GLOBAL_VETO_RELIEF = True       # v50b: the veto steps aside (becomes a penalty) while live price action + strategies strongly confirm the trade
+LANE_NEEDS_MACRO = True         # v50: the momentum lane is only for setups where Model B agrees too (verdict ALIGNED / STRONG_ALIGNED)
+LANE_MIN_WIN_PROB = 0.36        # v50: even the lane never takes a setup the engine itself rates below this
+LANE_MAX_EV_SHORTFALL = 0.10    # v50: the lane may waive at most this much EV (R) below the bar -- it used to waive the whole bar
+CAPS_NEED_MACRO = True          # v50: the v42 caps on the learned penalties only apply when Model B agrees; otherwise the old, uncapped learning is used
+OPENING_NO_TRADE_UNTIL = dtime(9, 45)   # v50: opening range still forming.  Entries before this need Model B STRONG_ALIGNED (global research strong with us)
+OPENING_CAUTION_UNTIL = dtime(10, 0)    # v50: until here the EV bar is a little higher unless Model B agrees
+OPENING_EV_EXTRA = 0.05
 ENFORCE_SESSION_WINDOW = True
 NO_ENTRY_BEFORE = dtime(9, 25)  # first 10 min: opening auction noise / wide spreads
 NO_ENTRY_AFTER = dtime(15, 10)  # entries allowed until the market's last minutes; the tool auto-closes open trades at 15:20
@@ -323,6 +335,19 @@ def _news_refresh(keys):
             _NEWS["busy"] = False
 
 
+def _news_status():
+    """Short text: was the Google-grounded news brief that goes into every review prompt actually available (and really grounded)?"""
+    try:
+        with _NEWS_LOCK:
+            n = dict(_NEWS)
+        if n.get("text"):
+            age = round((time.time() - n["ts"]) / 60) if n.get("ts") else None
+            return (f"Google-grounded brief {age} min old" if n.get("grounded") else f"brief {age} min old but NOT grounded (no search result)") + (f" [{n.get('model')}]" if n.get("model") else "")
+        return "no brief: " + (str(n.get("err") or "not fetched yet")[:100])
+    except Exception:
+        return None
+
+
 def get_news_brief(api_keys):
     """Return the cached brief immediately ({"text","grounded","model","err","age_s"}); start a background refresh when it is stale.
     Never raises, never waits for Gemini."""
@@ -474,6 +499,18 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
                                 "strategy_switched_to_match_ai": bool((strategy_result or {}).get("rebased_from"))}, default=str)
     except Exception:
         live_json = "{}"
+    # v49: facts Gemini cannot see in the packet -- what already got stopped out today, where in the day's range the entry is, and the clock.
+    try:
+        _df = ((decision or {}).get("factor_flags") or {}).get("_features") or {}
+        _today = trade_learning._now_ist().strftime("%Y-%m-%d")
+        _stops = [f"{r.get('direction')} from {float(r.get('entry')):,.0f} stopped {str(r.get('exit_timestamp') or '')[11:16]}"
+                  for r in (trade_learning.get_recent_setups(limit=8) or [])
+                  if r.get("status") == "LOSS" and str(r.get("exit_timestamp") or r.get("timestamp"))[:10] == _today][:4]
+        live_json = live_json[:-1] + "," + json.dumps({"clock_hour(14.5=14:30)": _df.get("hour"), "day_move_pct_so_far": _df.get("day_move_pct"),
+                                                         "day_range_position(0=low,1=high)": _df.get("day_pos"),
+                                                         "trades_stopped_out_today": _stops})[1:] if live_json.endswith("}") and len(live_json) > 2 else live_json
+    except Exception:
+        pass
     try:
         _nb = get_news_brief(keys)
         news_block = (f"FRESH NEWS BRIEF (Google Search, {_nb.get('age_s')} s old):\n{_nb['text']}\n\n" if _nb.get("text") else "")
@@ -496,6 +533,7 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
         "2b) REJECT if the entry would CHASE a move: e.g. a SELL after the index has already fallen sharply today and is at/below its nearest support or has just bounced, or a BUY after a sharp rise at/above resistance or just after a pullback starts. Prefer a pullback/retest entry.\n"
         "2c) The candle table is chronological (oldest first, LAST row = current candle) and spans several days: "
         "older rows at different price levels are NORMAL, never a data mismatch. Judge price from the LAST rows and the Live price given above.\n"
+        "2d) The packet below lists trades_stopped_out_today.  REJECT a new entry on the same side inside the zone of a trade that was just stopped out, unless price has clearly made a new low/high beyond it. Be extra strict before 10:00 (opening whipsaw: the first 45 minutes often reverse both ways).\n"
         "3) Secondary factors may disagree; require the MAIN evidence (structure, VWAP, order flow, option OI, regime) to lean your way.\n"
         "3b) Do NOT reject only because a minor/secondary factor disagrees or because a pullback is possible. Reject for: stale data, "
         "price chasing, or MAIN evidence leaning the opposite way. If the setup is a retest/pullback entry that is NOT extended, approve it.\n"
@@ -531,12 +569,14 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
     def _one(key, model):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         hdr = {"Content-Type": "application/json", "x-goog-api-key": key}
+        _serr = ""
         if use_search:
             try:
                 out = _gemini_extract_json(_post(url, hdr, body_search, 40))
                 out["_search_used"] = True
                 return out
             except Exception as exc_s:
+                _serr = f"{type(exc_s).__name__}: {str(exc_s)[:110]}"
                 # ANY problem with the search-grounded call (400 unsupported, 429 search quota, timeout,
                 # non-JSON prose...) -> retry the SAME key/model once WITHOUT search, so a search problem
                 # never burns this key/model or cascades through all 5 keys.
@@ -546,6 +586,7 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
         except ValueError:
             raise gemini_pool.PoolHTTPError(502, "Gemini reply was not valid JSON")
         out["_search_used"] = False
+        out["_search_error"] = _serr
         return out
 
     try:
@@ -559,7 +600,7 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
     approved = bool(parsed.get("approved")) and str(parsed.get("verdict", "")).upper() == "APPROVE" and own in (direction, "")
     out = {"direction": own or direction, "confidence": parsed.get("confidence"), 
            "risk_flags": parsed.get("risk_flags") or [], "model": model, "own_direction": own,
-           "search_used": bool(parsed.get("_search_used"))}
+           "search_used": bool(parsed.get("_search_used")), "search_error": parsed.get("_search_error") or ""}
     if approved:
         out.update({"status": "APPROVED", "approved": True, "direction": direction, "verdict": "APPROVE",
                     "reason": parsed.get("reason") or "Gemini's own read matches the proposed setup."})
@@ -614,6 +655,7 @@ _GATE_PATTERNS = (
     ("Strategy vs AI direction mismatch", "AI research is"),
     ("Stale data", "STALE/FROZEN"),
     ("Event risk window", "Event risk window"),
+    ("Opening range forming", "Opening range forming"),
     ("Win-chance floor", "below the minimum"),
     ("Outside entry window", "entry window"),
     ("Cooldown / pause", "Cooldown"),
@@ -739,6 +781,8 @@ def apply_gemini_verdict(decision, review, now=None):
         # PERMANENT PROOF stored with the trade: which review approved it (shown in the Recent AI Setups table).
         flags["_gemini"] = {"status": str(r.get("status", "")), "model": r.get("model"),
                             "search_used": bool(r.get("search_used")),
+                            "search_error": str(r.get("search_error") or "")[:160] or None,
+                            "news_brief": _news_status(),
                             "confidence": r.get("confidence"),
                             "reason": str(r.get("reason") or "")[:500],
                             "gemini_error": str(r.get("gemini_error") or "")[:300] or None,   # why Gemini was unreachable (fallback only)
@@ -1029,7 +1073,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         reversal_reason = f"Early bullish reversal accepted after {_bullish_reversal_score}/7 independent confirmations; full context was checked before changing SELL to BUY."
 
     # COOLDOWN: do not re-enter a direction that was just stopped out / pause during a loss streak.
-    _cd_blocked, _cd_reason = trade_learning.entry_cooldown(direction, now=_now)
+    _cd_blocked, _cd_reason = trade_learning.entry_cooldown(direction, now=_now, price=live_price)
     if _cd_blocked:
         return {"has_setup": False, "reason": _cd_reason, "context_audit": context_audit}
 
@@ -1039,10 +1083,9 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     if _used:
         return {"has_setup": False, "reason": _used_reason, "context_audit": context_audit}
 
-    # GLOBAL RESEARCH (v43): a STRONG opposite global read used to HARD-BLOCK the trade -- even while the index was falling
-    # for an hour with every named strategy saying SELL, because macro points (VIX/DXY/yields/crude) added up to "BUY".
-    # Global data is yesterday's close for US/Asia and is secondary to live price action, so it now costs probability
-    # (soft) and Gemini -- which does its own Google-Search research -- stays the judge of the global picture.
+    # GLOBAL RESEARCH + MODEL B (v50).  v29..v41: a STRONG opposite global read blocked the trade (the behaviour that made the older engine good).
+    # v43 turned it into a 0.20 penalty and the engine then took 5 losing trades in a row.  Restored.  What v43 correctly found is kept: "STRONG"
+    # now needs the global EQUITY markets themselves to back it (global_research.py), so macro-only points can not produce a false STRONG.
     _global_pen = 0.0
     _global_note = ""
     _gr = global_research if isinstance(global_research, dict) else dashboard_context.get("RAW Global Research")
@@ -1053,8 +1096,33 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         _g_oppose = (_gb == "SELL" and direction == "BUY") or (_gb == "BUY" and direction == "SELL")
         _gr_aligned = not _g_oppose
         if _g_oppose and _gs == "STRONG":
+            # v50b: the veto fired on EVERY refresh of a trending day (global data is yesterday's close).  It now blocks only while the live market
+            # does NOT confirm the trade.  When live price action + strategies push hard in the trade direction (same test as the momentum lane,
+            # and no severe chase) the global read becomes a penalty and Gemini + the edge bar decide -- the trade is no longer frozen all day.
+            _eq_pre = (entry_quality or {}).get(direction) if isinstance(entry_quality, dict) and direction in entry_quality else entry_quality
+            _live_confirms = bool(strategy_path) and _momentum_lane_ok(strategy_result, direction, _eq_pre)
+            if GLOBAL_VETO and not (GLOBAL_VETO_RELIEF and _live_confirms):
+                return {"has_setup": False,
+                        "reason": f"Global research is STRONGLY {_gb} against this {direction}; domestic setup alone is not enough.",
+                        "context_audit": context_audit}
             _global_pen = GLOBAL_OPPOSE_PENALTY
-            _global_note = f"Global research reads {_gb} (strong) against this {direction}: probability reduced, not blocked."
+            _global_note = (f"Global research reads {_gb} (strong) against this {direction}, but live price action + strategies confirm the move: "
+                            "probability reduced, not blocked." if _live_confirms else
+                            f"Global research reads {_gb} (strong) against this {direction}: probability reduced, not blocked.")
+    _macro = macro_confluence.assess(
+        direction, global_research=_gr, global_avg_change=global_avg_change, india_news=india_news_sentiment,
+        nifty50_news=nifty50_news_sentiment, nifty50_fundamentals=nifty50_fundamentals_bias,
+        breadth_advances=breadth_advances, breadth_declines=breadth_declines, order_pressure=_order_pressure_preview,
+        pcr_bias=(pcr_velocity or {}).get("bias", "NEUTRAL") if isinstance(pcr_velocity, dict) else "NEUTRAL", vix=live_vix)
+    _macro_verdict = _macro.get("verdict", "NEUTRAL")
+    _macro_agrees = _macro_verdict in ("ALIGNED", "STRONG_ALIGNED")
+    # OPENING RANGE: the market autopsy names "opening volatility" as the #1 reason for turns (11 of 31 big moves) and two of the five straight
+    # losses were opening SELLs into a V-reversal.  Before 09:45 only a trade with Model B STRONG_ALIGNED (global research strong with it) is allowed.
+    if _now.time() < OPENING_NO_TRADE_UNTIL and _macro_verdict != "STRONG_ALIGNED":
+        return {"has_setup": False,
+                "reason": (f"Opening range forming (until {OPENING_NO_TRADE_UNTIL.strftime('%H:%M')}): the first 30 minutes reverse both ways, so only a setup that "
+                           f"global/macro research strongly supports is taken. Model B now: {_macro.get('note')}"),
+                "context_audit": context_audit, "macro_model": _macro}
 
     # LOCATION-FIRST HARD GATE.  A directional score is not enough to buy
     # directly into resistance or sell directly into support.  The engine
@@ -1564,6 +1632,8 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     _penalty += 0.10 if (not regime_ok and regime_bias == "RANGE") else 0.0
     _penalty += oi_wall_penalty
     _penalty += _global_pen
+    _penalty += float(_macro.get("penalty_logit", 0.0))      # v50 Model B: agreement = small bonus, opposition = penalty
+    factor_flags["macro_model_aligned"] = bool(_macro_agrees)
     # ENTRY QUALITY (price-action): chasing an extended move costs probability; a sweep / rejection / pullback earns some back.
     _eq = (entry_quality or {}).get(direction) if isinstance(entry_quality, dict) and direction in entry_quality else entry_quality
     _eq = _eq if isinstance(_eq, dict) and ("penalty_logit" in _eq) else None
@@ -1609,7 +1679,10 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         logger.exception("learned adjustment failed (ignored)")
         _adj = {"delta_logit": 0.0, "note": "", "nn": {}, "memory": {}}
     _delta = float(_adj.get("delta_logit", 0.0))
-    _penalty -= max(_delta, -LEARNED_DRAG_CAP)         # bonus is allowed in full; the DRAG is capped (v42)
+    # v50: the v42 cap on the learned drag only protects setups that Model B also supports.  Without macro support the learned penalty is applied in full
+    # (the older engine's behaviour): the engine's own record says "this looks like setups that lost" and nothing outside price action disagrees.
+    _caps_on = _macro_agrees or not CAPS_NEED_MACRO
+    _penalty -= max(_delta, -LEARNED_DRAG_CAP) if _caps_on else _delta
     # REPEAT-MISTAKE CHECK: tags (extended entry, late session, huge day move ...) that have already lost often -> small penalty
     _tags = trade_diagnostics.risk_tags(factor_flags, _feats, hour=_now.hour + _now.minute / 60.0)
     try:
@@ -1617,7 +1690,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     except Exception:
         logger.exception("tag penalty failed (ignored)")
         _tag_pen, _tag_note = 0.0, ""
-    _tag_pen = min(float(_tag_pen), TAG_PENALTY_CAP)
+    _tag_pen = min(float(_tag_pen), TAG_PENALTY_CAP) if _caps_on else float(_tag_pen)
     _penalty += _tag_pen
     # v43: weak coarse segments (whole grade / side / hour) are a small probability cost, not a block
     _grade_pre = "A" if (critical_true >= 7 and hard_conflicts == 0) else ("B" if critical_true >= 5 else "C")
@@ -1665,16 +1738,22 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         _bar_notes.append(f"trading costs ~{ROUND_TRIP_COST_PTS:.0f} pts -> bar +{_cost_r:.2f}R")
     except Exception:
         pass
+    if _now.time() < OPENING_CAUTION_UNTIL and not _macro_agrees:
+        _min_ev += OPENING_EV_EXTRA
+        _bar_notes.append(f"opening hour, Model B not agreeing -> bar +{OPENING_EV_EXTRA:.2f}R")
     edge["required_ev_r"] = round(_min_ev, 3)
     edge["bar_notes"] = _bar_notes
     edge["required_probability"] = round(edge_model.required_probability(rr, _min_ev), 4)
 
     # v42 momentum-capture lane (see constants).  It only waives the LEARNED edge/win-chance bar; it needs strong live evidence.
-    _lane_ok = bool(strategy_path) and _momentum_lane_ok(strategy_result, direction, _eq)
+    # v50: the lane now needs BOTH models (Model B agrees), a minimum win chance, and can waive only a SMALL EV shortfall.
+    _lane_ok = bool(strategy_path) and _momentum_lane_ok(strategy_result, direction, _eq) and (_macro_agrees or not LANE_NEEDS_MACRO)
+    _lane_ok = _lane_ok and float(edge.get("win_probability") or 0.0) >= LANE_MIN_WIN_PROB \
+        and edge["expectancy_r"] >= _min_ev - LANE_MAX_EV_SHORTFALL
     _momentum_lane = False
     if _lane_ok and (edge["expectancy_r"] < _min_ev or float(edge.get("win_probability") or 0.0) < _win_floor(_now)[0]):
         _momentum_lane = True
-        _bar_notes.append("momentum-capture lane: live price action + strategies agree strongly -> learned win-rate bar waived")
+        _bar_notes.append("momentum-capture lane: live price action + strategies + macro model all agree -> small shortfall of the learned bar waived")
         edge["required_ev_r"] = round(_min_ev, 3)
 
     if edge["expectancy_r"] < _min_ev and not _momentum_lane:
@@ -1736,6 +1815,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     factor_flags["_entry_meta"] = _entry_meta
     factor_flags["_playbook_label"] = str(_playbook)
     factor_flags["_setup_score"] = round(_sscore, 1)
+    factor_flags["_macro"] = {"verdict": _macro_verdict, "score": _macro.get("score")}
     factor_flags["_reasons"] = list(lp.get("factors", []))[:3]
     factor_flags["_edge"] = {"p": edge["win_probability"], "ev_r": edge["expectancy_r"], "rr": round(rr, 2)}
     _feats["win_prob"] = round(_wp, 3)
@@ -1784,6 +1864,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         "entry_quality": _eq, "pcr_velocity": _pv or None,
         "oi_buildup": _oib, "event_risk": _event, "risk_tags": factor_flags.get("_risk_tags"), "repeat_mistake_note": _tag_note,
         "momentum_lane": _momentum_lane, "global_note": _global_note,
+        "macro_model": _macro,
         "expectancy_r": edge["expectancy_r"], "win_probability": edge["win_probability"],
         "breakeven_probability": edge["breakeven_probability"], "required_ev_r": edge["required_ev_r"],
         "edge": edge,

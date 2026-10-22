@@ -35,28 +35,56 @@ def _strong(direction, live=50.0, cons=95.0, n=4):
 
 
 class MomentumLaneTests(DbCase):
-    def test_losing_record_vetoes_ordinary_setup_but_not_a_confirmed_momentum_move(self):
-        _lose_a_lot()
+    def test_lane_needs_both_models_and_cannot_rescue_a_really_losing_record(self):
+        """v50: the lane used to waive the whole learned bar.  Now it needs Model B to agree, a win chance >= LANE_MIN_WIN_PROB and
+        an EV shortfall <= LANE_MAX_EV_SHORTFALL."""
+        _lose_a_lot()                                                     # 1 win in 7: honest win chance ~28-30 %
         plain = _decide("SELL")
         self.assertFalse(plain["has_setup"]); self.assertIn("No positive edge", plain["reason"])
         for d in ("SELL", "BUY"):
-            out = _decide(d, strategy=_strong(d, live=80))
-            self.assertTrue(out["has_setup"], out.get("reason"))
-            self.assertTrue(out["momentum_lane"]); self.assertIn("Momentum-capture lane", out["confidence_note"])
+            out = _decide(d, strategy=_strong(d, live=80), macro=True)
+            self.assertFalse(out["has_setup"], d)                         # a 14 % record is not overridden any more
+
+    def test_lane_waives_a_small_shortfall_only_when_model_b_agrees(self):
+        c = sqlite3.connect(tl.DB_NAME)
+        for i in range(40):                                               # 1 win in 4 -> chance ~38-41 %, EV just under the bar
+            fj = json.dumps(_flags(10, **{"_entry_meta": {"logic_version": tl.LOGIC_VERSION}}))
+            c.execute("INSERT INTO ai_trade_setups (timestamp,direction,strike,option_type,underlying_entry,stop_loss,target,"
+                      "confidence_pct,factors_json,status) VALUES ('2026-01-01 10:00:00','BUY',1,'CE',1,1,1,1,?,?)",
+                      (fj, "WIN" if i % 4 == 0 else "LOSS"))
+        c.commit(); c.close()
+        self.assertFalse(_decide("SELL")["has_setup"])
+        old = atd.LANE_MAX_EV_SHORTFALL
+        try:
+            self.assertFalse(_decide("SELL", strategy=_strong("SELL", live=80), macro=True)["has_setup"])   # shortfall 0.12 > 0.10
+            atd.LANE_MAX_EV_SHORTFALL = 0.15
+            out = _decide("SELL", strategy=_strong("SELL", live=80), macro=True)
+            self.assertTrue(out["has_setup"], out.get("reason")); self.assertTrue(out["momentum_lane"])
+            self.assertIn("Momentum-capture lane", out["confidence_note"])
             self.assertEqual(out["factor_flags"]["_entry_meta"]["lane"], "momentum")
+            self.assertFalse(_decide("SELL", strategy=_strong("SELL", live=80), macro=False)["has_setup"])  # Model B not agreeing -> no lane
+        finally:
+            atd.LANE_MAX_EV_SHORTFALL = old
 
     def test_lane_needs_strong_live_evidence(self):
         _lose_a_lot()
         for kw in (dict(live=30), dict(cons=60), dict(n=2)):
-            out = _decide("SELL", strategy=_strong("SELL", **dict(dict(live=80), **kw)))
+            out = _decide("SELL", strategy=_strong("SELL", **dict(dict(live=80), **kw)), macro=True)
             self.assertFalse(out["has_setup"], kw)
 
     def test_lane_does_not_override_a_severe_chase(self):
-        _lose_a_lot()
+        c = sqlite3.connect(tl.DB_NAME)
+        for i in range(40):
+            fj = json.dumps(_flags(10, **{"_entry_meta": {"logic_version": tl.LOGIC_VERSION}}))
+            c.execute("INSERT INTO ai_trade_setups (timestamp,direction,strike,option_type,underlying_entry,stop_loss,target,"
+                      "confidence_pct,factors_json,status) VALUES ('2026-01-01 10:00:00','BUY',1,'CE',1,1,1,1,?,?)",
+                      (fj, "WIN" if i % 4 == 0 else "LOSS"))
+        c.commit(); c.close()
+        self.addCleanup(setattr, atd, "LANE_MAX_EV_SHORTFALL", atd.LANE_MAX_EV_SHORTFALL)
+        atd.LANE_MAX_EV_SHORTFALL = 0.15
         eq = {"penalty_logit": 0.6, "chase_flags": ["RSI 80", "far from EMA", "day move"], "confirm_flags": [], "severe": True, "metrics": {}}
-        d = dict(live=24000.0)
-        out = _decide("SELL", strategy=_strong("SELL", live=80))
-        self.assertTrue(out["has_setup"])
+        out = _decide("SELL", strategy=_strong("SELL", live=80), macro=True)
+        self.assertTrue(out["has_setup"], out.get("reason"))
         # same setup, but entry-quality says severe chase -> lane off -> the learned bar vetoes again
         import ai_trade_decision as m
         orig = m.generate_trade_decision
@@ -65,7 +93,7 @@ class MomentumLaneTests(DbCase):
             return orig(*a, **k)
         m.generate_trade_decision = wrapped
         try:
-            out2 = _decide("SELL", strategy=_strong("SELL", live=80))
+            out2 = _decide("SELL", strategy=_strong("SELL", live=80), macro=True)
         finally:
             m.generate_trade_decision = orig
         self.assertFalse(out2["has_setup"])

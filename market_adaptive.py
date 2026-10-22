@@ -188,7 +188,13 @@ def gemini_scorecard(trades, shadow_by_gate=None):
             rej[gate] = e
     rn = sum(e["n"] for e in rej.values())
     rw = sum(e["wins"] for e in rej.values())
-    return {"approved_n": len(appr), "approved_wins": w, "approved_wr": (w / len(appr)) if appr else None,
+    by_model = {}
+    for t in appr:
+        m = str((t.get("gemini") or {}).get("model") or "?")
+        e = by_model.setdefault(m, {"n": 0, "wins": 0})
+        e["n"] += 1
+        e["wins"] += int(t.get("status") == "WIN")
+    return {"by_model": by_model, "approved_n": len(appr), "approved_wins": w, "approved_wr": (w / len(appr)) if appr else None,
             "rejected_n": rn, "rejected_would_win": rw, "rejected_wr": (rw / rn) if rn else None}
 
 

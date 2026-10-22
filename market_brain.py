@@ -272,6 +272,9 @@ def _draw(st, res, ns):
         if g.get("approved_n") or g.get("rejected_n"):
             st.markdown(f"**Gemini scorecard:** approve kiye hue trades me {g.get('approved_wins', 0)}/{g.get('approved_n', 0)} jeete ({_pct(g.get('approved_wr'))})"
                         + (f" | jo setups Gemini ne roke unme {g['rejected_would_win']}/{g['rejected_n']} jeet jaate ({_pct(g.get('rejected_wr'))})" if g.get("rejected_n") else ""))
+        if g.get("by_model"):
+            st.caption("Gemini approvals model-wise (jeet/total): " + ", ".join(f"{m} {v['wins']}/{v['n']}" for m, v in sorted(g["by_model"].items(), key=lambda z: -z[1]["n"]))
+                       + ". Sample chhota ho to isse natija mat nikalo.")
         if res.get("gem_text"):
             st.caption("Gemini ko review se pehle ye yaaddasht milti hai (salaah, live data ko override nahi kar sakti):")
             st.code(res["gem_text"], language=None)

@@ -1105,7 +1105,12 @@ def recent_performance(window=RECENT_WINDOW):
 # =====================================================================
 # ENTRY COOLDOWN -- stops "stopped out, re-entered the same idea 2 candles later, stopped out again"
 # =====================================================================
-def entry_cooldown(direction, now=None):
+ZONE_GUARD = True            # v49: after a stop-out, no same-side re-entry in the SAME price zone unless price has made real progress
+ZONE_GUARD_MIN = 60          # ... for this many minutes after the stop-out
+ZONE_PROGRESS_R = 0.5        # ... "real progress" = price beyond the stopped trade's entry by this many R (of that trade's risk) in our direction
+
+
+def entry_cooldown(direction, now=None, price=None):
     """(blocked, reason).  Two cheap, well-understood protections:
 
     1. After a LOSS in the SAME direction, wait COOLDOWN_AFTER_LOSS_MIN minutes.  A stop-out means
@@ -1137,6 +1142,28 @@ def entry_cooldown(direction, now=None):
             return True, (f"Cooldown: last {direction} trade was stopped out {int((now - t).total_seconds() // 60)} min ago; "
                           f"waiting ~{left} more min so the engine does not re-enter the same failed idea.")
         break
+    # 1b) v49 same-zone guard.  Two of the last five straight losses were exactly this: stopped out, then the SAME side re-entered
+    #     within a few points of the failed entry (10-21 SELL 22683.8 -> 22687.1; 10-22 SELL 22636.1 -> 22629.1) and was stopped again.
+    #     A re-entry is allowed only after price has moved clearly past the failed entry (the stop-out was then just a shake-out).
+    try:
+        if ZONE_GUARD and price is not None:
+            px = float(price)
+            for r in closed:
+                if r.get("direction") != direction:
+                    continue
+                t = _t(r)
+                if r.get("status") == "LOSS" and t is not None and timedelta(0) <= (now - t) < timedelta(minutes=ZONE_GUARD_MIN):
+                    e, sl = float(r.get("entry")), float(r.get("stop_loss"))
+                    risk = abs(e - sl)
+                    need = ZONE_PROGRESS_R * risk
+                    progress = (e - px) if direction == "SELL" else (px - e)
+                    if risk > 0 and progress < need:
+                        return True, (f"Cooldown (same-zone re-entry): the last {direction} from {e:,.0f} was stopped out "
+                                      f"{int((now - t).total_seconds() // 60)} min ago and price ({px:,.0f}) has not moved {need:.0f} pts beyond that entry "
+                                      f"in our direction yet -- waiting for a real new low/high instead of re-entering the same failed zone.")
+                break
+    except Exception:
+        logger.exception("same-zone guard failed (ignored)")
     # 2) loss streak today
     streak = 0
     last_loss_t = None

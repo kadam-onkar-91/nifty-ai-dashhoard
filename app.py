@@ -1511,6 +1511,11 @@ def _live_dashboard():
                 _eqd = (_decision.get('entry_quality') or {})
                 if _eqd.get('summary'):
                     st.caption(("⚠️ " if _eqd.get('chase_flags') else "✅ ") + "Entry quality: " + str(_eqd['summary']))
+                if (_decision.get('macro_model') or {}).get('note'):
+                    _mm = _decision['macro_model']
+                    st.caption(("✅ " if _mm.get('verdict') in ('ALIGNED', 'STRONG_ALIGNED') else "⚠️ " if 'OPPOSED' in str(_mm.get('verdict')) else "➖ ")
+                               + "Dono models: Model A (structure+strategy) trade deta hai | " + str(_mm['note'])
+                               + (" | MOMENTUM LANE (dono models agree)" if _decision.get('momentum_lane') else ""))
                 if (_decision.get('pcr_velocity') or {}).get('note'):
                     st.caption("📈 " + str(_decision['pcr_velocity']['note']))
                 if _decision.get('target_note'):
@@ -1671,7 +1676,9 @@ def _live_dashboard():
                         _who = "✅ GEMINI approval" if (_g.get('reviewer') == 'GEMINI' or _g.get('status') == 'APPROVED') else "⚠️ LOCAL FALLBACK (Gemini unavailable tha)"
                         st.markdown(f"**{_x['timestamp']} — {_x['direction']} {_x['strike']}{_x['option_type']} [{_x['status']}]** · "
                                     f"{_who} · model `{_g.get('model') or '-'}` · "
-                                    f"{'Google Search ON' if _g.get('search_used') else 'no search'} · approved at {_g.get('at')}")
+                                    f"{'Google Search ON' if _g.get('search_used') else 'no search in review'} · approved at {_g.get('at')}")
+                        if _g.get('news_brief') or _g.get('search_error'):
+                            st.caption("Google research: " + str(_g.get('news_brief') or '-') + (f" | search call failed: {_g.get('search_error')}" if _g.get('search_error') else ""))
                         st.caption(str(_g.get('reason') or ''))
                         if _g.get('gemini_error'):
                             st.caption("Gemini problem: " + str(_g.get('gemini_error')))
