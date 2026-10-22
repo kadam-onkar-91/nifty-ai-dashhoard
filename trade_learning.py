@@ -1199,3 +1199,46 @@ def signal_already_traded(direction, formed_at):
                           f"Waiting for a NEW setup instead of re-entering after the move.")
         break
     return False, ""
+
+
+# ---------------------------------------------------------------------
+# v48: full resolved-trade reader for the post-trade review (read-only, additive)
+# ---------------------------------------------------------------------
+def get_resolved_full(limit=150):
+    """Closed trades (WIN / LOSS / EXPIRED), NEWEST first, each with its parsed `factors` dict (entry flags, _features,
+    _entry_meta, _learning_meta ...).  Used only by trade_postmortem.  Never raises -> [] on any problem."""
+    cols = "timestamp,direction,underlying_entry,stop_loss,target,status,exit_price,exit_timestamp,factors_json,confidence_pct"
+    out = []
+    try:
+        rows = None
+        if _is_supabase_configured():
+            try:
+                url = (f"{_supabase_url}/rest/v1/{TABLE}?status=in.(WIN,LOSS,EXPIRED)&order=id.desc&limit={int(limit)}&select={cols}")
+                resp = requests.get(url, headers=_supabase_headers(), timeout=10)
+                resp.raise_for_status()
+                rows = resp.json()
+            except Exception:
+                logger.exception("get_resolved_full: supabase read failed, using local")
+                rows = None
+        if rows is None:
+            conn = sqlite3.connect(DB_NAME)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = [dict(r) for r in conn.execute(
+                    f"SELECT {cols} FROM ai_trade_setups "
+                    "WHERE status IN ('WIN','LOSS','EXPIRED') ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()]
+            finally:
+                conn.close()
+        for r in rows:
+            try:
+                f = json.loads(r.get("factors_json") or "{}") if isinstance(r.get("factors_json"), str) else (r.get("factors_json") or {})
+            except Exception:
+                f = {}
+            out.append({"timestamp": r.get("timestamp"), "direction": r.get("direction"), "entry": r.get("underlying_entry"),
+                        "stop_loss": r.get("stop_loss"), "target": r.get("target"), "status": r.get("status"),
+                        "exit_price": r.get("exit_price"), "exit_timestamp": r.get("exit_timestamp"),
+                        "confidence_pct": r.get("confidence_pct"), "factors": f if isinstance(f, dict) else {}})
+    except Exception:
+        logger.exception("get_resolved_full failed (ignored)")
+        return []
+    return out

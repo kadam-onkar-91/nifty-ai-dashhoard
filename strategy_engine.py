@@ -1114,6 +1114,14 @@ def analyze(df: pd.DataFrame, *, sr_context=None, level_prediction=None, order_f
         learned_strategy_stats = trade_learning.get_strategy_performance()
     except Exception:
         learned_strategy_stats = {}
+    # (trade_learning.get_strategy_performance never existed, so the hook above always fell through to {}.)  v47: the Market Brain's
+    # live strategy scorecard (shrunk toward neutral, n>=10 episodes) supplies the same shape of data.  Bounded by the +/-8 clamp below.
+    if not learned_strategy_stats:
+        try:
+            import market_adaptive
+            learned_strategy_stats = market_adaptive.strategy_stats()
+        except Exception:
+            learned_strategy_stats = {}
     for key,meta in STRATEGY_META.items():
         live_option_chain = option_chain if (key == "oi_writer_zones" and option_chain_live) else None
         sig, signal_age = _recent_strategy_signal_cached(x, key, fingerprint, option_chain=live_option_chain)

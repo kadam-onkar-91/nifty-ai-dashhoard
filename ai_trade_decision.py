@@ -432,6 +432,11 @@ def _gemini_extract_json(text):
     raise ValueError("no JSON object in Gemini reply")
 
 
+# v47: short "what this system has learned" block (set by market_adaptive.publish_gemini_text) that is added to Gemini's review prompt.
+# Advisory only -- the prompt tells Gemini it can never override the live packet.
+LEARNED_CONTEXT_TEXT = ""
+
+
 def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_direction,
                         live_price=None, strategy_formed_at=None, decision=None, use_search=True):
     """Independent Gemini second opinion, called ONLY after a live named strategy and the
@@ -474,6 +479,12 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
         news_block = (f"FRESH NEWS BRIEF (Google Search, {_nb.get('age_s')} s old):\n{_nb['text']}\n\n" if _nb.get("text") else "")
     except Exception:
         news_block = ""
+    try:
+        _lc = str(globals().get("LEARNED_CONTEXT_TEXT") or "")[:1600]
+    except Exception:
+        _lc = ""
+    _learned_block = (("LEARNED MEMORY from this system's own recorded history (advisory only: use it to avoid repeating past mistakes; "
+                       "it NEVER overrides the live packet and never creates a trade):\n" + _lc + "\n\n") if _lc else "")
     prompt = (
         "You are the FINAL independent reviewer for an intraday NIFTY trading system.\n\n"
         f"A named strategy is live and the self-learning AI engine agrees. Proposed direction: {direction}.\n"
@@ -496,6 +507,7 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
         "but price levels and indicators must come from the packet. Check the entry, SL and target levels are sensible "
         "for the live price (not already extended, SL not too tight, target realistic).\n\n"
         f"{news_block}"
+        f"{_learned_block}"
         f"LIVE RESEARCH PACKET:\n{packet}\n\n"
         "Return ONLY JSON with keys: own_direction (BUY/SELL/NO_TRADE), approved (boolean), verdict (APPROVE/REJECT), "
         "confidence (0-100), reason (short string), risk_flags (array of strings)."
@@ -1612,8 +1624,27 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     _seg_pen, _seg_note = trade_learning.segment_soft_penalty(
         {"grade": _grade_pre, "hour_bucket": f"{_now.hour:02d}h", "side": direction})
     _penalty += _seg_pen
+    # v47: earned, bounded nudge from the Market Brain (forecaster / statistically solid patterns).  Inert (0.0) until the evidence
+    # exists; capped at +/-0.15 logit.  A positive delta SUPPORTS the trade, so it lowers the penalty.
+    _brain = {"delta_logit": 0.0, "active": False, "note": ""}
+    try:
+        import market_adaptive
+        _brain = market_adaptive.engine_adjustment(direction)
+        _penalty -= float(_brain.get("delta_logit", 0.0))
+    except Exception:
+        logger.exception("market adaptive adjustment failed (ignored)")
+    # v48: earned loss filter -- trades taken while half or more of the signal groups argued against them.  Penalty only, inert until the
+    # user's own closed trades prove that such trades lose more (Wilson-tested, both buckets >= 10 trades).  Max 0.10 logit.
+    _pmw = {"penalty_logit": 0.0, "note": ""}
+    try:
+        import trade_postmortem
+        _pmw = trade_postmortem.entry_adjustment(factor_flags)
+        _penalty += float(_pmw.get("penalty_logit", 0.0))
+    except Exception:
+        logger.exception("post-mortem entry filter failed (ignored)")
     edge = trade_learning.compute_edge(factor_flags, rr, _penalty)
-    edge["learning_note"] = _adj.get("note", "")
+    edge["learning_note"] = (_adj.get("note", "") + ((" | Market Brain: " + _brain["note"]) if _brain.get("active") else "")
+                             + ((" | " + _pmw["note"]) if _pmw.get("note") else ""))
     confidence_pct = edge["confidence_pct"]
     used_learning = edge["learned_count"] > 0 or edge["calibrated_on_trades"] > 0
     learned_count = edge["learned_count"]

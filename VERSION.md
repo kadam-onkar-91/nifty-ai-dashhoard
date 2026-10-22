@@ -1,3 +1,35 @@
+# v48 -- TRADE POST-MORTEM (har trade ka "kyon" seekhna)  [purely additive; trading logic, gates, SL, target UNCHANGED]
+New: `trade_postmortem.py`, `tests_postmortem_v48.py`.  Touched (small, guarded): `trade_learning.py` (+ read-only `get_resolved_full`),
+`market_memory.py` (+ `load_pm_days`; day autopsies ignore `pm-` rows), `market_brain.py` (post-mortem panel + Gemini note).
+- Every closed trade gets a review: best/worst move in R, minutes held, SL size vs ATR, and for a LOSS what happened in the next 90 min
+  (stop-hunt then target reached / wrong direction / whipsaw / never worked / worked then failed) + a Hinglish story.
+- Factor & group scoreboard (global, news, Nifty50 fundamentals, strategy/structure, option-chain flow, entry quality): win rate when aligned
+  vs not aligned, Wilson-tested, "data kam" until >= 8 trades each side.  Pure-noise test: <= 1 false verdict / 40.
+- Gemini's review prompt gets a <= 440-char note (last losses' reasons + proven reliable / misleading groups).  Advisory only.
+- One stored row per day (`pm-YYYY-MM-DD`).  Kill switch: `trade_postmortem.ENABLED = False`.
+- It does NOT change the engine probability: the engine already learns every factor via trade_learning / learner_nn / Market Brain.
+- Tests: 166 pass across all suites (11 new).
+- v48b: (1) WARNING-COUNT LOSS FILTER: counts how many signal groups (global / news / fundamentals / strategy / flow / entry quality) argued against a
+  trade at entry.  If the user's OWN closed trades PROVE (Wilson, >= 10 trades in both buckets) that "half or more groups against" trades win less, a new
+  candidate in that state gets a PENALTY of 0.10 logit (~2.5 pct pts).  Penalty only, never a bonus, inert until proven, switches itself off if the
+  evidence disappears.  Kill switch `trade_postmortem.WARN_GATE = "off"`.  (2) MISSED-MOVE REVIEW: for every 50+ pt move the engine did not trade,
+  the gate that was answering at its start (from gate_log) + gate-wise counts.  Advisory.  Tests: 170 pass.
+
+# v47 -- WHOLE-TOOL DAILY UPGRADE LOOP  [additive; every part bounded, fail-safe, with a kill switch]
+New: `market_adaptive.py`, `tests_market_brain_v47.py`.  Touched (small, guarded): `market_memory.py` (records which named strategies are live),
+`market_brain.py` (Upgrade Report panel), `strategy_engine.py` (one fallback), `ai_trade_decision.py` (Gemini memory block + earned nudge).
+- BUG FOUND: `strategy_engine` called `trade_learning.get_strategy_performance()`, which does not exist -> strategies never learned from live
+  outcomes (the AttributeError was swallowed).  Now the Market Brain strategy scorecard feeds the same hook: per-strategy "episodes" scored
+  against a random candle, shrunk toward neutral, needs >=10 episodes, effect on a strategy score is a few points at most (engine clamp +/-8).
+- Gemini memory: its review prompt gets a <=1500-char block (its own approve/reject track record, active patterns with real stats, forecaster
+  status, weak/strong strategies, big-move catch rate).  Advisory: prompt says it never overrides the live packet.
+- Earned engine nudge (`market_adaptive.ENGINE_ADJUST = "auto"`, set "off" to disable): +/-0.15 logit max (~3.5 pct pts).  Forecaster part
+  needs a TRUSTED model AND >=30 live validated forecasts with >=55% right; pattern part needs ~100 candles and a 99% edge after deflating for
+  overlapping candles.  Pure-noise test: 0 false nudges / 24.  Inert until then; switches itself off if evidence disappears.
+- Daily upgrade log: one `stats-YYYY-MM-DD` row per day (stored in `market_autopsy`) -> trend table in "Roz ka Upgrade Report", plus plain-language
+  suggestions (never auto-applied).  Hard gates, SL/target rules, cooldown, trade tables: UNCHANGED.
+- Tests: 12 new, all pass.  The 7 failures in `tests_level_verdict` already existed before v46/v47 (identical on the original zip).
+
 # v46 -- MARKET BRAIN (roz seekhne wala dimaag)  [purely additive; no trade logic changed]
 New files: `market_memory.py` (recorder), `market_learner.py` (patterns + forecaster), `market_autopsy.py`, `market_brain.py` (panel),
 `SUPABASE_MARKET_BRAIN_MIGRATION.sql` (run once).  `app.py`: one import + one guarded call above the Shadow-trades expander.

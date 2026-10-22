@@ -53,7 +53,7 @@ BASE_FEATS = [
 # live-only extras (None for back-filled rows)
 EXT_FEATS = ["pcr", "vix", "breadth_net", "global_avg", "call_wall_dist", "put_wall_dist",
              "call_wall_share", "put_wall_share", "strat_dir", "strat_score"]
-EXTRA_KEYS = EXT_FEATS + ["call_wall", "put_wall", "news_sent", "sr_loc"]
+EXTRA_KEYS = EXT_FEATS + ["call_wall", "put_wall", "news_sent", "sr_loc", "strats"]
 
 _SB_RETRY_S = 600
 _sb_state: dict = {}
@@ -294,6 +294,10 @@ def build_extras(ns: dict) -> dict:
         if isinstance(sr, dict):
             ex["strat_dir"] = 1.0 if sr.get("direction") == "BUY" else -1.0 if sr.get("direction") == "SELL" else 0.0
             ex["strat_score"] = _f(sr.get("score"))
+        ra = sr.get("ranked_active") if isinstance(sr, dict) else None
+        if isinstance(ra, list):             # which named strategies are live (and valid) right now -> strategy scorecard
+            ex["strats"] = [f"{r.get('key')}:{r.get('direction')}" for r in ra
+                            if isinstance(r, dict) and r.get("live_valid") and r.get("key") and r.get("direction")][:12]
         src = ns.get("sr_context")
         if isinstance(src, dict):
             ex["sr_loc"] = str(src.get("location", ""))[:20]
@@ -418,15 +422,15 @@ def save_forecast(ts, forecast: dict):
         logger.exception("save_forecast failed (ignored)")
 
 
-def load_days():
-    """Stored daily autopsies: {day: summary_dict}."""
+def _load_day_rows():
+    """Every row of the autopsy table: {key: dict}.  Keys 'YYYY-MM-DD' = day autopsies, 'stats-YYYY-MM-DD' = daily upgrade metrics."""
     hit = _cache.get("days")
     if hit and time.time() - hit[0] < 60:
         return hit[1]
     raw = None
     if _sb_ok(DAY_TABLE):
         try:
-            r = requests.get(f"{tl._supabase_url}/rest/v1/{DAY_TABLE}?select=day,summary&order=day.desc&limit=120", headers=tl._supabase_headers(), timeout=10)
+            r = requests.get(f"{tl._supabase_url}/rest/v1/{DAY_TABLE}?select=day,summary&order=day.desc&limit=400", headers=tl._supabase_headers(), timeout=10)
             r.raise_for_status()
             raw = r.json()
         except Exception:
@@ -435,7 +439,7 @@ def load_days():
     if raw is None:
         conn = _local()
         conn.row_factory = sqlite3.Row
-        raw = [dict(x) for x in conn.execute("SELECT day,summary FROM market_autopsy ORDER BY day DESC LIMIT 120").fetchall()]
+        raw = [dict(x) for x in conn.execute("SELECT day,summary FROM market_autopsy ORDER BY day DESC LIMIT 400").fetchall()]
         conn.close()
     out = {}
     for r in raw:
@@ -444,6 +448,23 @@ def load_days():
             out[r["day"]] = s
     _cache["days"] = (time.time(), out)
     return out
+
+
+def load_days():
+    """Stored daily autopsies: {day: summary_dict}."""
+    return {k: v for k, v in _load_day_rows().items() if not str(k).startswith(("stats-", "pm-"))}
+
+
+def load_pm_days():
+    """v48: stored daily post-trade reviews {day: summary_dict}, oldest first (rows keyed 'pm-YYYY-MM-DD')."""
+    rows = {k[3:]: v for k, v in _load_day_rows().items() if str(k).startswith("pm-")}
+    return dict(sorted(rows.items()))
+
+
+def load_stats():
+    """Stored daily upgrade metrics: {day: metrics_dict}, oldest first."""
+    rows = {k[6:]: v for k, v in _load_day_rows().items() if str(k).startswith("stats-")}
+    return dict(sorted(rows.items()))
 
 
 def save_day(day, summary: dict):
