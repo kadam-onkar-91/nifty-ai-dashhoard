@@ -36,6 +36,7 @@ MEM_MIN_ROWS = 8
 MEM_REF_PRIOR_N = 12.0
 MEM_MAX_PENALTY = 0.35
 MEM_MAX_BONUS = 0.15
+SIDE_AWARE_MEMORY = True      # v51 kill switch
 _CACHE = {"key": None, "ts": 0.0, "bundle": None}
 CACHE_TTL_S = 240
 
@@ -170,6 +171,19 @@ def mistake_memory(x, bundle):
             out["note"] = f"mistake memory: needs {MEM_MIN_ROWS} labelled setups"
             return out
         n_flag = len(bundle["keys"])
+        # v51: compare a BUY only with past BUYs and a SELL only with past SELLs.  The history is mostly losing SELLs; "your nearest
+        # neighbours lost" was being said about every BUY purely because the neighbours were SELLs.  Too few same-side rows -> no verdict.
+        try:
+            j = n_flag + len(NUM_KEYS)
+            sv = float(x[j])
+            if SIDE_AWARE_MEMORY and sv in (0.0, 1.0):
+                m = (X[:, j] == sv) | (X[:, j] == 0.5)      # rows with unknown side (very old trades) count for both sides
+                if int(m.sum()) < MEM_MIN_ROWS:
+                    out["note"] = f"mistake memory: only {int(m.sum())} past {'BUY' if sv == 1.0 else 'SELL'} setups (needs {MEM_MIN_ROWS}) - no verdict yet"
+                    return out
+                X, y, w = X[m], y[m], w[m]
+        except Exception:
+            pass
         mu, sd = _standardizer(X, n_flag)
         Z = _apply(X, mu, sd); z = _apply(x.reshape(1, -1), mu, sd)[0]
         d = np.sqrt(((Z - z) ** 2).sum(axis=1) / Z.shape[1])

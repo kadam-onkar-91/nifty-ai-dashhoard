@@ -78,6 +78,18 @@ CAPS_NEED_MACRO = True          # v50: the v42 caps on the learned penalties onl
 OPENING_NO_TRADE_UNTIL = dtime(9, 45)   # v50: opening range still forming.  Entries before this need Model B STRONG_ALIGNED (global research strong with us)
 OPENING_CAUTION_UNTIL = dtime(10, 0)    # v50: until here the EV bar is a little higher unless Model B agrees
 OPENING_EV_EXTRA = 0.05
+# ---- v51: live market is allowed to outvote STALE global data (26-Oct: 5 strategies BUY 100% consensus, price +165 pts off the low, engine still said
+#      "no positive edge 26.9 %").  Every switch below can be set to False to get the exact v50 behaviour back. ----
+LIVE_DOMINANCE_RELIEF = True    # momentum lane / learned-penalty caps no longer need Model B to AGREE -- only to not be STRONGLY opposed,
+                                # provided live price action + >= 3 live strategies + consensus >= 80 % already push the same way (_momentum_lane_ok)
+OPENING_LIVE_EXCEPTION = True   # 09:25-09:45: a trade is allowed (without Model B STRONG_ALIGNED) when the 5-min structure has ALREADY turned in the trade
+                                # direction (trend-transition confirmed) AND live dominance holds AND Model B is not opposed -> catches the opening V-reversal
+OPENING_EXC_MIN_WIN_PROB = 0.38 # ... and the engine's own win chance must be at least this
+GLOBAL_VETO_EARLY_RELIEF = True # v51b: the global veto (global data = yesterday's close) fires exactly when a big move STARTS, because the 45-score / 80%-consensus lane
+                                # is not built yet.  A smaller live confirmation is now enough to turn the veto into a penalty (the edge bar + Gemini still decide).
+EARLY_LIVE_MIN = 25.0           # |live price-action score| in the trade direction
+EARLY_MIN_LIVE_STRATEGIES = 2   # live strategies agreeing
+EARLY_MAX_OPPOSITE_CONSENSUS = 30.0
 ENFORCE_SESSION_WINDOW = True
 NO_ENTRY_BEFORE = dtime(9, 25)  # first 10 min: opening auction noise / wide spreads
 NO_ENTRY_AFTER = dtime(15, 10)  # entries allowed until the market's last minutes; the tool auto-closes open trades at 15:20
@@ -294,6 +306,22 @@ def _momentum_lane_ok(strategy_result, direction, entry_quality):
         severe = bool(eq.get("severe")) or len(eq.get("chase_flags") or []) >= 3
         return (score >= LANE_MIN_LIVE and cons >= LANE_MIN_CONSENSUS and cnt >= LANE_MIN_LIVE_STRATEGIES
                 and opp <= LANE_MAX_OPPOSITE_CONSENSUS and not severe)
+    except Exception:
+        return False
+
+
+def _early_live_ok(strategy_result, direction, entry_quality):
+    """v51b: a LIGHTER version of _momentum_lane_ok -- the live tape has started to move in `direction` (score >= 25, 2+ live strategies, little opposition,
+    no severe chase).  Used only to let the global veto step aside; it never opens the momentum lane and never waives the edge bar."""
+    try:
+        sr = strategy_result or {}
+        buy = direction == "BUY"
+        score = float((sr.get("live_state") or {}).get("score", 0) or 0) * (1.0 if buy else -1.0)
+        opp = float(sr.get("sell_consensus" if buy else "buy_consensus", 0) or 0)
+        cnt = int(sr.get("buy_live_count" if buy else "sell_live_count", 0) or 0)
+        eq = entry_quality if isinstance(entry_quality, dict) else {}
+        severe = bool(eq.get("severe")) or len(eq.get("chase_flags") or []) >= 3
+        return (score >= EARLY_LIVE_MIN and cnt >= EARLY_MIN_LIVE_STRATEGIES and opp <= EARLY_MAX_OPPOSITE_CONSENSUS and not severe)
     except Exception:
         return False
 
@@ -1101,6 +1129,8 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
             # and no severe chase) the global read becomes a penalty and Gemini + the edge bar decide -- the trade is no longer frozen all day.
             _eq_pre = (entry_quality or {}).get(direction) if isinstance(entry_quality, dict) and direction in entry_quality else entry_quality
             _live_confirms = bool(strategy_path) and _momentum_lane_ok(strategy_result, direction, _eq_pre)
+            if GLOBAL_VETO_EARLY_RELIEF and strategy_path and not _live_confirms:
+                _live_confirms = _early_live_ok(strategy_result, direction, _eq_pre)
             if GLOBAL_VETO and not (GLOBAL_VETO_RELIEF and _live_confirms):
                 return {"has_setup": False,
                         "reason": f"Global research is STRONGLY {_gb} against this {direction}; domestic setup alone is not enough.",
@@ -1116,9 +1146,18 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         pcr_bias=(pcr_velocity or {}).get("bias", "NEUTRAL") if isinstance(pcr_velocity, dict) else "NEUTRAL", vix=live_vix)
     _macro_verdict = _macro.get("verdict", "NEUTRAL")
     _macro_agrees = _macro_verdict in ("ALIGNED", "STRONG_ALIGNED")
+    _macro_strong_opposed = _macro_verdict == "STRONG_OPPOSED"
+    _macro_opposed = _macro_verdict in ("OPPOSED", "STRONG_OPPOSED")
+    # v51 LIVE DOMINANCE: the live tape (EMA/VWAP/momentum/supertrend) + broad strategy agreement outranks yesterday's global close.
+    _eq_early = (entry_quality or {}).get(direction) if isinstance(entry_quality, dict) and direction in entry_quality else entry_quality
+    _live_dom = bool(LIVE_DOMINANCE_RELIEF and strategy_path
+                     and _momentum_lane_ok(strategy_result, direction, _eq_early if isinstance(_eq_early, dict) else None))
+    _trend_turned = bool((direction == "BUY" and _bullish_transition) or (direction == "SELL" and _bearish_transition))
+    _live_relief = bool(_live_dom and not _macro_strong_opposed)     # may stand in for "Model B agrees" in the lane + caps
     # OPENING RANGE: the market autopsy names "opening volatility" as the #1 reason for turns (11 of 31 big moves) and two of the five straight
     # losses were opening SELLs into a V-reversal.  Before 09:45 only a trade with Model B STRONG_ALIGNED (global research strong with it) is allowed.
-    if _now.time() < OPENING_NO_TRADE_UNTIL and _macro_verdict != "STRONG_ALIGNED":
+    _opening_exception = bool(OPENING_LIVE_EXCEPTION and _live_relief and _trend_turned and not _macro_opposed)
+    if _now.time() < OPENING_NO_TRADE_UNTIL and _macro_verdict != "STRONG_ALIGNED" and not _opening_exception:
         return {"has_setup": False,
                 "reason": (f"Opening range forming (until {OPENING_NO_TRADE_UNTIL.strftime('%H:%M')}): the first 30 minutes reverse both ways, so only a setup that "
                            f"global/macro research strongly supports is taken. Model B now: {_macro.get('note')}"),
@@ -1681,7 +1720,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     _delta = float(_adj.get("delta_logit", 0.0))
     # v50: the v42 cap on the learned drag only protects setups that Model B also supports.  Without macro support the learned penalty is applied in full
     # (the older engine's behaviour): the engine's own record says "this looks like setups that lost" and nothing outside price action disagrees.
-    _caps_on = _macro_agrees or not CAPS_NEED_MACRO
+    _caps_on = _macro_agrees or _live_relief or not CAPS_NEED_MACRO
     _penalty -= max(_delta, -LEARNED_DRAG_CAP) if _caps_on else _delta
     # REPEAT-MISTAKE CHECK: tags (extended entry, late session, huge day move ...) that have already lost often -> small penalty
     _tags = trade_diagnostics.risk_tags(factor_flags, _feats, hour=_now.hour + _now.minute / 60.0)
@@ -1715,7 +1754,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         _penalty += float(_pmw.get("penalty_logit", 0.0))
     except Exception:
         logger.exception("post-mortem entry filter failed (ignored)")
-    edge = trade_learning.compute_edge(factor_flags, rr, _penalty)
+    edge = trade_learning.compute_edge(factor_flags, rr, _penalty, side=direction)
     edge["learning_note"] = (_adj.get("note", "") + ((" | Market Brain: " + _brain["note"]) if _brain.get("active") else "")
                              + ((" | " + _pmw["note"]) if _pmw.get("note") else ""))
     confidence_pct = edge["confidence_pct"]
@@ -1738,7 +1777,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         _bar_notes.append(f"trading costs ~{ROUND_TRIP_COST_PTS:.0f} pts -> bar +{_cost_r:.2f}R")
     except Exception:
         pass
-    if _now.time() < OPENING_CAUTION_UNTIL and not _macro_agrees:
+    if _now.time() < OPENING_CAUTION_UNTIL and not (_macro_agrees or _live_relief):
         _min_ev += OPENING_EV_EXTRA
         _bar_notes.append(f"opening hour, Model B not agreeing -> bar +{OPENING_EV_EXTRA:.2f}R")
     edge["required_ev_r"] = round(_min_ev, 3)
@@ -1747,7 +1786,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
 
     # v42 momentum-capture lane (see constants).  It only waives the LEARNED edge/win-chance bar; it needs strong live evidence.
     # v50: the lane now needs BOTH models (Model B agrees), a minimum win chance, and can waive only a SMALL EV shortfall.
-    _lane_ok = bool(strategy_path) and _momentum_lane_ok(strategy_result, direction, _eq) and (_macro_agrees or not LANE_NEEDS_MACRO)
+    _lane_ok = bool(strategy_path) and _momentum_lane_ok(strategy_result, direction, _eq) and (_macro_agrees or _live_relief or not LANE_NEEDS_MACRO)
     _lane_ok = _lane_ok and float(edge.get("win_probability") or 0.0) >= LANE_MIN_WIN_PROB \
         and edge["expectancy_r"] >= _min_ev - LANE_MAX_EV_SHORTFALL
     _momentum_lane = False
@@ -1756,6 +1795,12 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         _bar_notes.append("momentum-capture lane: live price action + strategies + macro model all agree -> small shortfall of the learned bar waived")
         edge["required_ev_r"] = round(_min_ev, 3)
 
+    if _now.time() < OPENING_NO_TRADE_UNTIL and _macro_verdict != "STRONG_ALIGNED" and _opening_exception \
+            and float(edge.get("win_probability") or 0.0) < OPENING_EXC_MIN_WIN_PROB:
+        return {"has_setup": False,
+                "reason": (f"Opening range forming (until {OPENING_NO_TRADE_UNTIL.strftime('%H:%M')}): the structure has turned but the engine's own win chance "
+                           f"{100 * float(edge.get('win_probability') or 0.0):.0f}% is below the {100 * OPENING_EXC_MIN_WIN_PROB:.0f}% needed this early."),
+                "context_audit": context_audit, "macro_model": _macro}
     if edge["expectancy_r"] < _min_ev and not _momentum_lane:
         return {"has_setup": False,
                 "reason": (f"No positive edge: estimated win chance {confidence_pct:.1f}% at R:R {rr:.2f} gives expectancy "
@@ -1816,6 +1861,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     factor_flags["_playbook_label"] = str(_playbook)
     factor_flags["_setup_score"] = round(_sscore, 1)
     factor_flags["_macro"] = {"verdict": _macro_verdict, "score": _macro.get("score")}
+    factor_flags["_live_dominance"] = {"live_dom": bool(_live_dom), "relief_used": bool(_live_relief and not _macro_agrees), "opening_exception": bool(_opening_exception)}
     factor_flags["_reasons"] = list(lp.get("factors", []))[:3]
     factor_flags["_edge"] = {"p": edge["win_probability"], "ev_r": edge["expectancy_r"], "rr": round(rr, 2)}
     _feats["win_prob"] = round(_wp, 3)

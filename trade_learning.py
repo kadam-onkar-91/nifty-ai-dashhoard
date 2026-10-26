@@ -914,13 +914,40 @@ def _labelled_rows_full(include_shadow=True):
     return out + real[-LEARNING_WINDOW:]
 
 
-def compute_edge(factor_flags: dict, rr: float, extra_penalty_logit: float = 0.0):
+SIDE_AWARE_CALIBRATION = True    # v51 kill switch.  False = the v36..v50 behaviour (one win rate for BUY and SELL together)
+SIDE_ROW_MIN = 4                 # fewer same-side rows than this -> the side has no record of its own yet (neutral prior, no drag)
+
+
+def _row_side(r):
+    """'BUY' / 'SELL' / None for one labelled row (from the stored _features.is_buy).  Old rows without features -> None."""
+    try:
+        f = r.get("feats") or {}
+        v = f.get("is_buy")
+        if v is None:
+            return None
+        return "BUY" if float(v) >= 0.5 else "SELL"
+    except Exception:
+        return None
+
+
+def compute_edge(factor_flags: dict, rr: float, extra_penalty_logit: float = 0.0, side=None):
     """Calibrated win probability + expectancy (in R) for one candidate -- see edge_model.py.
     Factor lifts learn from all recent history (real + shadow); the win-rate calibration uses ONLY trades made by the CURRENT
-    decision logic (LOGIC_VERSION) plus shadow trades, so an older logic's losing record can not freeze the new one."""
+    decision logic (LOGIC_VERSION) plus shadow trades, so an older logic's losing record can not freeze the new one.
+
+    v51: the reliability correction ("how often does THIS engine really win") is now SIDE-AWARE.  Until v50 one overall win rate
+    (mostly 25-30 % from SELL trades taken into opening reversals) was subtracted from EVERY candidate, so a fully aligned BUY
+    was rated ~27 % and could never pass -- the engine then had no new BUY data and the drag never went away.  A BUY is now judged
+    by the BUY record, a SELL by the SELL record; a side with almost no trades of its own is not punished for the other side's losses."""
     full = _labelled_rows_full()
     rows = [(r["flags"], r["label"], r["weight"]) for r in full]
-    calib = [(r["flags"], r["label"], r["weight"]) for r in full if r["version"] == LOGIC_VERSION or r["source"] == "shadow"]
+    cur = [r for r in full if r["version"] == LOGIC_VERSION or r["source"] == "shadow"]
+    if SIDE_AWARE_CALIBRATION and side in ("BUY", "SELL"):
+        # rows whose side is unknown (very old trades stored without features) still count for both sides -- only rows KNOWN to be the
+        # other side are left out.  A side with fewer than SIDE_ROW_MIN usable rows has no record of its own yet.
+        same = [r for r in cur if _row_side(r) in (side, None)]
+        cur = same if len(same) >= SIDE_ROW_MIN else []
+    calib = [(r["flags"], r["label"], r["weight"]) for r in cur]
     return edge_model.estimate_edge(factor_flags, rows, ALL_FACTOR_KEYS, rr=rr,
                                     extra_penalty_logit=extra_penalty_logit, calib_rows=calib)
 

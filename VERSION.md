@@ -1,3 +1,34 @@
+# v51b -- GLOBAL VETO no longer freezes the START of a big move  [from the 21-Oct screenshots: "Global research is STRONGLY BUY against this SELL"]
+Global research reads yesterday's close, so the veto fires most exactly when a new move begins (the live lane needs score >= 45 + 80 % consensus, which only exists
+LATER in the move).  The engine's own post-mortem also shows global alignment does not predict wins (aligned 28 % vs not aligned 30 %, "farq saabit nahi").
+- `GLOBAL_VETO_EARLY_RELIEF`: the veto becomes a 0.20 penalty as soon as live price action >= 25 in the trade direction + >= 2 live strategies agree + opposite consensus <= 30 %
+  + no severe chase.  The edge bar, win-chance floor, cooldowns and Gemini still decide.  Flat tape (< 25) = veto still blocks.  Tests: 3 new (16 in tests_v51).
+
+# v51 -- BIG MOVES NO LONGER MISSED: side-aware win-rate, live tape outvotes stale global data, opening V-reversal, Upstox analytics token  [from the 26-Oct review]
+What the 26-Oct screenshots + the code showed (the engine took ZERO trades while Nifty went 22,433 -> 22,631+):
+- 09:31 the feed was `YAHOO_FALLBACK_NON_TRADABLE` (nobody had logged in to Upstox after the 03:30 token expiry) -> "no named strategy" -> no trade possible.
+- 09:35-09:45 "Opening range forming": v50 allows an entry before 09:45 only when Model B is STRONG_ALIGNED.  Global data was bearish at the open, so the
+  V-reversal BUY was impossible by rule.
+- 10:04 five BUY strategies live, consensus BUY 100 vs SELL 0, live price action +90 -- and still "No positive edge: win chance 26.9 %".  Root cause in
+  `edge_model.estimate_edge`: the RELIABILITY CORRECTION subtracts (model's average prediction - the engine's real win rate) from EVERY candidate.  The real record
+  (67 trades, ~25 % wins, almost all SELLs taken into opening whipsaws) was therefore charged to a BUY that had nothing to do with it.  A fully aligned BUY was rated 34 %.
+  Fewer trades -> no new BUY data -> the drag never healed.  Same side-blindness in the mistake-memory ("your nearest neighbours lost" -- the neighbours were SELLs).
+- Evidence the filters are not discriminating: blocked ("shadow") setups won 42-48 % vs 25 % for the real trades; Gemini-approved trades won 37 % vs 42 % for the ones it rejected.
+Changes (every one has a kill switch; SL / target / cooldown / same-zone guard / Gemini review / post-mortem UNCHANGED):
+1. SIDE-AWARE CALIBRATION (`trade_learning.SIDE_AWARE_CALIBRATION`): a BUY is calibrated on the BUY record, a SELL on the SELL record.  A side with < 4 trades of its own is not
+   punished for the other side.  Rows stored without features (very old) count for both sides.  A side whose OWN record is bad is still stopped (tests).
+2. SIDE-AWARE MISTAKE MEMORY (`learner_nn.SIDE_AWARE_MEMORY`): BUY compared with past BUYs, SELL with past SELLs (needs 8 same-side rows, else no verdict).
+3. LIVE DOMINANCE (`ai_trade_decision.LIVE_DOMINANCE_RELIEF`): when live price action >= 45, >= 3 live strategies, consensus >= 80 % (the old `_momentum_lane_ok`) all point the
+   same way, Model B only has to be "not STRONGLY opposed" (before: had to AGREE) for the momentum lane, the learned-penalty caps and the opening-hour EV bar.  The lane still
+   needs win chance >= 36 % and can waive at most 0.10 R, so a real losing record is NOT bypassed.  STRONG_OPPOSED gets no relief.
+4. OPENING V-REVERSAL (`ai_trade_decision.OPENING_LIVE_EXCEPTION`): 09:25-09:45 an entry is allowed without Model B STRONG_ALIGNED when the 5-min structure has ALREADY turned in the
+   trade direction (trend-transition confirmed) + live dominance + Model B not opposed + engine win chance >= 38 %.
+5. UPSTOX ANALYTICS TOKEN (`upstox_auth._analytics_token`): free, read-only, valid 1 YEAR -- add `UPSTOX_ANALYTICS_TOKEN = "..."` to Streamlit secrets and the live feed is on all day
+   without the daily login (normal login still works and is preferred when present).  A 401 from the LTP call now clears a dead token immediately.
+- Each new trade stores `_live_dominance` {live_dom, relief_used, opening_exception} so the effect can be audited afterwards.
+- Tests: tests_v51_live_dominance (13 new) + all earlier suites pass.  (tests_level_verdict was already failing before v51 -- untouched.)
+- NOT verified: no live/backtest market data was available here, so the effect on win rate is NOT measured.  Watch the first days in the Trade Post-Mortem / Shadow panels.
+
 # v50b -- global veto no longer fires on every refresh: it steps aside (becomes a 0.20 penalty) while live price action + strategies strongly confirm the trade (`GLOBAL_VETO_RELIEF`). It still blocks when the live market does NOT confirm.
 
 # v50 -- TWO MODELS TOGETHER: Model A (structure + strategies) + Model B (macro / global-led, the old v41 idea)  [from the 22-Oct 5-straight-loss review]
