@@ -1519,7 +1519,8 @@ def _live_dashboard():
                     _mm = _decision['macro_model']
                     st.caption(("✅ " if _mm.get('verdict') in ('ALIGNED', 'STRONG_ALIGNED') else "⚠️ " if 'OPPOSED' in str(_mm.get('verdict')) else "➖ ")
                                + "Dono models: Model A (structure+strategy) trade deta hai | " + str(_mm['note'])
-                               + (" | MOMENTUM LANE (dono models agree)" if _decision.get('momentum_lane') else ""))
+                               + (" | MOMENTUM LANE (dono models agree)" if _decision.get('momentum_lane') else "")
+                               + (" | TURNING-POINT REACTION (rejection at S/R)" if _decision.get('reaction_entry') else ""))
                 if (_decision.get('pcr_velocity') or {}).get('note'):
                     st.caption("📈 " + str(_decision['pcr_velocity']['note']))
                 if _decision.get('target_note'):

@@ -930,7 +930,27 @@ def _row_side(r):
         return None
 
 
-def compute_edge(factor_flags: dict, rr: float, extra_penalty_logit: float = 0.0, side=None):
+ENTRY_TYPE_AWARE = True          # v54 kill switch.  False = side-only calibration (v51..v53).  Only turning-point REACTION entries are judged separately;
+                                 # clean / chasing entries keep the full side record (a chase must never get easier than before)
+ENTRY_TYPE_MIN_ROWS = 6          # fewer comparable rows than this -> this kind of entry has no record of its own yet (neutral prior, no drag)
+
+
+def entry_type_of(flags):
+    """'reaction' (turning-point rejection at a validated level) / 'clean' (entry not extended) / 'extended' (chasing an already-run move) /
+    None when the stored flags can not tell (very old rows) -- unknown rows count for every type, exactly like unknown-side rows."""
+    try:
+        if not isinstance(flags, dict):
+            return None
+        if flags.get("reaction_entry"):
+            return "reaction"
+        if "entry_not_extended" not in flags:
+            return None
+        return "clean" if flags.get("entry_not_extended") else "extended"
+    except Exception:
+        return None
+
+
+def compute_edge(factor_flags: dict, rr: float, extra_penalty_logit: float = 0.0, side=None, entry_type=None):
     """Calibrated win probability + expectancy (in R) for one candidate -- see edge_model.py.
     Factor lifts learn from all recent history (real + shadow); the win-rate calibration uses ONLY trades made by the CURRENT
     decision logic (LOGIC_VERSION) plus shadow trades, so an older logic's losing record can not freeze the new one.
@@ -947,6 +967,11 @@ def compute_edge(factor_flags: dict, rr: float, extra_penalty_logit: float = 0.0
         # other side are left out.  A side with fewer than SIDE_ROW_MIN usable rows has no record of its own yet.
         same = [r for r in cur if _row_side(r) in (side, None)]
         cur = same if len(same) >= SIDE_ROW_MIN else []
+    if ENTRY_TYPE_AWARE and entry_type == "reaction":
+        # v54: a turning-point reaction is judged by REACTION trades only (no record yet -> neutral prior, still capped at 50 % and still
+        # needing the EV bar); the late-chase losses of the past say nothing about a rejection at a validated level.
+        same_t = [r for r in cur if entry_type_of(r["flags"]) in ("reaction", None)]
+        cur = same_t if len(same_t) >= ENTRY_TYPE_MIN_ROWS else []
     calib = [(r["flags"], r["label"], r["weight"]) for r in cur]
     return edge_model.estimate_edge(factor_flags, rows, ALL_FACTOR_KEYS, rr=rr,
                                     extra_penalty_logit=extra_penalty_logit, calib_rows=calib)

@@ -405,6 +405,8 @@ def _triangle_shape(x: pd.DataFrame, direction: str, look: int = 24):
 EXHAUSTION_REVERSAL = True
 EXH_MIN_MOVE_ATR = 2.0
 EXH_LOOKBACK = 24
+EXH_BLOWOFF = True             # v54: outsized-move rejection (spike top / capitulation low) without needing a prior swing to sweep
+EXH_BLOWOFF_MOVE_ATR = 3.0
 EXH_SWING_BARS = (3, 21)       # swing level = extreme of bars [-21:-3] (excludes the 2 newest bars that do the sweep/reaction)
 
 
@@ -434,6 +436,11 @@ def _exhaustion_reversal(x: pd.DataFrame) -> int:
         reclaimed = c > min(sw_lo + 0.05 * a, h) and c > l + 0.55 * rng and (not math.isfinite(ema9) or c > ema9 - 0.35 * a)
         if fell and touched and at_floor and reject and reclaimed and body >= 0.15 * a:
             return 1
+        # v54 BLOW-OFF / CAPITULATION: after a VERY large move the sweep of an old swing is not needed -- a vertical spike has no prior swing to
+        # sweep.  An outsized move + this bar is the extreme + rejection + close back through the middle of the previous (spike) candle is enough.
+        _mid_prev = (ph + pl) / 2.0
+        if EXH_BLOWOFF and (hi24 - two_lo) / a >= EXH_BLOWOFF_MOVE_ATR and at_floor and reject and c > _mid_prev and c > o and body >= 0.15 * a:
+            return 1
         # ---- SELL: upthrust at the high of a real rally
         rose = (two_hi - lo24) / a >= EXH_MIN_MOVE_ATR
         touched_h = two_hi >= sw_hi - 0.25 * a
@@ -441,6 +448,8 @@ def _exhaustion_reversal(x: pd.DataFrame) -> int:
         reject_h = (upper >= max(0.40 * rng, 0.6 * body) and c < o) or (pc > po and c < o and c <= po and o >= pc)
         lost = c < max(sw_hi - 0.05 * a, l) and c < h - 0.55 * rng and (not math.isfinite(ema9) or c < ema9 + 0.35 * a)
         if rose and touched_h and at_roof and reject_h and lost and body >= 0.15 * a:
+            return -1
+        if EXH_BLOWOFF and (two_hi - lo24) / a >= EXH_BLOWOFF_MOVE_ATR and at_roof and reject_h and c < _mid_prev and c < o and body >= 0.15 * a:
             return -1
         return 0
     except Exception:
@@ -1043,6 +1052,8 @@ RECLAIM_EXCEPTION = True
 EXHAUSTION_GUARD = True
 EXH_GUARD_MIN_MOVE_ATR = 2.5
 EXH_GUARD_NEAR_EXTREME_ATR = 0.7
+EXH_GUARD_BIG_MOVE_ATR = 3.5
+EXH_GUARD_NEAR_EXTREME_BIG_ATR = 1.6
 RECLAIM_MIN_ALIGN = 15.0
 RECLAIM_MIN_BOUNCE_ATR = 0.7
 CHASE_ATR = 3.0              # moved >= this many ATR in signal direction in 12 bars and sits at the extreme
@@ -1100,21 +1111,59 @@ def _live_state(x: pd.DataFrame) -> Dict[str, Any]:
         return {"ok": False, "score": 0.0}
 
 
-def _signal_validity(sig: int, live: Dict[str, Any], age: int, score: float):
+# v54: REACTION (TURNING-POINT) ENTRIES.  A resistance-rejection SELL / support-bounce BUY fires exactly when the live tape (EMA / VWAP /
+# momentum) is STILL with the old move, so the "live price action is against the signal -> stale" block below killed every reversal signal the
+# moment it formed; the engine could only enter AFTER the new move was established (late, extended, then stopped out).  A reversal-type strategy
+# now passes that block when the turn itself is CONFIRMED: price is at the extreme of a real move (>= REACTION_MIN_MOVE_ATR off the 24-bar
+# opposite extreme, within REACTION_NEAR_EXTREME_ATR of the 24-bar high/low) AND the last two candles show a rejection wick with the turn
+# (colour flipped or 3-bar momentum turned).  Everything downstream (AI vote / S-R location / edge bar / Gemini / SL / target) still applies.
+# Kill switch: REACTION_ENTRIES = False -> exactly the v53 behaviour.
+REACTION_ENTRIES = True
+REACTION_MIN_MOVE_ATR = 1.5
+REACTION_NEAR_EXTREME_ATR = 1.6
+REVERSAL_STRATEGIES = frozenset({
+    "spring_reclaim_reversal", "vwap_sr_rejection", "pivot_reversal", "rsi_divergence_reversal", "liquidity_sweep_fvg",
+    "previous_day_liquidity_sweep", "ema_trap_fakeout", "double_bottom", "inverse_head_shoulders", "head_shoulders",
+})
+
+
+def reaction_confirmed(sig: int, live: Dict[str, Any]) -> bool:
+    """True when a SELL (sig<0) / BUY (sig>0) is a confirmed rejection at the extreme of a real move.  Pure; never raises."""
+    try:
+        if not REACTION_ENTRIES or not live or not live.get("ok") or sig == 0:
+            return False
+        if sig < 0:
+            return bool(live.get("top_reject") and live.get("rise24_atr", 0.0) >= REACTION_MIN_MOVE_ATR
+                        and live.get("fall24_atr", 99.0) <= REACTION_NEAR_EXTREME_ATR)
+        return bool(live.get("bottom_reject") and live.get("fall24_atr", 0.0) >= REACTION_MIN_MOVE_ATR
+                    and live.get("rise24_atr", 99.0) <= REACTION_NEAR_EXTREME_ATR)
+    except Exception:
+        return False
+
+
+def _signal_validity(sig: int, live: Dict[str, Any], age: int, score: float, name=None):
     """Returns (valid, adjusted_score, note) for one live strategy signal."""
     if not live.get("ok"):
         return True, score, ""
     ls = float(live.get("score", 0.0)); align = sig * ls
     notes = []
+    if name in REVERSAL_STRATEGIES and reaction_confirmed(sig, live):
+        # turning point: the live tape is still with the old move BY DEFINITION -- do not call the signal stale / bounced / dropped
+        return True, min(100.0, max(0.0, score - AGE_PENALTY * age)), \
+            "v54 reaction: rejection confirmed at the extreme of the move - turning-point entry allowed (live tape has not turned yet)"
     if align <= LIVE_COUNTER_BLOCK:
         side = "SELL" if sig < 0 else "BUY"
         return False, max(0.0, score + LIVE_ALIGN_WEIGHT * max(-100.0, align) - AGE_PENALTY * age), \
             f"{side} blocked: live price action is {'UP' if ls > 0 else 'DOWN'} ({ls:+.0f}) - signal is stale/against the move"
     if EXHAUSTION_GUARD:
-        if sig < 0 and live.get("rise24_atr", 9) <= EXH_GUARD_NEAR_EXTREME_ATR and live.get("fall24_atr", 0) >= EXH_GUARD_MIN_MOVE_ATR and live.get("bottom_reject"):
+        # v54: after a HUGE move (>= EXH_GUARD_BIG_MOVE_ATR) the candle that rejects the extreme closes well off it (a 20-pt wick + body is >1 ATR), so the
+        # "near the extreme" distance is wider there -- a continuation BUY 1.5 ATR below a 6-ATR spike top that just printed a rejection is still buying the top.
+        _near_s = EXH_GUARD_NEAR_EXTREME_BIG_ATR if live.get("fall24_atr", 0) >= EXH_GUARD_BIG_MOVE_ATR else EXH_GUARD_NEAR_EXTREME_ATR
+        _near_b = EXH_GUARD_NEAR_EXTREME_BIG_ATR if live.get("rise24_atr", 0) >= EXH_GUARD_BIG_MOVE_ATR else EXH_GUARD_NEAR_EXTREME_ATR
+        if sig < 0 and live.get("rise24_atr", 9) <= _near_s and live.get("fall24_atr", 0) >= EXH_GUARD_MIN_MOVE_ATR and live.get("bottom_reject"):
             return False, max(0.0, score - AGE_PENALTY * age), \
                 f"SELL blocked: price already fell {live['fall24_atr']} ATR and is rejecting the low - selling the bottom (bounce risk)"
-        if sig > 0 and live.get("off_high24_atr", 9) <= EXH_GUARD_NEAR_EXTREME_ATR and live.get("rise24_atr", 0) >= EXH_GUARD_MIN_MOVE_ATR and live.get("top_reject"):
+        if sig > 0 and live.get("off_high24_atr", 9) <= _near_b and live.get("rise24_atr", 0) >= EXH_GUARD_MIN_MOVE_ATR and live.get("top_reject"):
             return False, max(0.0, score - AGE_PENALTY * age), \
                 f"BUY blocked: price already rose {live['rise24_atr']} ATR and is rejecting the high - buying the top (pullback risk)"
     _reclaimed = False
@@ -1246,13 +1295,13 @@ def analyze(df: pd.DataFrame, *, sr_context=None, level_prediction=None, order_f
         current=min(100,max(0,base_current+learning_adjustment))
         raw_current=current; valid=True; vnote=""
         if sig and meta["type"]=="directional":
-            valid,current,vnote=_signal_validity(sig,live,int(signal_age or 0),current)
+            valid,current,vnote=_signal_validity(sig,live,int(signal_age or 0),current,name=key)
             if live_upstox:
                 all_active.append((current,key,sig,valid,vnote))
                 if valid: candidates.append((current,key,sig))
         _source_note = "LIVE_UPSTOX_OPTION_CHAIN" if key == "oi_writer_zones" and option_chain_live else ("LIVE_UPSTOX_PRICE_DATA" if key != "oi_writer_zones" else "BLOCKED_SIMULATED_OPTION_CHAIN")
         validation_status = wf.get("validation_status", "INSUFFICIENT")
-        results[key]={"name":meta["name"],"type":meta["type"],"signal":"BUY" if sig>0 else "SELL" if sig<0 else "NONE","current_score":round(current,1),"base_score":round(base_current,1),"walk_forward":wf,"regime_fit":regime in meta["regimes"],"formed_now":bool(sig and signal_age == 0),"active_setup":bool(sig),"live_ready":bool(sig and meta["type"]=="directional" and live_upstox),"validation_status":validation_status,"signal_age_bars":signal_age,"formed_at":str(x.index[-1-signal_age]) if sig and signal_age is not None else None,"data_source":(market_source if key != "oi_writer_zones" else _source_note),"learning_samples":learned_samples,"learning_win_rate":learned_wr,"learning_status":learned.get("validation","WARMING_UP"),"learning_adjustment":round(learning_adjustment,1),"raw_score":round(raw_current,1),"live_valid":bool(valid),"live_note":vnote}
+        results[key]={"name":meta["name"],"type":meta["type"],"signal":"BUY" if sig>0 else "SELL" if sig<0 else "NONE","current_score":round(current,1),"base_score":round(base_current,1),"walk_forward":wf,"regime_fit":regime in meta["regimes"],"formed_now":bool(sig and signal_age == 0),"active_setup":bool(sig),"live_ready":bool(sig and meta["type"]=="directional" and live_upstox),"validation_status":validation_status,"signal_age_bars":signal_age,"formed_at":str(x.index[-1-signal_age]) if sig and signal_age is not None else None,"data_source":(market_source if key != "oi_writer_zones" else _source_note),"learning_samples":learned_samples,"learning_win_rate":learned_wr,"learning_status":learned.get("validation","WARMING_UP"),"learning_adjustment":round(learning_adjustment,1),"raw_score":round(raw_current,1),"live_valid":bool(valid),"live_note":vnote,"reaction":bool(valid and sig and key in REVERSAL_STRATEGIES and reaction_confirmed(sig, live))}
     # Keep the process memory bounded while allowing multiple recent candles to remain warm.
     with _WF_LOCK:
         if len(_WF_CACHE) > _WF_CACHE_MAX:
@@ -1279,6 +1328,8 @@ def analyze(df: pd.DataFrame, *, sr_context=None, level_prediction=None, order_f
     has_setup=bool(candidates) and direction!="WAIT" and best >= MIN_ENTRY_SCORE and edge >= MIN_EDGE
     selected=[n for _,n in (buy if direction=="BUY" else sell)[:3]] if has_setup else []
     active_names=[STRATEGY_META[n]["name"] for _,n,d in candidates if d==(1 if direction=="BUY" else -1)]
+    # v54: is the chosen side's setup a confirmed turning-point reaction?  (needs a reversal-type strategy that itself clears the entry score)
+    reaction_names=[n for sc_,n in (buy if direction=="BUY" else sell if direction=="SELL" else []) if results[n].get("reaction") and sc_>=MIN_ENTRY_SCORE] if has_setup else []
     # One-by-one ranking of every strategy that is live right now (best first), plus
     # a compact brief for the Gemini reviewer (the full 38-strategy dict was being
     # truncated in the prompt).
@@ -1289,9 +1340,9 @@ def analyze(df: pd.DataFrame, *, sr_context=None, level_prediction=None, order_f
             "score":round(sc,1),"passes_min_score":bool(sc>=MIN_ENTRY_SCORE),"regime_fit":results[n]["regime_fit"],
             "signal_age_bars":results[n].get("signal_age_bars"),"formed_at":results[n].get("formed_at"),
             "wf_win_rate":_wf.get("win_rate"),"wf_samples":_wf.get("samples",0),"wf_expectancy":_wf.get("expectancy"),
-            "validation":results[n].get("validation_status"),"live_valid":bool(_valid),"live_note":_vnote})
+            "validation":results[n].get("validation_status"),"live_valid":bool(_valid),"live_note":_vnote,"reaction":bool(results[n].get("reaction"))})
     strategy_brief={"regime":regime,"direction":direction if has_setup else "WAIT","best_score":round(best,1),
         "buy_score":round(buy_score,1),"sell_score":round(sell_score,1),"ranked_active":ranked_active[:8],
         "buy_consensus":round(buy_cons,1),"sell_consensus":round(sell_cons,1),"live_state":live,
         "total_strategies_scanned":len(results)}
-    return {"version":STRATEGY_VERSION,"status":"READY","ranked_active":ranked_active,"strategy_brief":strategy_brief,"min_entry_score":MIN_ENTRY_SCORE,"market_data_source":market_source,"live_upstox":live_upstox,"has_setup":has_setup,"direction":direction if has_setup else "WAIT","score":round(best,1),"edge":round(edge,1),"live_state":live,"buy_consensus":round(buy_cons,1),"sell_consensus":round(sell_cons,1),"buy_live_count":len(buy),"sell_live_count":len(sell),"blocked_count":sum(1 for a_ in all_active if not a_[3]),"regime":regime,"selected_strategies":selected,"active_strategy_count":len(active_names),"buy_score":round(buy_score,1),"sell_score":round(sell_score,1),"strategies":results,"formed_at":(results[selected[0]].get("formed_at") if selected else None),"learning": {"strategies_with_resolved_history": sum(1 for v in results.values() if int(v.get("learning_samples",0) or 0) >= 6), "mode": "adaptive_ranking"},"reason":(f"{direction} setup: {', '.join(active_names[:3])}" if has_setup else "No named strategy setup is active in the current execution window.")}
+    return {"version":STRATEGY_VERSION,"status":"READY","ranked_active":ranked_active,"strategy_brief":strategy_brief,"min_entry_score":MIN_ENTRY_SCORE,"market_data_source":market_source,"live_upstox":live_upstox,"has_setup":has_setup,"direction":direction if has_setup else "WAIT","score":round(best,1),"edge":round(edge,1),"live_state":live,"buy_consensus":round(buy_cons,1),"sell_consensus":round(sell_cons,1),"buy_live_count":len(buy),"sell_live_count":len(sell),"blocked_count":sum(1 for a_ in all_active if not a_[3]),"regime":regime,"selected_strategies":selected,"reaction_selected":bool(reaction_names),"reaction_strategies":reaction_names,"active_strategy_count":len(active_names),"buy_score":round(buy_score,1),"sell_score":round(sell_score,1),"strategies":results,"formed_at":(results[selected[0]].get("formed_at") if selected else None),"learning": {"strategies_with_resolved_history": sum(1 for v in results.values() if int(v.get("learning_samples",0) or 0) >= 6), "mode": "adaptive_ranking"},"reason":(f"{direction} setup: {', '.join(active_names[:3])}" if has_setup else "No named strategy setup is active in the current execution window.")}

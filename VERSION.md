@@ -1,3 +1,32 @@
+# v54 -- TURNING-POINT (REACTION) ENTRIES: resistance-rejection SELL / support-bounce BUY were structurally impossible  [27-Oct: "itna bada move aaya, support/resistance se reverse, ek bhi trade nahi"]
+What the 27-Oct screenshots + a replay of that tape through the code showed (Nifty 22,820 spike top -> 22,681 -> 22,672; engine took only one BUY):
+- The strategy layer DID produce SELL signals during the fall; the refusals came later ("win chance 14.3 %", "entry too far from the validated level").
+- ROOT CAUSE 1 (strategy_engine._signal_validity): every signal whose direction is against the live tape (EMA/VWAP/momentum) is blocked as "stale / against the move".  A reversal signal
+  (upthrust at resistance, spring at support) fires exactly while the live tape is STILL with the old move, so every reversal was blocked the moment it formed.  The engine could only
+  enter after the new move was established = late, extended = the "immediate reversal" losses (47 cases, 19 % wins on the dashboard).
+- ROOT CAUSE 2 (ai_trade_decision): "AI research must point the same way" -- the AI vote (order flow / regime / MTF / breadth) lags at a turn by definition -- and the knife gate.
+- ROOT CAUSE 3: the engine's overall SELL record (taken mostly into bounces/bottoms) was charged to every new SELL, including a clean rejection at a validated level.
+- Also found: a continuation BUY at a 6-ATR spike top that has just printed a rejection candle was NOT blocked (the exhaustion guard only looked 0.7 ATR from the extreme).
+Changes (each has a kill switch; SL <= 28 pts, target / OI-wall logic, cooldown, same-zone guard, Gemini final review, no-trailing rule UNCHANGED):
+1. `strategy_engine.reaction_confirmed` + `REVERSAL_STRATEGIES` (spring/upthrust, VWAP+S/R rejection, pivot reversal, RSI divergence, liquidity sweep+FVG, PDH/PDL sweep, EMA trap, double bottom,
+   H&S, inverse H&S): such a signal passes the "against the live tape" block when the turn is CONFIRMED -- price within 1.6 ATR of the 24-bar high/low after a >= 1.5 ATR move AND a rejection wick
+   with the turn.  Continuation strategies stay blocked exactly as before.  Kill switch `REACTION_ENTRIES`.
+2. `_exhaustion_reversal` BLOW-OFF branch: after a >= 3 ATR move, the extreme bar + rejection + close back through the middle of the previous (spike) candle is a spring/upthrust even with no old
+   swing to sweep (a vertical spike has none).  Kill switch `EXH_BLOWOFF`.
+3. Exhaustion guard tier: after a >= 3.5 ATR move the "near the extreme" distance is 1.6 ATR (was 0.7) -> no continuation BUY under a freshly rejected spike top / SELL over a rejected capitulation low.
+4. `ai_trade_decision`: a confirmed reaction at the MATCHING zone (SELL at AT/NEAR_RESISTANCE, BUY at AT/NEAR_SUPPORT) is exempt from the "AI vote must agree" lock (no rebase to the lagging AI side) and
+   from the knife gate.  Wrong zone (selling INTO support) = still blocked.  Kill switch `REACTION_ENTRIES`, `REACTION_NEEDS_LOCATION`.
+5. `trade_learning.compute_edge(entry_type="reaction")`: a reaction is calibrated on REACTION trades only; until 6 of them have resolved it gets the neutral (capped 50 %) prior, and the learned penalties
+   (mistake memory / NN / tags / weak segment) count 25 % (`REACTION_LEARNED_DRAG_FACTOR`).  The EV bar, win-chance floor and Gemini still decide, and once reaction trades exist their OWN record rules
+   (tests: a reaction type with a losing record is stopped).  Ordinary / chasing entries keep the full record -- they do NOT get easier.  Kill switch `trade_learning.ENTRY_TYPE_AWARE`.
+6. Gemini prompt rule 2e: for reaction_entry=true the old trend on the live tape is expected and not "chasing"; it must still SEE the rejection at that level, otherwise REJECT.
+7. TRANSPARENCY: every "No positive edge" refusal now lists where the probability went ("Probability drags: global/macro -0.15, entry quality +0.30, repeat-mistake tags +0.20 ...") and how many
+   comparable trades it was calibrated on -> the next review does not need guessing.  (+ = hurts)
+8. BUG FIX: the gate diagnostics counted every "No positive edge" refusal as "S/R location / confirmation" (the text "break-even needs ..." matched the wrong pattern).
+- NOT changed on purpose: late continuation entries (a SELL 6 ATR into a fall) are still judged by the full record -- the dashboard's own post-mortem says chases lose; the aim is to be there at the TURN or the RETEST, not to chase.
+- Tests: tests_v54_reaction (17) + all earlier suites pass (tests_level_verdict was already failing before).  Effect on win rate is NOT measured on live data: reaction trades are a new, unproven trade type --
+  they will be small in number, are logged with lane="reaction", and are judged separately from the first resolved trade.
+
 # v53 -- UNUSED DASHBOARD DATA NOW COUNTS: sector breadth, volume POC, FII option footprint, IV skew, IV percentile, drift report, Monte-Carlo risk  [27-Oct: "factors ka data use me lao"]
 Audit: of the 46 dashboard sections only the RAW ones were read by the engine.  Sector breadth, POC, FII footprint, IV skew/percentile, drift and Monte-Carlo were computed and SHOWN,
 but never changed a decision (some only reached Gemini as text).
