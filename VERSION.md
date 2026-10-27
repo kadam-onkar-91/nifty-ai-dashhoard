@@ -5,7 +5,7 @@ but never changed a decision (some only reached Gemini as text).
   (penalty up to +0.18 logit, bonus up to -0.06) -- it can never create a trade or touch SL/target.  Missing data = no vote.  Engine drift adds +0.06 (be pickier when the recent record is worse than baseline).
 - The votes are stored as factor flags (`sector_breadth_aligned`, `poc_aligned`, `fii_footprint_aligned`, `iv_skew_aligned`, `model_not_drifting`, `risk_of_ruin_low`, `iv_not_extreme`)
   and have their own group in the Trade Post-Mortem ("Extra data") -> the engine measures whether each one REALLY helps on your trades.  Misleading one? set `data_confluence.VOTES_ON[...] = False`.
-- Dashboard shows a new line "Extra data (sector/POC/FII/IV skew, n/4 mila): saath / khilaf".
+- No new dashboard text: the screen looks exactly as before (the data effect works silently).
 - NOT added to ALL_FACTOR_KEYS on purpose (would change the trained edge model / NN inputs); they are learned through the post-mortem scoreboard first.
 - Tests: tests_v53_data_confluence (7) + all earlier suites pass.  Effect on win rate NOT measured on live data.
 

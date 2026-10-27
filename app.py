@@ -1520,10 +1520,6 @@ def _live_dashboard():
                     st.caption(("✅ " if _mm.get('verdict') in ('ALIGNED', 'STRONG_ALIGNED') else "⚠️ " if 'OPPOSED' in str(_mm.get('verdict')) else "➖ ")
                                + "Dono models: Model A (structure+strategy) trade deta hai | " + str(_mm['note'])
                                + (" | MOMENTUM LANE (dono models agree)" if _decision.get('momentum_lane') else ""))
-                if (_decision.get('data_confluence') or {}).get('note'):
-                    _dcu = _decision['data_confluence']
-                    st.caption(("✅ " if _dcu.get('net', 0) > 0 else "⚠️ " if _dcu.get('net', 0) < 0 else "➖ ")
-                               + f"Extra data (sector/POC/FII/IV skew, {_dcu.get('available', 0)}/4 mila): " + str(_dcu['note']))
                 if (_decision.get('pcr_velocity') or {}).get('note'):
                     st.caption("📈 " + str(_decision['pcr_velocity']['note']))
                 if _decision.get('target_note'):

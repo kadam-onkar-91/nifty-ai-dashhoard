@@ -37,7 +37,7 @@ GROUPS = {
     "Strategy / structure": ["main_signal_aligned", "sniper_setup_aligned", "mtf_stack_aligned", "regime_aligned",
                              "htf_1h_aligned", "htf_15min_aligned", "vwap_aligned", "ml_agrees", "level_pct_ge_65"],
     "Option chain / flow": ["oi_aligned", "order_flow_aligned", "pcr_velocity_aligned", "breadth_aligned", "banknifty_no_divergence"],
-    "Extra data (sector/POC/FII/IV)": ["sector_breadth_aligned", "poc_aligned", "fii_footprint_aligned", "iv_skew_aligned",
+    "Extra data": ["sector_breadth_aligned", "poc_aligned", "fii_footprint_aligned", "iv_skew_aligned",
                                        "model_not_drifting", "risk_of_ruin_low", "iv_not_extreme"],
     "Entry quality / timing": ["entry_not_extended", "entry_confirmed_bounce", "entry_timing_safe", "no_opposite_transition",
                                "immediate_reversal_risk_low", "data_quality_pass"],

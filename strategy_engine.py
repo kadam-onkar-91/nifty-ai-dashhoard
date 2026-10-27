@@ -59,7 +59,7 @@ _SIGNAL_CACHE = {}
 _SIGNAL_CACHE_MAX = 256
 
 STRATEGY_META = {
-    "spring_reclaim_reversal": {"name": "Support Spring / Resistance Upthrust Reversal", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE", "LOW_VOL"}},
+    "spring_reclaim_reversal": {"name": "Spring-Upthrust Reversal", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE", "LOW_VOL"}},
     "modified_920_orb": {"name": "Modified 9:20 ORB", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE"}},
     "classic_30m_orb": {"name": "Classic 30-Min ORB", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL"}},
     "ema_trap_fakeout": {"name": "EMA Trap / Fakeout Scalping", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE"}},
