@@ -1380,6 +1380,10 @@ def _live_dashboard():
                 strategy_result=strategy_result,
                 raw_option_chain=df_option_chain,
                 entry_quality=_entry_q, pcr_velocity=_pcr_vel,
+                sector_breadth=globals().get('sector_breadth'), live_poc=globals().get('live_poc'),
+                fii_footprint=globals().get('fii_footprint'), iv_skew=globals().get('iv_skew'),
+                iv_percentile=globals().get('iv_percentile'), drift_report=globals().get('drift_report'),
+                monte_carlo_report=globals().get('monte_carlo_report'),   # v53: .get -> a missing/failed data source just casts no vote
             )
 
             # v35: if the AI engine matched a different live strategy to its own direction, use that one.
@@ -1516,6 +1520,10 @@ def _live_dashboard():
                     st.caption(("✅ " if _mm.get('verdict') in ('ALIGNED', 'STRONG_ALIGNED') else "⚠️ " if 'OPPOSED' in str(_mm.get('verdict')) else "➖ ")
                                + "Dono models: Model A (structure+strategy) trade deta hai | " + str(_mm['note'])
                                + (" | MOMENTUM LANE (dono models agree)" if _decision.get('momentum_lane') else ""))
+                if (_decision.get('data_confluence') or {}).get('note'):
+                    _dcu = _decision['data_confluence']
+                    st.caption(("✅ " if _dcu.get('net', 0) > 0 else "⚠️ " if _dcu.get('net', 0) < 0 else "➖ ")
+                               + f"Extra data (sector/POC/FII/IV skew, {_dcu.get('available', 0)}/4 mila): " + str(_dcu['note']))
                 if (_decision.get('pcr_velocity') or {}).get('note'):
                     st.caption("📈 " + str(_decision['pcr_velocity']['note']))
                 if _decision.get('target_note'):

@@ -37,6 +37,8 @@ GROUPS = {
     "Strategy / structure": ["main_signal_aligned", "sniper_setup_aligned", "mtf_stack_aligned", "regime_aligned",
                              "htf_1h_aligned", "htf_15min_aligned", "vwap_aligned", "ml_agrees", "level_pct_ge_65"],
     "Option chain / flow": ["oi_aligned", "order_flow_aligned", "pcr_velocity_aligned", "breadth_aligned", "banknifty_no_divergence"],
+    "Extra data (sector/POC/FII/IV)": ["sector_breadth_aligned", "poc_aligned", "fii_footprint_aligned", "iv_skew_aligned",
+                                       "model_not_drifting", "risk_of_ruin_low", "iv_not_extreme"],
     "Entry quality / timing": ["entry_not_extended", "entry_confirmed_bounce", "entry_timing_safe", "no_opposite_transition",
                                "immediate_reversal_risk_low", "data_quality_pass"],
 }
@@ -44,6 +46,8 @@ FACTOR_GROUP = {f: g for g, fs in GROUPS.items() for f in fs}
 
 MODE_TEXT = {
     "STOP_HUNT_THEN_WORKED": "SL chhua, phir 90 min me target bhi chhu liya (disha sahi thi, SL/timing ne maara)",
+    "SOLD_THE_BOTTOM": "Girawat ke bilkul neeche SELL liya (support par bounce aaya) - ab guard sakht hoga",
+    "BOUGHT_THE_TOP": "Tezi ke bilkul upar BUY liya (resistance se palta) - ab guard sakht hoga",
     "WRONG_DIRECTION": "SL ke baad bhi price ulti disha me chalta raha (disha hi galat thi)",
     "NEVER_WORKED": "Entry ke turant baad hi ulta gaya, kabhi 0.25R bhi favour me nahi gaya",
     "WORKED_THEN_FAILED": "Target ke kareeb (60%+) pahunch kar palta aur SL laga",
@@ -118,6 +122,49 @@ def _candles_after(df, t_from, minutes):
         return [], False
 
 
+LOC_LOOKBACK_BARS = 24
+LOC_MIN_MOVE_ATR = 2.0
+LOC_NEAR_EXTREME_ATR = 0.7
+
+
+def location_mistake(df, t0, side, entry, atr):
+    """v52: was this trade opened at the far END of an already-extended move (SELL at the low of a fall / BUY at the high of a rally)?
+    -> 'SOLD_THE_BOTTOM' | 'BOUGHT_THE_TOP' | None.  Uses only candles BEFORE the entry."""
+    try:
+        if df is None or t0 is None or not atr or atr <= 0 or "High" not in df.columns:
+            return None
+        idx = _naive_index(df)
+        pos = [i for i, t in enumerate(idx) if t < t0]
+        if len(pos) < 10:
+            return None
+        w = df.iloc[max(0, pos[-1] - LOC_LOOKBACK_BARS + 1): pos[-1] + 1]
+        hi, lo = float(w["High"].max()), float(w["Low"].min())
+        if side == "SELL" and (hi - entry) / atr >= LOC_MIN_MOVE_ATR and (entry - lo) / atr <= LOC_NEAR_EXTREME_ATR:
+            return "SOLD_THE_BOTTOM"
+        if side == "BUY" and (entry - lo) / atr >= LOC_MIN_MOVE_ATR and (hi - entry) / atr <= LOC_NEAR_EXTREME_ATR:
+            return "BOUGHT_THE_TOP"
+    except Exception:
+        logger.exception("location_mistake failed (ignored)")
+    return None
+
+
+def location_stats(pms, last_n=12):
+    """Among the last `last_n` decided trades: how many LOSSES were location mistakes (sold the bottom / bought the top)?"""
+    rows = [p for p in decided(pms)][-last_n:]
+    bad = [p for p in rows if p.get("loc_mistake") and p.get("status") == "LOSS"]
+    return {"n": len(rows), "bad": len(bad), "keys": [p["key"] for p in bad]}
+
+
+def exhaustion_threshold(pms, base=2.5, floor=1.8, step=0.35):
+    """v52 AMPLIFIER: every repeated location mistake makes the exhaustion guard STRICTER (it triggers after a smaller move).
+    0-1 mistake -> base; 2 -> base-step; 3+ -> floor.  Never below `floor`, never above `base`."""
+    try:
+        b = location_stats(pms)["bad"]
+        return max(floor, base - step * max(0, b - 1)) if b >= 2 else base
+    except Exception:
+        return base
+
+
 def review_trade(t, df=None):
     """One closed trade -> post-mortem dict.  `t` comes from trade_learning.get_resolved_full()."""
     fx = t.get("factors") or {}
@@ -171,7 +218,10 @@ def review_trade(t, df=None):
     confirmed = sorted(k for k, v in flags.items() if v and won)
     missed = sorted(k for k, v in flags.items() if (not v) and won)     # said "not aligned" but the trade won (warning was wrong)
 
-    pm = {"key": f"{str(t.get('timestamp'))[:19]}|{side}", "day": str(t.get("timestamp") or "")[:10], "time": str(t.get("timestamp") or "")[11:16],
+    loc_mistake = location_mistake(df, t0, side, entry, atr) if status == "LOSS" else None
+    if loc_mistake and mode in ("NEVER_WORKED", "WRONG_DIRECTION", "WHIPSAW", "LOSS_PATH_PENDING"):
+        mode = loc_mistake
+    pm = {"key": f"{str(t.get('timestamp'))[:19]}|{side}", "loc_mistake": loc_mistake, "day": str(t.get("timestamp") or "")[:10], "time": str(t.get("timestamp") or "")[11:16],
           "side": side, "status": status, "mode": mode, "entry": entry, "sl": sl, "target": tp, "exit": _f(t.get("exit_price")),
           "risk_pts": round(risk, 1), "reward_pts": round(reward, 1), "mfe_r": round(mfe / risk, 2), "mae_r": round(mae / risk, 2),
           "held_min": held, "sl_atr": round(risk / atr, 2) if atr else None, "after": after,

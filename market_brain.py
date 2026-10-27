@@ -125,6 +125,12 @@ def compute(df, ns):
                 tpm.save_day_reviews(pms, day_)
             ws = tpm.warn_stats(pms)
             tpm.update_state(ws)
+            try:                                   # v52 amplifier: repeated "sold the bottom / bought the top" losses tighten the exhaustion guard
+                import strategy_engine as _se
+                _se.EXH_GUARD_MIN_MOVE_ATR = tpm.exhaustion_threshold(pms)
+                out["pm"]["loc"] = tpm.location_stats(pms)
+            except Exception:
+                logger.exception("exhaustion amplifier failed (ignored)")
             mr, mg = tpm.missed_review(merged)
             out["pm"].update({"warn": ws, "missed": mr, "missed_gates": mg})
             note = tpm.gemini_note(pms)

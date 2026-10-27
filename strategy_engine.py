@@ -59,6 +59,7 @@ _SIGNAL_CACHE = {}
 _SIGNAL_CACHE_MAX = 256
 
 STRATEGY_META = {
+    "spring_reclaim_reversal": {"name": "Support Spring / Resistance Upthrust Reversal", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE", "LOW_VOL"}},
     "modified_920_orb": {"name": "Modified 9:20 ORB", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE"}},
     "classic_30m_orb": {"name": "Classic 30-Min ORB", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL"}},
     "ema_trap_fakeout": {"name": "EMA Trap / Fakeout Scalping", "type": "directional", "regimes": {"TREND_UP", "TREND_DOWN", "HIGH_VOL", "RANGE"}},
@@ -397,6 +398,55 @@ def _triangle_shape(x: pd.DataFrame, direction: str, look: int = 24):
     return None
 
 
+# v52: SUPPORT-SPRING / RESISTANCE-UPTHRUST REVERSAL  (the "support se bounce" trade the engine never took)
+# After a real fall (>= EXH_MIN_MOVE_ATR off the 24-bar high) price sweeps/touches the prior swing low and the LAST COMPLETED candle rejects it
+# (lower wick and/or bullish engulf) and closes back above the swept level and above its own midpoint -> BUY.  Mirror at resistance after a rally -> SELL.
+# Pure price action: needs no history, so it fires from day one; the walk-forward + shadow/post-mortem then rate it like every other strategy.
+EXHAUSTION_REVERSAL = True
+EXH_MIN_MOVE_ATR = 2.0
+EXH_LOOKBACK = 24
+EXH_SWING_BARS = (3, 21)       # swing level = extreme of bars [-21:-3] (excludes the 2 newest bars that do the sweep/reaction)
+
+
+def _exhaustion_reversal(x: pd.DataFrame) -> int:
+    try:
+        if not EXHAUSTION_REVERSAL or len(x) < 40:
+            return 0
+        r = x.iloc[-1]; p = x.iloc[-2]
+        c = _num(r["Close"]); o = _num(r["Open"]); h = _num(r["High"]); l = _num(r["Low"]); a = _num(r["ATR"], 0)
+        if not (math.isfinite(c) and a > 0):
+            return 0
+        a0, a1 = EXH_SWING_BARS
+        swing = x.iloc[-a1:-a0]
+        sw_lo = float(swing["Low"].min()); sw_hi = float(swing["High"].max())
+        win = x.iloc[-EXH_LOOKBACK:]
+        hi24 = float(win["High"].max()); lo24 = float(win["Low"].min())
+        rng = max(h - l, 1e-9); body = abs(c - o)
+        lower = min(o, c) - l; upper = h - max(o, c)
+        ema9 = _num(r.get("EMA9"))
+        pl = _num(p["Low"]); ph = _num(p["High"]); pc = _num(p["Close"]); po = _num(p["Open"])
+        two_lo = min(l, pl); two_hi = max(h, ph)
+        # ---- BUY: spring / double-bottom at the low of a real fall
+        fell = (hi24 - two_lo) / a >= EXH_MIN_MOVE_ATR
+        touched = two_lo <= sw_lo + 0.25 * a                      # swept below OR tested the prior swing low
+        at_floor = two_lo <= lo24 + 0.15 * a                      # and this bar/previous bar IS the low of the window
+        reject = (lower >= max(0.40 * rng, 0.6 * body) and c > o) or (pc < po and c > o and c >= po and o <= pc)
+        reclaimed = c > min(sw_lo + 0.05 * a, h) and c > l + 0.55 * rng and (not math.isfinite(ema9) or c > ema9 - 0.35 * a)
+        if fell and touched and at_floor and reject and reclaimed and body >= 0.15 * a:
+            return 1
+        # ---- SELL: upthrust at the high of a real rally
+        rose = (two_hi - lo24) / a >= EXH_MIN_MOVE_ATR
+        touched_h = two_hi >= sw_hi - 0.25 * a
+        at_roof = two_hi >= hi24 - 0.15 * a
+        reject_h = (upper >= max(0.40 * rng, 0.6 * body) and c < o) or (pc > po and c < o and c <= po and o >= pc)
+        lost = c < max(sw_hi - 0.05 * a, l) and c < h - 0.55 * rng and (not math.isfinite(ema9) or c < ema9 + 0.35 * a)
+        if rose and touched_h and at_roof and reject_h and lost and body >= 0.15 * a:
+            return -1
+        return 0
+    except Exception:
+        return 0
+
+
 def _signal_rules(x: pd.DataFrame, name: str, option_chain=None) -> int:
     if len(x) < 60: return 0
     r=x.iloc[-1]; p=x.iloc[-2]; close=_num(r["Close"]); high=_num(r["High"]); low=_num(r["Low"]); atr=_num(r["ATR"],0)
@@ -422,6 +472,9 @@ def _signal_rules(x: pd.DataFrame, name: str, option_chain=None) -> int:
         if close>rh and (vol_ok or body>=0.5*atr): return 1
         if close<rl and (vol_ok or body>=0.5*atr): return -1
         return 0
+
+    if name == "spring_reclaim_reversal":
+        return _exhaustion_reversal(x)
 
     if name == "ema_trap_fakeout":
         prev_hi=float(x["High"].iloc[-6:-1].max()); prev_lo=float(x["Low"].iloc[-6:-1].min())
@@ -978,6 +1031,20 @@ LIVE_ALIGN_WEIGHT = 0.30     # +/-30 score points for agreeing/disagreeing with 
 LIVE_COUNTER_BLOCK = -30.0   # live alignment at/below this -> signal is BLOCKED (market going the other way)
 RETRACE_ATR = 1.2            # SELL after price already bounced >= this many ATR off the low (BUY: dropped off high)
 RETRACE_OK_ALIGN = 40.0      # ...unless live trend is still strongly with the signal
+# v52: V-RECOVERY / RECLAIM EXCEPTION.  The retrace block above measures "dropped off the 12-bar high" even when price has ALREADY
+# dipped to support and bounced back above EMA9/EMA20 (27-Oct: 22,810 -> 22,650 -> 22,767, live UP +34, BUY 44.8 blocked as "1.37 ATR off the high",
+# while SELLs were blocked as "bounced off the low" -> engine had NO side at all during the whole recovery).  A signal now passes the retrace
+# block when price has demonstrably RECLAIMED (above EMA9 + EMA20, live tape >= RECLAIM_MIN_ALIGN with the signal, 3-bar momentum with the
+# signal, and already >= RECLAIM_MIN_BOUNCE_ATR off the opposite extreme).  Kill switch: RECLAIM_EXCEPTION = False.
+RECLAIM_EXCEPTION = True
+# v52: EXHAUSTION GUARD -- never SELL the bottom / BUY the top of an already-extended move when the last candles show rejection there.
+# (27-Oct: after a full fall to support the engine opened a SELL at the low and price went straight back up.)  A clean breakdown with
+# big bodies and NO rejection wick still passes.  Kill switch: EXHAUSTION_GUARD = False.
+EXHAUSTION_GUARD = True
+EXH_GUARD_MIN_MOVE_ATR = 2.5
+EXH_GUARD_NEAR_EXTREME_ATR = 0.7
+RECLAIM_MIN_ALIGN = 15.0
+RECLAIM_MIN_BOUNCE_ATR = 0.7
 CHASE_ATR = 3.0              # moved >= this many ATR in signal direction in 12 bars and sits at the extreme
 CHASE_PENALTY = 10.0
 AGE_PENALTY = 1.5            # per bar since the setup formed
@@ -1007,8 +1074,25 @@ def _live_state(x: pd.DataFrame) -> Dict[str, Any]:
         sc += 10.0 if st > 0 else -10.0 if st < 0 else 0.0
         sc += 5.0 if c > o else -5.0 if c < o else 0.0
         lo12 = float(x["Low"].iloc[-12:].min()); hi12 = float(x["High"].iloc[-12:].max())
+        # v52 exhaustion facts (sell-the-bottom / buy-the-top guard)
+        _w = x.iloc[-EXH_LOOKBACK:]; _hi24 = float(_w["High"].max()); _lo24 = float(_w["Low"].min())
+        _h = _num(r["High"]); _l = _num(r["Low"]); _rg = max(_h - _l, 1e-9)
+        _lw = (min(o, c) - _l) / _rg; _uw = (_h - max(o, c)) / _rg
+        _pl = x.iloc[-2]; _prg = max(_num(_pl["High"]) - _num(_pl["Low"]), 1e-9)
+        _plw = (min(_num(_pl["Open"]), _num(_pl["Close"])) - _num(_pl["Low"])) / _prg
+        _puw = (_num(_pl["High"]) - max(_num(_pl["Open"]), _num(_pl["Close"]))) / _prg
         move12 = (c - float(cl.iloc[-13])) / a if len(cl) > 13 else 0.0
+        _above9 = bool(math.isfinite(e9) and c > e9); _above20 = bool(math.isfinite(e20) and c > e20)
+        _vw_ok = (not math.isfinite(vw)) or c > vw
+        _vw_dn = (not math.isfinite(vw)) or c < vw
         return {"ok": True, "score": round(max(-100.0, min(100.0, sc)), 1),
+                "reclaim_up": bool(_above9 and _above20 and mom3 > 0 and (c - lo12) / a >= RECLAIM_MIN_BOUNCE_ATR),
+                "reclaim_dn": bool((not _above9) and (not _above20) and mom3 < 0 and (hi12 - c) / a >= RECLAIM_MIN_BOUNCE_ATR),
+                "vwap_up": bool(_vw_ok), "vwap_dn": bool(_vw_dn),
+                "fall24_atr": round((_hi24 - c) / a, 2), "rise24_atr": round((c - _lo24) / a, 2),
+                "off_low24_atr": round((c - _lo24) / a, 2), "off_high24_atr": round((_hi24 - c) / a, 2),
+                "bottom_reject": bool(max(_lw, _plw) >= 0.40 and (c > o or mom3 > 0)),
+                "top_reject": bool(max(_uw, _puw) >= 0.40 and (c < o or mom3 < 0)),
                 "bias": "UP" if sc >= 25 else "DOWN" if sc <= -25 else "SIDEWAYS",
                 "bounce_atr": round((c - lo12) / a, 2), "drop_atr": round((hi12 - c) / a, 2),
                 "move12_atr": round(move12, 2), "mom6_atr": round(mom6, 2), "atr": round(a, 2)}
@@ -1026,10 +1110,23 @@ def _signal_validity(sig: int, live: Dict[str, Any], age: int, score: float):
         side = "SELL" if sig < 0 else "BUY"
         return False, max(0.0, score + LIVE_ALIGN_WEIGHT * max(-100.0, align) - AGE_PENALTY * age), \
             f"{side} blocked: live price action is {'UP' if ls > 0 else 'DOWN'} ({ls:+.0f}) - signal is stale/against the move"
-    if sig < 0 and live.get("bounce_atr", 0) >= RETRACE_ATR and align < RETRACE_OK_ALIGN:
+    if EXHAUSTION_GUARD:
+        if sig < 0 and live.get("rise24_atr", 9) <= EXH_GUARD_NEAR_EXTREME_ATR and live.get("fall24_atr", 0) >= EXH_GUARD_MIN_MOVE_ATR and live.get("bottom_reject"):
+            return False, max(0.0, score - AGE_PENALTY * age), \
+                f"SELL blocked: price already fell {live['fall24_atr']} ATR and is rejecting the low - selling the bottom (bounce risk)"
+        if sig > 0 and live.get("off_high24_atr", 9) <= EXH_GUARD_NEAR_EXTREME_ATR and live.get("rise24_atr", 0) >= EXH_GUARD_MIN_MOVE_ATR and live.get("top_reject"):
+            return False, max(0.0, score - AGE_PENALTY * age), \
+                f"BUY blocked: price already rose {live['rise24_atr']} ATR and is rejecting the high - buying the top (pullback risk)"
+    _reclaimed = False
+    if RECLAIM_EXCEPTION and align >= RECLAIM_MIN_ALIGN:
+        _reclaimed = bool(live.get("reclaim_up") and live.get("vwap_up")) if sig > 0 else bool(live.get("reclaim_dn") and live.get("vwap_dn"))
+        if _reclaimed:
+            notes.append("v52 reclaim: price already recovered above EMA9/EMA20 - dip/bounce entry allowed" if sig > 0
+                         else "v52 reclaim: price already rolled below EMA9/EMA20 - rejection entry allowed")
+    if (not _reclaimed) and sig < 0 and live.get("bounce_atr", 0) >= RETRACE_ATR and align < RETRACE_OK_ALIGN:
         return False, max(0.0, score - AGE_PENALTY * age), \
             f"SELL blocked: price already bounced {live['bounce_atr']} ATR off the low - wait for retest/rejection"
-    if sig > 0 and live.get("drop_atr", 0) >= RETRACE_ATR and align < RETRACE_OK_ALIGN:
+    if (not _reclaimed) and sig > 0 and live.get("drop_atr", 0) >= RETRACE_ATR and align < RETRACE_OK_ALIGN:
         return False, max(0.0, score - AGE_PENALTY * age), \
             f"BUY blocked: price already dropped {live['drop_atr']} ATR off the high - wait for retest/reclaim"
     adj = score + LIVE_ALIGN_WEIGHT * max(-100.0, min(100.0, align)) - AGE_PENALTY * age

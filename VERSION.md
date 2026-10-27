@@ -1,3 +1,34 @@
+# v53 -- UNUSED DASHBOARD DATA NOW COUNTS: sector breadth, volume POC, FII option footprint, IV skew, IV percentile, drift report, Monte-Carlo risk  [27-Oct: "factors ka data use me lao"]
+Audit: of the 46 dashboard sections only the RAW ones were read by the engine.  Sector breadth, POC, FII footprint, IV skew/percentile, drift and Monte-Carlo were computed and SHOWN,
+but never changed a decision (some only reached Gemini as text).
+- NEW `data_confluence.py` (pure, kill switch `ENABLED`): each source -> one signed vote for/against the proposed direction; net of weighted votes gives a CAPPED nudge
+  (penalty up to +0.18 logit, bonus up to -0.06) -- it can never create a trade or touch SL/target.  Missing data = no vote.  Engine drift adds +0.06 (be pickier when the recent record is worse than baseline).
+- The votes are stored as factor flags (`sector_breadth_aligned`, `poc_aligned`, `fii_footprint_aligned`, `iv_skew_aligned`, `model_not_drifting`, `risk_of_ruin_low`, `iv_not_extreme`)
+  and have their own group in the Trade Post-Mortem ("Extra data") -> the engine measures whether each one REALLY helps on your trades.  Misleading one? set `data_confluence.VOTES_ON[...] = False`.
+- Dashboard shows a new line "Extra data (sector/POC/FII/IV skew, n/4 mila): saath / khilaf".
+- NOT added to ALL_FACTOR_KEYS on purpose (would change the trained edge model / NN inputs); they are learned through the post-mortem scoreboard first.
+- Tests: tests_v53_data_confluence (7) + all earlier suites pass.  Effect on win rate NOT measured on live data.
+
+# v52b -- SUPPORT-SPRING BOUNCE + NO SELLING THE BOTTOM + LOCATION-MISTAKE LEARNING AMPLIFIER  [27-Oct: "support se bounce, fall ke baad bhi trade nahi, aur neeche SELL ban gaya"]
+1. NEW strategy `spring_reclaim_reversal` (strategy_engine, #41): after a real fall (>= 2 ATR off the 24-bar high) price sweeps/tests the prior swing low, the last completed candle
+   rejects it (lower wick / bullish engulf) and closes back above the level -> BUY.  Mirror at resistance after a rally -> SELL (upthrust).  Pure price action, works from day 1;
+   walk-forward / shadow / post-mortem then rate it like any other strategy.  Kill switch `EXHAUSTION_REVERSAL`.
+2. NEW EXHAUSTION GUARD (`_signal_validity`): SELL blocked when price already fell >= 2.5 ATR, sits within 0.7 ATR of the low AND the last candles show a rejection wick (BUY mirrored at the top).
+   A clean breakdown with no rejection still passes.  Kill switch `EXHAUSTION_GUARD`.
+3. LEARNING AMPLIFIER (trade_postmortem + market_brain): each LOSS is checked for "SOLD_THE_BOTTOM / BOUGHT_THE_TOP" (candles before entry).  2+ such losses in the last 12 decided trades
+   make the guard stricter (2.5 -> 2.15 -> 1.8 ATR, never lower); the tag appears in the Trade Post-Mortem failure-mode table.  So a repeated mistake is punished harder next time, not just recorded.
+- SL / target / cooldown / same-zone guard / Gemini review UNCHANGED.  Tests: tests_v52_spring (7) + tests_v52_location_learning (3) + tests_v52_reclaim (5) + all older suites pass.
+- NOT measured on live/backtest data.  Strategy count is now 41 (UI text still says 40 in places).
+
+# v52 -- V-RECOVERY DEADLOCK FIXED: engine no longer sits out a dip-and-reclaim move  [from the 27-Oct screenshots]
+27-Oct: Nifty 22,810 -> 22,650 (support/EMA zone) -> 22,767.  Named Strategy Library showed Opening Drive BUY 44.8 (min 38) but "BLOCKED - BUY: price already dropped 1.37 ATR
+off the high", while the SELL strategies were blocked as "stale/against the move" -> NO side was tradable for the whole recovery.  Root cause: `strategy_engine._signal_validity`
+measured the drop against the 12-bar high even after price had already bounced back above EMA9/EMA20 with live tape UP (+34 < the old 40 bar).
+- NEW `RECLAIM_EXCEPTION` (strategy_engine): a BUY passes the retrace block when price is above EMA9 + EMA20 + VWAP, 3-bar momentum is up, live tape >= +15 with the signal,
+  and it is already >= 0.7 ATR off the 12-bar low (SELL mirrored).  Signals against the live tape (<= -30) are STILL blocked; chase penalty unchanged.  Kill switch: RECLAIM_EXCEPTION = False.
+- Shadow evidence reviewed (27-Oct): Gemini rejected 22 -> 36 % win (block was right), Self-learning paused 12 -> 33 % (right), S/R location 66 -> 48.5 % (gate too broad; it is already a soft penalty on the strategy path).
+- SL / target / cooldown / same-zone guard / Gemini review UNCHANGED.  Tests: tests_v52_reclaim (5 new) + all earlier suites pass.  NOT measured on live data.
+
 # v51b -- GLOBAL VETO no longer freezes the START of a big move  [from the 21-Oct screenshots: "Global research is STRONGLY BUY against this SELL"]
 Global research reads yesterday's close, so the veto fires most exactly when a new move begins (the live lane needs score >= 45 + 80 % consensus, which only exists
 LATER in the move).  The engine's own post-mortem also shows global alignment does not predict wins (aligned 28 % vs not aligned 30 %, "farq saabit nahi").

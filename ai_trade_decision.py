@@ -22,6 +22,7 @@ import trade_diagnostics
 import strategy_engine
 import gemini_pool
 import macro_confluence
+import data_confluence
 import json
 import time
 import requests
@@ -868,7 +869,9 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
                              dashboard_context=None, global_research=None,
                              nifty50_news_sentiment=None, nifty50_fundamentals_bias=None,
                              strategy_result=None, raw_option_chain=None, now_ist=None,
-                             entry_quality=None, pcr_velocity=None):
+                             entry_quality=None, pcr_velocity=None,
+                             sector_breadth=None, live_poc=None, fii_footprint=None, iv_skew=None,
+                             iv_percentile=None, drift_report=None, monte_carlo_report=None):
     """
     Returns a dict:
       If NO qualifying setup right now:
@@ -1673,6 +1676,12 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     _penalty += _global_pen
     _penalty += float(_macro.get("penalty_logit", 0.0))      # v50 Model B: agreement = small bonus, opposition = penalty
     factor_flags["macro_model_aligned"] = bool(_macro_agrees)
+    # v53 DATA CONFLUENCE: sector breadth / POC / FII footprint / IV skew / drift were displayed but never used.  Small capped nudge + stored flags (post-mortem learns their reliability).
+    _dc = data_confluence.assess(direction, live_price=live_price, atr=atr, sector_breadth=sector_breadth, live_poc=live_poc,
+                                 fii_footprint=fii_footprint, iv_skew=iv_skew, iv_percentile=iv_percentile,
+                                 drift_report=drift_report, monte_carlo=monte_carlo_report)
+    _penalty += float(_dc.get("penalty_logit", 0.0))
+    factor_flags.update(_dc.get("flags") or {})
     # ENTRY QUALITY (price-action): chasing an extended move costs probability; a sweep / rejection / pullback earns some back.
     _eq = (entry_quality or {}).get(direction) if isinstance(entry_quality, dict) and direction in entry_quality else entry_quality
     _eq = _eq if isinstance(_eq, dict) and ("penalty_logit" in _eq) else None
@@ -1911,6 +1920,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         "oi_buildup": _oib, "event_risk": _event, "risk_tags": factor_flags.get("_risk_tags"), "repeat_mistake_note": _tag_note,
         "momentum_lane": _momentum_lane, "global_note": _global_note,
         "macro_model": _macro,
+        "data_confluence": _dc,
         "expectancy_r": edge["expectancy_r"], "win_probability": edge["win_probability"],
         "breakeven_probability": edge["breakeven_probability"], "required_ev_r": edge["required_ev_r"],
         "edge": edge,
