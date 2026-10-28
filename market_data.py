@@ -117,15 +117,7 @@ def _fetch_upstox_ltp(access_token, instrument_key=NIFTY_INSTRUMENT_KEY):
         encoded_key = urllib.parse.quote(instrument_key, safe='')
         url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={encoded_key}"
         headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-        _resp = requests.get(url, headers=headers, timeout=6)
-        if _resp.status_code == 401:            # v51: expired / revoked token -> drop it now (see upstox_auth.mark_invalid)
-            try:
-                import upstox_auth
-                upstox_auth.mark_invalid(access_token)
-            except Exception:
-                pass
-            return None
-        res = _resp.json()
+        res = requests.get(url, headers=headers, timeout=6).json()
         if res.get('status') != 'success':
             return None
         data = res.get('data', {})

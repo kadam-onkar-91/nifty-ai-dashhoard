@@ -31,7 +31,6 @@ TAG_TEXT = {
     "at_day_extreme": "Entered right at the day's low/high (little room left)",
     "late_session": "Entered late in the session (after 14:00)",
     "opening_15min": "Entered in the first 15 minutes (noise)",
-    "opening_whipsaw": "Entered 09:30-10:00 (opening whipsaw zone, often reverses both ways)",
     "midday_lull": "Entered in the midday lull (11:45-13:30)",
     "expiry_day": "Expiry day (erratic moves)",
     "event_day": "Event-risk window (RBI / Fed / Budget ...)",
@@ -71,8 +70,6 @@ def risk_tags(flags, feats, hour=None):
                 tags.append("late_session")
             elif h < 9.5:
                 tags.append("opening_15min")
-            elif h < 10.0:
-                tags.append("opening_whipsaw")
             elif 11.75 <= h < 13.5:
                 tags.append("midday_lull")
         if _num(f.get("expiry_day")) == 1.0:

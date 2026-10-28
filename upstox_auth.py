@@ -79,16 +79,6 @@ def _clear_token():
         pass
 
 
-def mark_invalid(token):
-    """v51: a data call came back 401 -> forget that OAuth token at once, so the sidebar shows login / switches to the analytics token
-    on the next refresh instead of silently serving Yahoo data for up to 10 minutes."""
-    try:
-        if token and token == _STORE.get("token"):
-            _clear_token()
-    except Exception:
-        pass
-
-
 def _stored_token():
     """Valid shared token or None. Re-validates against Upstox at most every 10 minutes."""
     _load_token_from_disk()
@@ -150,34 +140,13 @@ def _secrets():
         return None
 
 
-def _analytics_token():
-    """v51: Upstox ANALYTICS TOKEN (free, read-only, valid 1 YEAR, generated once on the Upstox Developer Apps page -> Analytics tab).
-    It covers every call this dashboard makes (LTP / quotes / historical + intraday candles / option chain / fundamentals) and can NOT place
-    orders, so it is safe.  Put it in Streamlit secrets as UPSTOX_ANALYTICS_TOKEN (or the env var of the same name).  With it the live feed is
-    on from the very first minute of the day -- no more 'YAHOO_FALLBACK_NON_TRADABLE -> zero trades' until someone logs in after 03:30 IST."""
-    tok = None
-    try:
-        tok = st.secrets["UPSTOX_ANALYTICS_TOKEN"]
-    except Exception:
-        tok = None
-    if not tok:
-        tok = os.environ.get("UPSTOX_ANALYTICS_TOKEN")
-    tok = str(tok).strip() if tok else ""
-    return tok or None
-
-
 def get_upstox_access_token():
     st.sidebar.subheader("🔐 Upstox Live Authentication")
     if "access_token" not in st.session_state:
         st.session_state.access_token = None
 
-    _an_token = _analytics_token()
     creds = _secrets()
     if creds is None:
-        if _an_token:                      # data-only setup: the analytics token alone is enough
-            st.session_state.access_token = _an_token
-            st.sidebar.success("🟢 Live Feed Active (Upstox Analytics token, 1 saal valid)")
-            return _an_token
         st.sidebar.error("Secrets me UPSTOX_API_KEY / UPSTOX_API_SECRET / REDIRECT_URI me se kuch missing hai.")
         return None
     API_KEY, API_SECRET, REDIRECT_URI = creds
@@ -186,7 +155,7 @@ def get_upstox_access_token():
     shared = _stored_token()
     if shared:
         st.session_state.access_token = shared
-    elif st.session_state.access_token and st.session_state.access_token != _STORE.get("token") and st.session_state.access_token != _an_token:
+    elif st.session_state.access_token and st.session_state.access_token != _STORE.get("token"):
         # shared store was cleared (expired / rejected by Upstox) -> drop the stale session copy
         st.session_state.access_token = None
 
@@ -218,13 +187,6 @@ def get_upstox_access_token():
             st.session_state.access_token = None
             st.rerun()
         return st.session_state.access_token
-
-    if _an_token:
-        # no (valid) OAuth login today -> the 1-year analytics token keeps the live feed on, automatically
-        st.session_state.access_token = _an_token
-        st.sidebar.success("🟢 Live Feed Active (Upstox Analytics token - roz login ki zarurat nahi)")
-        st.sidebar.caption("Normal Upstox login bhi chalega (optional). Analytics token sirf data padhta hai, order nahi laga sakta.")
-        return _an_token
 
     err = st.session_state.get("upstox_login_error")
     if err:

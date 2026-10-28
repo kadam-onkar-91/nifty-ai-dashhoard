@@ -64,30 +64,15 @@ class SoftSegments(DbCase):
 
 
 class TodaysCase(DbCase):
-    def test_21_oct_macro_only_points_can_no_longer_make_a_false_strong_global_read(self):
-        """The 21-Oct 'STRONG BUY' came from VIX/DXY/yields/crude while most world indices were red (global_research.py fix, kept in v50).
-        Because the v29 veto is back (v50), that fix is what keeps a falling market tradable."""
-        import global_research as gr
-        import inspect
-        src = inspect.getsource(gr)
-        self.assertIn("equity_backs_buy", src); self.assertIn("equity_backs_sell", src)
-
-    def test_a_losing_record_is_not_bypassed_even_when_the_veto_steps_aside(self):
+    def test_falling_market_with_strong_global_buy_and_a_losing_record_still_trades(self):
+        """The 21-Oct case: every strategy SELL, live price action -55, global macro says 'STRONG BUY', record 1 win in 8."""
         from tests_v42_momentum_tick import _lose_a_lot, _strong
         _lose_a_lot(8)
         g = {"status": "AVAILABLE", "directional_bias": "BUY", "strength": "STRONG"}
-        out = _decide("SELL", strategy=_strong("SELL", live=55), global_research=g, macro=True)
-        self.assertFalse(out["has_setup"])
-
-    def test_veto_steps_aside_when_live_market_confirms_the_move(self):
-        """v50b: the 21-Oct case.  Every strategy SELL, live price action -55, global says STRONG BUY: no longer blocked all day (penalty instead)."""
-        from tests_v42_momentum_tick import _strong
-        g = {"status": "AVAILABLE", "directional_bias": "BUY", "strength": "STRONG"}
-        out = _decide("SELL", strategy=_strong("SELL", live=55), global_research=g, macro=True)
+        out = _decide("SELL", strategy=_strong("SELL", live=55), global_research=g)
         self.assertTrue(out["has_setup"], out.get("reason"))
-        self.assertIn("live price action", out["confidence_note"])
-        weak = _decide("SELL", strategy=_strong("SELL", live=20), global_research=g, macro=True)
-        self.assertFalse(weak["has_setup"]); self.assertIn("Global research is STRONGLY BUY", weak["reason"])
+        self.assertTrue(out["momentum_lane"])
+        self.assertLessEqual(abs(out["underlying_entry"] - out["stop_loss"]), 28.0 + 1e-6)
 
     def test_weak_move_with_strong_global_buy_is_still_not_forced(self):
         from tests_v42_momentum_tick import _lose_a_lot, _strong
