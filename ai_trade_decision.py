@@ -99,6 +99,7 @@ EARLY_MAX_OPPOSITE_CONSENSUS = 30.0
 # Kill switch: REACTION_ENTRIES = False -> exactly the v53 behaviour.
 REACTION_ENTRIES = True
 REACTION_NEEDS_LOCATION = True
+CONFLICT_RELIEF = True                # v54b: lagging regime/MTF/order-flow conflicts (2 of 3) stop vetoing a live-dominant or reaction entry
 REACTION_LEARNED_DRAG_FACTOR = 0.25   # until 6 reaction trades have resolved, the learned penalties (memory/NN/tags/segment) count this fraction
 ENFORCE_SESSION_WINDOW = True
 NO_ENTRY_BEFORE = dtime(9, 25)  # first 10 min: opening auction noise / wide spreads
@@ -1525,7 +1526,15 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     unknown_major = int(regime_bias == "UNKNOWN") + int(mtf_bias == "UNKNOWN") + int(order_pressure == "")
     _unknown_limit = 3 if strategy_path else 2   # strategy-led: a missing module is unknown, not a veto
     _timing_block = (not factor_flags.get('entry_timing_safe') and not _early_entry_ok and not strategy_path)
-    if critical_true < 3 or hard_conflicts >= 2 or unknown_major >= _unknown_limit or not factor_flags.get('no_opposite_transition') or _timing_block or (reversal_used and ((direction == "SELL" and _bearish_reversal_score < 5) or (direction == "BUY" and _bullish_reversal_score < 5))):
+    # v54b: regime / MTF / order-flow are LAGGING reads -- right after a V-reversal (28-Oct: 22,550 -> 22,660, five live BUY strategies, consensus 88 %,
+    # live tape +52) two of them still said "bearish" and this gate refused the trade ("7 direct confirmations; 2 major conflicts").  When the live tape +
+    # broad strategy agreement dominate (the same test as the momentum lane) or the entry is a confirmed turning-point reaction, two lagging conflicts
+    # are a probability COST (already charged: 0.20 each) and not a veto; all three together still block.  Reaction entries are also exempt from the
+    # "opposite transition" knife flag (that IS the turn).  Kill switch: CONFLICT_RELIEF = False.
+    _conflict_relief = bool(CONFLICT_RELIEF and (_live_dom or _reaction_keep) and not _macro_strong_opposed)
+    _max_conflicts = 3 if _conflict_relief else 2
+    _opp_trans_block = (not factor_flags.get('no_opposite_transition')) and not _reaction_keep
+    if critical_true < 3 or hard_conflicts >= _max_conflicts or unknown_major >= _unknown_limit or _opp_trans_block or _timing_block or (reversal_used and ((direction == "SELL" and _bearish_reversal_score < 5) or (direction == "BUY" and _bullish_reversal_score < 5))):
         return {"has_setup": False,
                 "reason": f"Full-context confluence is not strong enough ({critical_true} direct confirmations; {hard_conflicts} major conflicts). Waiting for a cleaner setup.",
                 "context_audit": context_audit}

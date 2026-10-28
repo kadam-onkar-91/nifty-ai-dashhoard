@@ -1,3 +1,10 @@
+# v54b -- 28-Oct: V-reversal BUY refused by lagging conflicts  [screenshots 09:48-09:55: 5 live BUY strategies, consensus 88 %, live +52, still "7 direct confirmations; 2 major conflicts"]
+- The confluence gate vetoed any entry with 2 of 3 (regime / MTF / order flow) against it.  Those are LAGGING reads: right after a gap-down capitulation (22,740 -> 22,550) and the V-bounce they still say bearish.
+- `CONFLICT_RELIEF`: when the live tape + broad strategy agreement dominate (momentum-lane test: live >= 45, >= 3 live strategies, consensus >= 80 %, Model B not STRONG_OPPOSED) or the entry is a confirmed turning-point
+  reaction, 2 conflicts are only a probability cost (0.20 each, already charged) -- all 3 still block.  Reaction entries are also exempt from the "opposite transition" flag.  Edge bar / floor / Gemini / SL unchanged.
+- The single 100-pt opening candle (09:15-09:20) can not be traded by any rule (entries start 09:25) -- the catchable part is the capitulation low + bounce afterwards.
+- Tests: 3 new in tests_v54_reaction (20 total) + all earlier suites pass.  NOT measured on live data.
+
 # v54 -- TURNING-POINT (REACTION) ENTRIES: resistance-rejection SELL / support-bounce BUY were structurally impossible  [27-Oct: "itna bada move aaya, support/resistance se reverse, ek bhi trade nahi"]
 What the 27-Oct screenshots + a replay of that tape through the code showed (Nifty 22,820 spike top -> 22,681 -> 22,672; engine took only one BUY):
 - The strategy layer DID produce SELL signals during the fall; the refusals came later ("win chance 14.3 %", "entry too far from the validated level").
