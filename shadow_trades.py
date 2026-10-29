@@ -29,7 +29,8 @@ import trade_learning as tl
 logger = logging.getLogger(__name__)
 
 SHADOW_WEIGHT = 0.5                # a paper trade counts half as much as a real one (no slippage/fill risk in it)
-SHADOW_MAX_PER_DAY = 15
+SHADOW_MAX_PER_DAY = 30            # v55: was 15 -- the S/R gate used it all up, so the biggest gate (edge/EV) was never tracked
+SHADOW_MAX_PER_GATE_PER_DAY = 10   # v55: every blocking gate gets its own share of the day's budget
 SHADOW_MIN_GAP_MIN = 15            # per direction: a new shadow only this long after the previous one (avoid 10 copies of one idea)
 SHADOW_MAX_OPEN_PER_DIRECTION = 1
 SB_TABLE = "ai_shadow_setups"
@@ -159,7 +160,11 @@ def log(candidate, blocked_by, now=None):
     today = now.strftime("%Y-%m-%d")
     if sum(1 for r in rows if str(r.get("timestamp", ""))[:10] == today) >= SHADOW_MAX_PER_DAY:
         return None
-    same_dir = [r for r in rows if r.get("direction") == d]
+    # v55: the gap / open caps are per (direction, blocking gate) -- one frequent gate can no longer starve the others of evidence
+    gate = str(blocked_by)[:60]
+    if sum(1 for r in rows if str(r.get("timestamp", ""))[:10] == today and str(r.get("blocked_by", ""))[:60] == gate) >= SHADOW_MAX_PER_GATE_PER_DAY:
+        return None
+    same_dir = [r for r in rows if r.get("direction") == d and str(r.get("blocked_by", ""))[:60] == gate]
     if sum(1 for r in same_dir if r.get("status") == "OPEN") >= SHADOW_MAX_OPEN_PER_DIRECTION:
         return None
     if same_dir:

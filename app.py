@@ -1380,6 +1380,10 @@ def _live_dashboard():
                 strategy_result=strategy_result,
                 raw_option_chain=df_option_chain,
                 entry_quality=_entry_q, pcr_velocity=_pcr_vel,
+                sector_breadth=globals().get('sector_breadth'), live_poc=globals().get('live_poc'),
+                fii_footprint=globals().get('fii_footprint'), iv_skew=globals().get('iv_skew'),
+                iv_percentile=globals().get('iv_percentile'), drift_report=globals().get('drift_report'),
+                monte_carlo_report=globals().get('monte_carlo_report'),   # v53: .get -> a missing/failed data source just casts no vote
             )
 
             # v35: if the AI engine matched a different live strategy to its own direction, use that one.
@@ -1511,6 +1515,12 @@ def _live_dashboard():
                 _eqd = (_decision.get('entry_quality') or {})
                 if _eqd.get('summary'):
                     st.caption(("⚠️ " if _eqd.get('chase_flags') else "✅ ") + "Entry quality: " + str(_eqd['summary']))
+                if (_decision.get('macro_model') or {}).get('note'):
+                    _mm = _decision['macro_model']
+                    st.caption(("✅ " if _mm.get('verdict') in ('ALIGNED', 'STRONG_ALIGNED') else "⚠️ " if 'OPPOSED' in str(_mm.get('verdict')) else "➖ ")
+                               + "Dono models: Model A (structure+strategy) trade deta hai | " + str(_mm['note'])
+                               + (" | MOMENTUM LANE (dono models agree)" if _decision.get('momentum_lane') else "")
+                               + (" | TURNING-POINT REACTION (rejection at S/R)" if _decision.get('reaction_entry') else ""))
                 if (_decision.get('pcr_velocity') or {}).get('note'):
                     st.caption("📈 " + str(_decision['pcr_velocity']['note']))
                 if _decision.get('target_note'):
@@ -1605,6 +1615,15 @@ def _live_dashboard():
                 if _day_rng >= 150 and _sm['taken'] == 0:
                     st.info("Aaj bada move aaya aur koi trade nahi bana. Neeche dekho har candle pe kaun sa gate tha. Agar upar "
                             "'engine chal nahi raha tha' likha hai to wahi asli wajah hai (gate nahi).")
+                try:
+                    for _mm in gate_log.missed_moves(_today):
+                        _g = ", ".join(f"{g} x{n}" for g, n in _mm["gates"]) or "koi gate record nahi (engine chal nahi raha tha?)"
+                        _msg = (f"**{'UP' if _mm['dir'] == 'BUY' else 'DOWN'} move {_mm['pts']:.0f} pts** "
+                                f"({_mm['start'].strftime('%H:%M')} -> {_mm['end'].strftime('%H:%M')}): "
+                                + ("trade liya gaya." if _mm["taken"] else f"trade NAHI bana. {_mm['dir']} ko in gates ne roka: {_g}"))
+                        (st.success if _mm["taken"] else st.error)(_msg)
+                except Exception:
+                    logger.exception('missed-move audit failed (ignored)')
                 if _sm['by_gate']:
                     st.dataframe([{"Gate": k, "Candles": v} for k, v in sorted(_sm['by_gate'].items(), key=lambda kv: -kv[1])],
                                  hide_index=True, width="stretch")
@@ -1671,7 +1690,9 @@ def _live_dashboard():
                         _who = "✅ GEMINI approval" if (_g.get('reviewer') == 'GEMINI' or _g.get('status') == 'APPROVED') else "⚠️ LOCAL FALLBACK (Gemini unavailable tha)"
                         st.markdown(f"**{_x['timestamp']} — {_x['direction']} {_x['strike']}{_x['option_type']} [{_x['status']}]** · "
                                     f"{_who} · model `{_g.get('model') or '-'}` · "
-                                    f"{'Google Search ON' if _g.get('search_used') else 'no search'} · approved at {_g.get('at')}")
+                                    f"{'Google Search ON' if _g.get('search_used') else 'no search in review'} · approved at {_g.get('at')}")
+                        if _g.get('news_brief') or _g.get('search_error'):
+                            st.caption("Google research: " + str(_g.get('news_brief') or '-') + (f" | search call failed: {_g.get('search_error')}" if _g.get('search_error') else ""))
                         st.caption(str(_g.get('reason') or ''))
                         if _g.get('gemini_error'):
                             st.caption("Gemini problem: " + str(_g.get('gemini_error')))

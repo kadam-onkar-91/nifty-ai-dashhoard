@@ -121,3 +121,55 @@ def summary(day):
     for r in rows:
         by_gate[r["gate"]] = by_gate.get(r["gate"], 0) + 1
     return {"rows": rows, "by_gate": by_gate, "taken": by_gate.get("TRADE TAKEN", 0)}
+
+
+def missed_moves(day, min_pts=70.0, window_min=75, max_report=4):
+    """v55: the moves the engine did NOT trade, and which gate held the matching-direction trade back during each.
+    A move = price travels >= min_pts within window_min minutes (up or down) using the per-candle prices in the log; it counts as missed when no
+    'TRADE TAKEN' row sits inside [start - 10 min, end].  -> [{dir, start, end, pts, gates:[(gate, candles)], taken}]  (largest first).
+    Pure reporting; never raises."""
+    try:
+        rows = rows_for_day(day)
+        px = {}
+        for r in rows:
+            t, p = _parse(r["candle"]), r.get("price")
+            if t is not None and p:
+                px[t] = float(p)
+        ts = sorted(px)
+        found = []
+        for i, a in enumerate(ts):
+            seg = [t for t in ts[i:] if (t - a).total_seconds() <= window_min * 60]
+            if len(seg) < 2:
+                continue
+            lo = min(seg, key=lambda t: px[t]); hi = max(seg, key=lambda t: px[t])
+            if lo == hi:
+                continue
+            pts = px[hi] - px[lo]
+            if pts < min_pts:
+                continue
+            up = lo < hi                                   # low came first -> rally
+            s, e = (lo, hi) if up else (hi, lo)
+            found.append((pts, "BUY" if up else "SELL", s, e))
+        found.sort(key=lambda x: -x[0])
+        out, used = [], []
+        for pts, d, s, e in found:
+            if any(not (e < us or s > ue) for us, ue in used):
+                continue
+            used.append((s, e))
+            lo_t, hi_t = s - timedelta(minutes=10), e
+            taken = any(r["gate"] == "TRADE TAKEN" and lo_t <= (_parse(r["candle"]) or lo_t - timedelta(days=1)) <= hi_t for r in rows)
+            gates = {}
+            for r in rows:
+                t = _parse(r["candle"])
+                if t is None or not (s <= t <= e) or r["gate"] == "TRADE TAKEN":
+                    continue
+                if r.get("direction") in (d, "", None):
+                    gates[r["gate"]] = gates.get(r["gate"], 0) + 1
+            out.append({"dir": d, "start": s, "end": e, "pts": round(pts, 1), "taken": taken,
+                        "gates": sorted(gates.items(), key=lambda kv: -kv[1])[:4]})
+            if len(out) >= max_report:
+                break
+        return out
+    except Exception:
+        logger.exception("gate_log.missed_moves failed (ignored)")
+        return []

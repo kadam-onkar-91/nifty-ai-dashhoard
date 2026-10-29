@@ -171,7 +171,7 @@ class DecisionLayer(DbCase):
         c = sqlite3.connect(tl.DB_NAME)
         for i in range(n):
             fj = json.dumps(_flags(10, **{"_entry_meta": {"logic_version": tl.LOGIC_VERSION, "side": "SELL"},
-                                          "_features": {"is_buy": 0.0}, "reaction_entry": bool(reaction), "entry_not_extended": False}))
+                                          "_features": {"is_buy": 0.0}, "reaction_entry": bool(reaction), "live_dom_entry": True, "entry_not_extended": False}))
             c.execute("INSERT INTO ai_trade_setups (timestamp,direction,strike,option_type,underlying_entry,stop_loss,target,"
                       "confidence_pct,factors_json,status) VALUES ('2026-01-01 10:00:00','SELL',1,'PE',1,1,1,1,?,?)",
                       (fj, "WIN" if (win_every and i % win_every == 0) else "LOSS"))

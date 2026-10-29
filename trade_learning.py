@@ -914,13 +914,70 @@ def _labelled_rows_full(include_shadow=True):
     return out + real[-LEARNING_WINDOW:]
 
 
-def compute_edge(factor_flags: dict, rr: float, extra_penalty_logit: float = 0.0):
+SIDE_AWARE_CALIBRATION = True    # v51 kill switch.  False = the v36..v50 behaviour (one win rate for BUY and SELL together)
+SIDE_ROW_MIN = 4                 # fewer same-side rows than this -> the side has no record of its own yet (neutral prior, no drag)
+
+
+def _row_side(r):
+    """'BUY' / 'SELL' / None for one labelled row (from the stored _features.is_buy).  Old rows without features -> None."""
+    try:
+        f = r.get("feats") or {}
+        v = f.get("is_buy")
+        if v is None:
+            return None
+        return "BUY" if float(v) >= 0.5 else "SELL"
+    except Exception:
+        return None
+
+
+ENTRY_TYPE_AWARE = True          # v54 kill switch.  False = side-only calibration (v51..v53).  Only turning-point REACTION entries are judged separately;
+                                 # clean / chasing entries keep the full side record (a chase must never get easier than before)
+ENTRY_TYPE_MIN_ROWS = 6          # fewer comparable rows than this -> this kind of entry has no record of its own yet (neutral prior, no drag)
+
+
+def entry_type_of(flags):
+    """'reaction' (turning-point rejection at a validated level) / 'clean' (entry not extended) / 'extended' (chasing an already-run move) /
+    None when the stored flags can not tell (very old rows) -- unknown rows count for every type, exactly like unknown-side rows."""
+    try:
+        if not isinstance(flags, dict):
+            return None
+        if flags.get("reaction_entry"):
+            return "reaction"
+        if "entry_not_extended" not in flags:
+            return None
+        return "clean" if flags.get("entry_not_extended") else "extended"
+    except Exception:
+        return None
+
+
+def compute_edge(factor_flags: dict, rr: float, extra_penalty_logit: float = 0.0, side=None, entry_type=None):
     """Calibrated win probability + expectancy (in R) for one candidate -- see edge_model.py.
     Factor lifts learn from all recent history (real + shadow); the win-rate calibration uses ONLY trades made by the CURRENT
-    decision logic (LOGIC_VERSION) plus shadow trades, so an older logic's losing record can not freeze the new one."""
+    decision logic (LOGIC_VERSION) plus shadow trades, so an older logic's losing record can not freeze the new one.
+
+    v51: the reliability correction ("how often does THIS engine really win") is now SIDE-AWARE.  Until v50 one overall win rate
+    (mostly 25-30 % from SELL trades taken into opening reversals) was subtracted from EVERY candidate, so a fully aligned BUY
+    was rated ~27 % and could never pass -- the engine then had no new BUY data and the drag never went away.  A BUY is now judged
+    by the BUY record, a SELL by the SELL record; a side with almost no trades of its own is not punished for the other side's losses."""
     full = _labelled_rows_full()
     rows = [(r["flags"], r["label"], r["weight"]) for r in full]
-    calib = [(r["flags"], r["label"], r["weight"]) for r in full if r["version"] == LOGIC_VERSION or r["source"] == "shadow"]
+    cur = [r for r in full if r["version"] == LOGIC_VERSION or r["source"] == "shadow"]
+    if SIDE_AWARE_CALIBRATION and side in ("BUY", "SELL"):
+        # rows whose side is unknown (very old trades stored without features) still count for both sides -- only rows KNOWN to be the
+        # other side are left out.  A side with fewer than SIDE_ROW_MIN usable rows has no record of its own yet.
+        same = [r for r in cur if _row_side(r) in (side, None)]
+        cur = same if len(same) >= SIDE_ROW_MIN else []
+    if ENTRY_TYPE_AWARE and entry_type == "reaction":
+        # v54: a turning-point reaction is judged by REACTION trades only (no record yet -> neutral prior, still capped at 50 % and still
+        # needing the EV bar); the late-chase losses of the past say nothing about a rejection at a validated level.
+        same_t = [r for r in cur if entry_type_of(r["flags"]) in ("reaction", None)]
+        cur = same_t if len(same_t) >= ENTRY_TYPE_MIN_ROWS else []
+    elif ENTRY_TYPE_AWARE and entry_type == "live_dom":
+        # v55: an aligned, not-extended live-dominant trend entry is judged by ITS OWN rows (flag live_dom_entry, real + shadow); until
+        # ENTRY_TYPE_MIN_ROWS exist it has no record yet -> neutral prior (capped 50 %), the EV bar still applies.
+        same_t = [r for r in cur if r["flags"].get("live_dom_entry")]
+        cur = same_t if len(same_t) >= ENTRY_TYPE_MIN_ROWS else []
+    calib = [(r["flags"], r["label"], r["weight"]) for r in cur]
     return edge_model.estimate_edge(factor_flags, rows, ALL_FACTOR_KEYS, rr=rr,
                                     extra_penalty_logit=extra_penalty_logit, calib_rows=calib)
 
@@ -1105,7 +1162,12 @@ def recent_performance(window=RECENT_WINDOW):
 # =====================================================================
 # ENTRY COOLDOWN -- stops "stopped out, re-entered the same idea 2 candles later, stopped out again"
 # =====================================================================
-def entry_cooldown(direction, now=None):
+ZONE_GUARD = True            # v49: after a stop-out, no same-side re-entry in the SAME price zone unless price has made real progress
+ZONE_GUARD_MIN = 60          # ... for this many minutes after the stop-out
+ZONE_PROGRESS_R = 0.5        # ... "real progress" = price beyond the stopped trade's entry by this many R (of that trade's risk) in our direction
+
+
+def entry_cooldown(direction, now=None, price=None):
     """(blocked, reason).  Two cheap, well-understood protections:
 
     1. After a LOSS in the SAME direction, wait COOLDOWN_AFTER_LOSS_MIN minutes.  A stop-out means
@@ -1137,6 +1199,28 @@ def entry_cooldown(direction, now=None):
             return True, (f"Cooldown: last {direction} trade was stopped out {int((now - t).total_seconds() // 60)} min ago; "
                           f"waiting ~{left} more min so the engine does not re-enter the same failed idea.")
         break
+    # 1b) v49 same-zone guard.  Two of the last five straight losses were exactly this: stopped out, then the SAME side re-entered
+    #     within a few points of the failed entry (10-21 SELL 22683.8 -> 22687.1; 10-22 SELL 22636.1 -> 22629.1) and was stopped again.
+    #     A re-entry is allowed only after price has moved clearly past the failed entry (the stop-out was then just a shake-out).
+    try:
+        if ZONE_GUARD and price is not None:
+            px = float(price)
+            for r in closed:
+                if r.get("direction") != direction:
+                    continue
+                t = _t(r)
+                if r.get("status") == "LOSS" and t is not None and timedelta(0) <= (now - t) < timedelta(minutes=ZONE_GUARD_MIN):
+                    e, sl = float(r.get("entry")), float(r.get("stop_loss"))
+                    risk = abs(e - sl)
+                    need = ZONE_PROGRESS_R * risk
+                    progress = (e - px) if direction == "SELL" else (px - e)
+                    if risk > 0 and progress < need:
+                        return True, (f"Cooldown (same-zone re-entry): the last {direction} from {e:,.0f} was stopped out "
+                                      f"{int((now - t).total_seconds() // 60)} min ago and price ({px:,.0f}) has not moved {need:.0f} pts beyond that entry "
+                                      f"in our direction yet -- waiting for a real new low/high instead of re-entering the same failed zone.")
+                break
+    except Exception:
+        logger.exception("same-zone guard failed (ignored)")
     # 2) loss streak today
     streak = 0
     last_loss_t = None
@@ -1199,3 +1283,46 @@ def signal_already_traded(direction, formed_at):
                           f"Waiting for a NEW setup instead of re-entering after the move.")
         break
     return False, ""
+
+
+# ---------------------------------------------------------------------
+# v48: full resolved-trade reader for the post-trade review (read-only, additive)
+# ---------------------------------------------------------------------
+def get_resolved_full(limit=150):
+    """Closed trades (WIN / LOSS / EXPIRED), NEWEST first, each with its parsed `factors` dict (entry flags, _features,
+    _entry_meta, _learning_meta ...).  Used only by trade_postmortem.  Never raises -> [] on any problem."""
+    cols = "timestamp,direction,underlying_entry,stop_loss,target,status,exit_price,exit_timestamp,factors_json,confidence_pct"
+    out = []
+    try:
+        rows = None
+        if _is_supabase_configured():
+            try:
+                url = (f"{_supabase_url}/rest/v1/{TABLE}?status=in.(WIN,LOSS,EXPIRED)&order=id.desc&limit={int(limit)}&select={cols}")
+                resp = requests.get(url, headers=_supabase_headers(), timeout=10)
+                resp.raise_for_status()
+                rows = resp.json()
+            except Exception:
+                logger.exception("get_resolved_full: supabase read failed, using local")
+                rows = None
+        if rows is None:
+            conn = sqlite3.connect(DB_NAME)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = [dict(r) for r in conn.execute(
+                    f"SELECT {cols} FROM ai_trade_setups "
+                    "WHERE status IN ('WIN','LOSS','EXPIRED') ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()]
+            finally:
+                conn.close()
+        for r in rows:
+            try:
+                f = json.loads(r.get("factors_json") or "{}") if isinstance(r.get("factors_json"), str) else (r.get("factors_json") or {})
+            except Exception:
+                f = {}
+            out.append({"timestamp": r.get("timestamp"), "direction": r.get("direction"), "entry": r.get("underlying_entry"),
+                        "stop_loss": r.get("stop_loss"), "target": r.get("target"), "status": r.get("status"),
+                        "exit_price": r.get("exit_price"), "exit_timestamp": r.get("exit_timestamp"),
+                        "confidence_pct": r.get("confidence_pct"), "factors": f if isinstance(f, dict) else {}})
+    except Exception:
+        logger.exception("get_resolved_full failed (ignored)")
+        return []
+    return out

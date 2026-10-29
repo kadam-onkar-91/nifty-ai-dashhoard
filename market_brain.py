@@ -15,10 +15,12 @@ import logging
 
 import pandas as pd
 
+import market_adaptive as mad
 import market_autopsy as ma
 import market_learner as ml
 import market_memory as mm
 import trade_learning as tl
+import trade_postmortem as tpm
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,59 @@ def compute(df, ns):
                 "lab_n": sum(1 for s in snaps if s.get("y")), "live_n": sum(1 for s in snaps if s.get("src") == "live"),
                 "days": merged, "pstats": pstats, "pbase": pbase, "score": ml.scorecard(snaps),
                 "tf": _trade_forecasts(snaps, trades), "lessons": ma.lessons(list(merged.values()))})
+    # ---- v47 adaptive layer: strategy scorecard, Gemini memory, earned engine nudge, daily upgrade log (all guarded, advisory)
+    try:
+        strat = mad.strategy_stats(snaps)
+        try:
+            import shadow_trades
+            shadow = (shadow_trades.summary() or {}).get("by_gate", {})
+        except Exception:
+            shadow = {}
+        gem_sc = mad.gemini_scorecard(trades, shadow)
+        mad.update_state(fc, pstats, pbase, ml.active_patterns(f_now or {}), out["score"])
+        out.update({"strat": strat, "shadow": shadow, "gem_sc": gem_sc, "adj": mad.adjustment_status()})
+        out["gem_text"] = mad.gemini_context(out, trades, gem_sc, strat)
+        mad.publish_gemini_text(out["gem_text"])
+        day = (ts_now or "")[:10]
+        if day:
+            metrics = mad.daily_metrics(out, trades, day)
+            mad.save_daily_metrics(metrics)
+            stats = mm.load_stats()
+            stats[day] = metrics
+            out["stats"] = dict(sorted(stats.items()))
+        out["suggest"] = mad.suggestions(out, shadow, strat)
+    except Exception:
+        logger.exception("adaptive layer failed (ignored)")
+    # ---- v48 post-trade review: why each closed trade won / lost, which factors were right or wrong (advisory only)
+    try:
+        if tpm.ENABLED:
+            pms = tpm.build(df)
+            fr, gr = tpm.factor_board(pms)
+            out["pm"] = {"trades": pms, "factors": fr, "groups": gr, "modes": tpm.mode_table(pms), "suggest": tpm.suggestions(pms),
+                         "days": mm.load_pm_days()}
+            day_ = (ts_now or "")[:10]
+            if day_:
+                tpm.save_day_reviews(pms, day_)
+            ws = tpm.warn_stats(pms)
+            tpm.update_state(ws)
+            try:                                   # v52 amplifier: repeated "sold the bottom / bought the top" losses tighten the exhaustion guard
+                import strategy_engine as _se
+                _se.EXH_GUARD_MIN_MOVE_ATR = tpm.exhaustion_threshold(pms)
+                out["pm"]["loc"] = tpm.location_stats(pms)
+            except Exception:
+                logger.exception("exhaustion amplifier failed (ignored)")
+            mr, mg = tpm.missed_review(merged)
+            out["pm"].update({"warn": ws, "missed": mr, "missed_gates": mg})
+            note = tpm.gemini_note(pms)
+            if note:                                   # keep the whole block inside the 1600-char limit ai_trade_decision reads
+                base = out.get("gem_text") or ""
+                cut = base[:1140]
+                if len(base) > 1140 and "\n" in cut:
+                    cut = cut[:cut.rfind("\n")]
+                out["gem_text"] = (cut + "\n" + note).strip()
+                mad.publish_gemini_text(out["gem_text"])
+    except Exception:
+        logger.exception("post-trade review failed (ignored)")
     return out
 
 
@@ -196,3 +251,88 @@ def _draw(st, res, ns):
             st.caption("Engine ke trades par forecaster ki raay (entry se pehle wali). Isse pata chalega ki wo losing trades pehle pakad leta ya nahi:")
             st.dataframe(pd.DataFrame(res["tf"]), use_container_width=True, hide_index=True)
         st.caption("Jab ye scorecard kaafi trades par sabit kare, tab forecaster ko trade ke gate me soft penalty ke taur par jodna theek hoga (abhi OFF).")
+
+    with st.expander("📈 Roz ka Upgrade Report -- kya system sach me behtar ho raha hai?", expanded=False):
+        adj = res.get("adj") or {}
+        if adj:
+            st.markdown("**Engine ko nudge:** " + ("🟢 forecaster ne kamaya hai (chalu)" if adj.get("forecaster_earned") else
+                        f"⚪ abhi band (forecaster ko live me {adj.get('fc_live_n', 0)}/{mad.FC_MIN_LIVE_N} validated natije chahiye, aur {int(100 * mad.FC_MIN_ACC)}%+ sahi)")
+                        + f" | solid patterns (50+ samples): {adj.get('patterns_with_enough_samples', 0)}")
+            st.caption("Nudge hamesha chhota (max +/-3.5 percentage point) aur apne aap tabhi chalu hota hai jab saboot mile; saboot gayab to band.")
+        stats = res.get("stats") or {}
+        if stats:
+            rows = [{"Din": d, "Seekhi candles": m.get("lab_n"), "Forecaster AUC (test)": m.get("fc_auc"), "Test sahi": _pct(m.get("fc_acc")),
+                     "Baseline": _pct(m.get("fc_base")), "Trusted": "✅" if m.get("fc_trusted") else "", "Live sahi": _pct(m.get("live_acc")),
+                     "Engine W-L": f"{m.get('engine_w', 0)}-{m.get('engine_l', 0)}"} for d, m in list(stats.items())[-14:]]
+            st.markdown("**Din-ba-din trend** (asli saboot: kya AUC/accuracy badh rahi hai?)")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        strat = res.get("strat") or {}
+        if strat:
+            st.markdown("**Strategy scorecard (live)**")
+            st.dataframe(pd.DataFrame([{"Strategy": k, "Signals": v["samples"], "Sahi disha": f"{v['wins']}/{v['samples']}", "Asli %": v["raw_win_rate"],
+                                        "Random candle %": v["expected_win_rate"], "Score par asar (pts)": round(max(-8.0, min(8.0, (v["win_rate"] - 50.0) * 0.16)), 1)}
+                                       for k, v in sorted(strat.items(), key=lambda z: -z[1]["win_rate"])]), use_container_width=True, hide_index=True)
+        else:
+            st.caption(f"Strategy scorecard abhi khali: har strategy ke kam se kam {mad.STRAT_MIN_EPISODES} live signals ka natija chahiye (dashboard khula rahe to roz judta hai).")
+        g = res.get("gem_sc") or {}
+        if g.get("approved_n") or g.get("rejected_n"):
+            st.markdown(f"**Gemini scorecard:** approve kiye hue trades me {g.get('approved_wins', 0)}/{g.get('approved_n', 0)} jeete ({_pct(g.get('approved_wr'))})"
+                        + (f" | jo setups Gemini ne roke unme {g['rejected_would_win']}/{g['rejected_n']} jeet jaate ({_pct(g.get('rejected_wr'))})" if g.get("rejected_n") else ""))
+        if g.get("by_model"):
+            st.caption("Gemini approvals model-wise (jeet/total): " + ", ".join(f"{m} {v['wins']}/{v['n']}" for m, v in sorted(g["by_model"].items(), key=lambda z: -z[1]["n"]))
+                       + ". Sample chhota ho to isse natija mat nikalo.")
+        if res.get("gem_text"):
+            st.caption("Gemini ko review se pehle ye yaaddasht milti hai (salaah, live data ko override nahi kar sakti):")
+            st.code(res["gem_text"], language=None)
+        for s_ in (res.get("suggest") or []):
+            st.markdown("• " + s_)
+        st.caption("Suggestions sirf jaankari hain -- koi hard gate, SL ya target apne aap nahi badalta.")
+
+    _draw_postmortem(st, res.get("pm"))
+
+
+def _draw_postmortem(st, pm):
+    with st.expander("🩺 Trade Post-Mortem -- har trade kyon jeeta / kyon haara (roz seekhta hai)", expanded=False):
+        if not pm or not pm.get("trades"):
+            st.info("Abhi koi band trade nahi mila. Trade band hote hi uska post-mortem yahan banega.")
+            return
+        T = pm["trades"]
+        done = [t for t in T if t["status"] in ("WIN", "LOSS")]
+        w = sum(t["status"] == "WIN" for t in done)
+        st.caption(f"{len(T)} band trades ka review ({w} jeet / {len(done) - w} haar). Ye SIRF jaankari/salaah hai -- koi trade, SL ya target apne aap nahi badalta.")
+        if pm.get("modes"):
+            st.markdown("**Haar ke kaaran (loss kaise hue)**")
+            st.dataframe(pd.DataFrame([{"Kaaran": m["text"], "Trades": m["n"], "Hissa": _pct(m["share"])} for m in pm["modes"]]),
+                         use_container_width=True, hide_index=True)
+        if pm.get("groups"):
+            st.markdown("**Signal groups: aligned hone par kya sach me jeete? (global / news / fundamentals / strategy ...)**")
+            st.dataframe(pd.DataFrame([{"Group": g["factor"], "Aligned trades": g["aligned_n"], "Aligned jeet": _pct(g["aligned_wr"]),
+                                        "Na-aligned trades": g["not_n"], "Na-aligned jeet": _pct(g["not_wr"]), "Natija": g["verdict"]} for g in pm["groups"]]),
+                         use_container_width=True, hide_index=True)
+            st.caption(f"Verdict tabhi aata hai jab dono taraf kam se kam {tpm.MIN_GROUP_N} trades hon aur farq statistically saaf ho; warna 'data kam'.")
+        if pm.get("factors"):
+            with st.expander("Har factor alag se", expanded=False):
+                st.dataframe(pd.DataFrame([{"Factor": f["factor"], "Group": f["group"], "Aligned": f["aligned_n"], "Aligned jeet": _pct(f["aligned_wr"]),
+                                            "Na-aligned": f["not_n"], "Na-aligned jeet": _pct(f["not_wr"]), "Natija": f["verdict"]} for f in pm["factors"]]),
+                             use_container_width=True, hide_index=True)
+        ws = pm.get("warn") or {}
+        if ws.get("hi_n") or ws.get("lo_n"):
+            st.markdown(f"**Chetawani-filter:** jab aadhe+ signal groups trade ke khilaf the, trades {_pct(ws.get('hi_wr'))} jeete ({ws.get('hi_n', 0)} trades) "
+                        f"vs baaki {_pct(ws.get('lo_wr'))} ({ws.get('lo_n', 0)}). " +
+                        ("🟢 Saabit ho chuka -- isliye aise naye trade par chhota penalty (max ~2.5 pt) lag raha hai." if ws.get("earned") else
+                         f"⚪ Abhi saabit nahi (dono taraf {tpm.WARN_MIN_N}+ trades aur saaf farq chahiye) -- penalty band."))
+        if pm.get("missed"):
+            st.markdown("**Jo badi moves chhoot gayi -- us waqt kaun sa gate bola?**")
+            if pm.get("missed_gates"):
+                st.caption("Gate-wise chhoote 50+ pt moves: " + ", ".join(f"{g}: {n}" for g, n in sorted(pm["missed_gates"].items(), key=lambda z: -z[1])))
+            st.dataframe(pd.DataFrame([{"Din": r["day"], "Shuru": r["start"], "Disha": "⬆️" if r["dir"] == "UP" else "⬇️", "Points": r["pts"],
+                                        "Gate": r["gate"], "Wajah": r["reason"]} for r in pm["missed"]]), use_container_width=True, hide_index=True)
+            st.caption("Agar ek gate bar-bar badi moves rokta dikhe aur shadow trades me wo jeet-te hon, tab use dheela karna soch sakte hain (apne aap nahi hota).")
+        for s_ in pm.get("suggest") or []:
+            st.markdown("• " + s_)
+        st.markdown("**Har trade ki kahani (naya pehle)**")
+        for t in T[:12]:
+            icon = {"WIN": "✅", "LOSS": "❌"}.get(t["status"], "⏱️")
+            st.markdown(f"{icon} **{t['day']} {t['time']}** {t['status']} -- {t['story']}")
+        st.caption("Kaaran data me dikhne wale sanket hain. News ya bade players ka asli asar data me nahi hota -- usse pakka nahi kaha ja sakta.")
+
