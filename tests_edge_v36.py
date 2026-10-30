@@ -395,9 +395,12 @@ class BackgroundReviewTests(unittest.TestCase):
     def setUp(self):
         atd._REVIEW_JOBS.clear()
         self._orig = atd.gemini_trade_review
+        self._wait = atd.REVIEW_WAIT_S
+        atd.REVIEW_WAIT_S = 0.0                              # these tests are about the non-blocking path; v55b adds a bounded wait (tested in tests_v55_live_dom)
 
     def tearDown(self):
         atd.gemini_trade_review = self._orig
+        atd.REVIEW_WAIT_S = self._wait
         atd._REVIEW_JOBS.clear()
 
     def test_returns_immediately_then_result_on_next_call(self):

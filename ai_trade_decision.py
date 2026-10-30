@@ -100,6 +100,10 @@ EARLY_MAX_OPPOSITE_CONSENSUS = 30.0
 REACTION_ENTRIES = True
 REACTION_NEEDS_LOCATION = True
 CONFLICT_RELIEF = True                # v54b: lagging regime/MTF/order-flow conflicts (2 of 3) stop vetoing a live-dominant or reaction entry
+EVIDENCE_RELIEF = True                 # v55b kill switch.  The calibrated-edge / win-floor gate stands aside WHILE the setups it refused have been winning above break-even (shadow evidence)
+EVIDENCE_MIN_N = 30                    # resolved shadow trades needed before the gate's own record is trusted
+EVIDENCE_MARGIN = 0.02                 # the 90 % lower bound of the refused setups' win rate must beat break-even by this much
+EVIDENCE_OWN_MIN_N = 8                 # ...and it switches itself off again if trades taken under it (flag evidence_relief) lose
 LIVE_DOM_ENTRIES = True                # v55 kill switch.  Aligned live-dominant trend entries (not extended) are judged by their OWN record, not the engine's old late-chase losses
 REACTION_LEARNED_DRAG_FACTOR = 0.25   # until 6 reaction trades have resolved, the learned penalties (memory/NN/tags/segment) count this fraction
 ENFORCE_SESSION_WINDOW = True
@@ -729,20 +733,39 @@ import threading as _threading
 
 _REVIEW_JOBS = {}            # sig -> {"state": "RUNNING"|"DONE", "t0": ts, "result": dict|None}
 _REVIEW_LOCK = _threading.Lock()
+REVIEW_WAIT_S = 14.0         # v55b: wait up to this long for the verdict inside the SAME refresh (was: always one full 30 s refresh late = a late entry)
 REVIEW_STALE_S = 240.0       # a job that never finished (thread died) is abandoned after this long
+
+
+def _wait_review(sig, timeout):
+    end = time.time() + max(0.0, timeout)
+    while time.time() < end:
+        with _REVIEW_LOCK:
+            job = _REVIEW_JOBS.get(sig)
+            if job and job["state"] == "DONE":
+                return job["result"]
+        time.sleep(0.4)
+    return None
 
 
 def gemini_review_async(sig, api_keys, dashboard_context, strategy_result, proposed_direction, **kw):
     """Returns the finished review dict, or {"status": "PENDING", "approved": False, ...} while it is still running.
     `sig` identifies the setup (candle + direction); the same sig never starts two jobs."""
     now = time.time()
+    _running_age = None
     with _REVIEW_LOCK:
         job = _REVIEW_JOBS.get(sig)
         if job and job["state"] == "DONE":
             return job["result"]
         if job and job["state"] == "RUNNING" and now - job["t0"] < REVIEW_STALE_S:
-            return {"status": "PENDING", "approved": False,
-                    "reason": f"Gemini review background me chal raha hai ({int(now - job['t0'])}s) -- next refresh me result aayega."}
+            _running_age = int(now - job["t0"])
+    if _running_age is not None:                         # already running: give it a few seconds, OUTSIDE the lock (the worker needs it to finish)
+        _r = _wait_review(sig, min(REVIEW_WAIT_S, 6.0))
+        if _r is not None:
+            return _r
+        return {"status": "PENDING", "approved": False,
+                "reason": f"Gemini review background me chal raha hai ({_running_age}s) -- next refresh me result aayega."}
+    with _REVIEW_LOCK:
         _REVIEW_JOBS[sig] = {"state": "RUNNING", "t0": now, "result": None}
         for k in [k for k, v in _REVIEW_JOBS.items() if now - v["t0"] > 3600]:
             _REVIEW_JOBS.pop(k, None)
@@ -760,6 +783,9 @@ def gemini_review_async(sig, api_keys, dashboard_context, strategy_result, propo
             _REVIEW_JOBS[sig] = {"state": "DONE", "t0": time.time(), "result": res}
 
     _threading.Thread(target=_work, daemon=True, name="gemini-review").start()
+    _r = _wait_review(sig, REVIEW_WAIT_S)
+    if _r is not None:
+        return _r
     return {"status": "PENDING", "approved": False,
             "reason": "Gemini review background me shuru hua -- result next refresh (~30s) me aayega; tab tak koi trade nahi."}
 
@@ -1888,7 +1914,34 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
                 "reason": (f"Opening range forming (until {OPENING_NO_TRADE_UNTIL.strftime('%H:%M')}): the structure has turned but the engine's own win chance "
                            f"{100 * float(edge.get('win_probability') or 0.0):.0f}% is below the {100 * OPENING_EXC_MIN_WIN_PROB:.0f}% needed this early."),
                 "context_audit": context_audit, "macro_model": _macro}
-    if edge["expectancy_r"] < _min_ev and not _momentum_lane:
+    # v55b EVIDENCE RELIEF: the dashboard's own shadow table showed the setups this gate refused winning ~48 % (n~90) at R:R ~2, while the trades it
+    # let through won 28 %.  So the gate is judged by its OWN record: while its refusals win above break-even (90 % lower bound) the EV / win-floor
+    # bar stands aside for strategy-led entries.  Every other gate (knife, cooldown, confluence, entry distance, SL cap, Gemini) still applies,
+    # and it turns itself off if the trades taken under it lose.
+    _evidence_lane = False
+    _evid_note = ""
+    if EVIDENCE_RELIEF and strategy_path and not _macro_strong_opposed and not _momentum_lane \
+            and (edge["expectancy_r"] < _min_ev or float(edge.get("win_probability") or 0.0) < _win_floor(_now)[0]):
+        try:
+            import shadow_trades
+            _rec = shadow_trades.edge_gate_record()
+            _be = float(edge.get("breakeven_probability") or 0.0)
+            if _rec["n"] >= EVIDENCE_MIN_N and _rec["wilson_low"] is not None and _rec["wilson_low"] >= _be + EVIDENCE_MARGIN:
+                _own = [r for r in trade_learning._labelled_rows_full(include_shadow=False)
+                        if r.get("source") == "real" and r.get("flags", {}).get("evidence_relief")]
+                _own_w = sum(1 for r in _own if r.get("label") == 1)
+                if len(_own) >= EVIDENCE_OWN_MIN_N and (_own_w / len(_own)) < _be - 0.05:
+                    _evid_note = f"evidence relief OFF: its own trades won {_own_w}/{len(_own)}"
+                else:
+                    _evidence_lane = True
+                    _evid_note = (f"evidence relief: setups this gate refused won {100 * _rec['wins'] / _rec['n']:.0f}% ({_rec['wins']}/{_rec['n']}, "
+                                  f"90% low {100 * _rec['wilson_low']:.0f}%) vs break-even {100 * _be:.0f}% -> EV bar waived")
+        except Exception:
+            logger.exception("evidence relief failed (ignored)")
+    if _evid_note:
+        _bar_notes.append(_evid_note)
+    factor_flags["evidence_relief"] = bool(_evidence_lane)
+    if edge["expectancy_r"] < _min_ev and not _momentum_lane and not _evidence_lane:
         return {"has_setup": False,
                 "reason": (f"No positive edge: estimated win chance {confidence_pct:.1f}% at R:R {rr:.2f} gives expectancy "
                            f"{edge['expectancy_r']:+.2f}R, below the required {_min_ev:+.2f}R "
@@ -1905,7 +1958,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
 
     _wp = float(edge.get("win_probability") or 0.0)
     _floor, _floor_note = _win_floor(_now)
-    if _wp < _floor and not _momentum_lane:
+    if _wp < _floor and not _momentum_lane and not _evidence_lane:
         return {"has_setup": False,
                 "reason": (f"Win-chance floor: the engine's own win probability for this setup is {100 * _wp:.1f}%, below the minimum "
                            f"{100 * _floor:.0f}%{(' (' + _floor_note + ')') if _floor_note else ''}. Even with a positive-looking R:R it would lose about {100 * (1 - _wp):.0f} of 100 times. "
@@ -1928,6 +1981,8 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         _entry_meta["lane"] = "reaction"
     elif _live_dom_keep and not _momentum_lane:
         _entry_meta["lane"] = "live_dom"
+    if _evidence_lane and "lane" not in _entry_meta:
+        _entry_meta["lane"] = "evidence"
     _seg_blocked, _seg_reason = trade_learning.segment_gate(_entry_meta)
     if _seg_blocked:
         return {"has_setup": False, "reason": _seg_reason, "context_audit": context_audit,

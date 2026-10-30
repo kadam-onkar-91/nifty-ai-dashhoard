@@ -69,3 +69,52 @@ class ShadowQuota(DbCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewWaitAndEvidence(DbCase):
+    def test_fast_review_returns_in_the_same_refresh(self):
+        import time
+        atd._REVIEW_JOBS.clear()
+        orig = atd.gemini_trade_review
+        atd.gemini_trade_review = lambda *a, **k: (time.sleep(0.6), {"status": "APPROVED", "approved": True})[1]
+        try:
+            r = atd.gemini_review_async(("c55", "BUY"), ["k"], {}, {}, "BUY")
+        finally:
+            atd.gemini_trade_review = orig; atd._REVIEW_JOBS.clear()
+        self.assertEqual(r["status"], "APPROVED")             # was PENDING for a whole 30 s refresh before v55b
+
+    def _shadow(self, n, win_every, gate="No positive edge (EV)", wins_of_10=None):
+        c = sqlite3.connect(tl.DB_NAME)
+        sh._local_init()
+        for i in range(n):
+            c.execute("INSERT INTO ai_shadow_setups (timestamp,direction,underlying_entry,stop_loss,target,blocked_by,factors_json,status) "
+                      "VALUES ('2026-01-01 10:00:00','BUY',100,90,120,?,?,?)",
+                      (gate, json.dumps(_flags(10)), "WIN" if ((i % 10 < wins_of_10) if wins_of_10 is not None else (i % win_every == 0)) else "LOSS"))
+        c.commit(); c.close()
+
+    def test_edge_gate_record_counts_legacy_label(self):
+        self._shadow(20, 2, "S/R location / confirmation"); self._shadow(20, 2)
+        r = sh.edge_gate_record()
+        self.assertEqual(r["n"], 40); self.assertAlmostEqual(r["win_rate"], 0.5)
+
+    def test_gate_stands_aside_only_while_its_refusals_win(self):
+        _history(40, 8, live_dom=False)
+        self._shadow(50, 2, wins_of_10=6)                     # refused setups win 60 % (n=50)
+        out = _decide("BUY", strategy=_strong("BUY", live=20, cons=40, n=1))   # NOT live-dominant: v55 lane does not apply
+        self.assertTrue(out["has_setup"], out.get("reason"))
+        self.assertTrue(out["factor_flags"].get("evidence_relief"))
+
+    def test_losing_refusals_keep_the_gate(self):
+        _history(40, 8, live_dom=False)
+        self._shadow(40, 8)                                   # refused setups win 12 % -> the gate was right
+        out = _decide("BUY", strategy=_strong("BUY", live=20, cons=40, n=1))
+        self.assertFalse(out["has_setup"]); self.assertIn("No positive edge", out["reason"])
+
+    def test_kill_switch(self):
+        _history(40, 8, live_dom=False); self._shadow(50, 2, wins_of_10=6)
+        atd.EVIDENCE_RELIEF = False
+        try:
+            out = _decide("BUY", strategy=_strong("BUY", live=20, cons=40, n=1))
+        finally:
+            atd.EVIDENCE_RELIEF = True
+        self.assertFalse(out["has_setup"])

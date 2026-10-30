@@ -282,3 +282,29 @@ def summary():
     for e in by.values():
         e["win_rate"] = round(100.0 * e["wins"] / e["n"], 1) if e["n"] else None
     return {"by_gate": by, "open": sum(1 for r in rows if r.get("status") == "OPEN"), "total": len(rows)}
+
+
+EDGE_FAMILY_GATES = ("No positive edge (EV)", "Win-chance floor", "S/R location / confirmation")
+# "S/R location / confirmation" is included on purpose: before v54 classify_block filed every "No positive edge ... break-even needs 34%"
+# refusal under that label (the word "needs"), and a hard S/R refusal never produces a shadow candidate, so those rows ARE edge-gate blocks.
+
+
+def edge_gate_record(z=1.645):
+    """v55: how did the setups the calibrated-edge / win-chance gate REFUSED actually turn out?  -> {n, wins, win_rate, wilson_low}
+    (resolved shadow trades only; win_rate / wilson_low are fractions).  Never raises."""
+    out = {"n": 0, "wins": 0, "win_rate": None, "wilson_low": None}
+    try:
+        by = summary()["by_gate"]
+        n = sum(int(by.get(g, {}).get("n", 0)) for g in EDGE_FAMILY_GATES)
+        w = sum(int(by.get(g, {}).get("wins", 0)) for g in EDGE_FAMILY_GATES)
+        out["n"], out["wins"] = n, w
+        if n > 0:
+            p = w / n
+            out["win_rate"] = p
+            d = 1 + z * z / n
+            c = p + z * z / (2 * n)
+            m = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
+            out["wilson_low"] = max(0.0, (c - m) / d)
+    except Exception:
+        logger.exception("edge_gate_record failed (ignored)")
+    return out
