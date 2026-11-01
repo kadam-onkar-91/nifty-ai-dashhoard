@@ -1,0 +1,47 @@
+name: keep dashboard open in market hours
+
+# Opens your Streamlit app in a headless browser (the "robot tab") so research / shadow trades / learning / trades keep running
+# even when YOUR phone is off.  Setup steps: see the "Mobile band, tab chalta rahe" section in README.md
+on:
+  schedule:
+    # GitHub can delay or DROP a scheduled run, so there is a trigger every 15 minutes through the whole market day (odd minutes: GitHub is
+    # busiest at :00/:30).  All times are UTC: 03:07 UTC = 08:37 IST ... 09:52 UTC = 15:22 IST, Monday-Friday.
+    # Only ONE keeper runs at a time (concurrency below); the extra triggers wait in the queue, so if the running keeper ever dies the
+    # next queued one starts at once (self-healing), and a late start still covers the rest of the day.
+    # Sessions (IST, set in keep_open.py): anything that starts before 13:45 stays until 13:50, anything later stays until 15:35.
+    - cron: "7,22,37,52 3-9 * * 1-5"
+  workflow_dispatch:           # "Run workflow" button for a manual test
+
+permissions:
+  contents: read
+
+concurrency:
+  group: market-keeper
+  cancel-in-progress: false    # the next run QUEUES behind the running one (no two tabs at once)
+
+jobs:
+  keep-open:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install headless Chrome
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: keep the app open until the market closes
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+          SKIP_DATES: ${{ vars.SKIP_DATES }}
+        run: python keep_open.py
+      - name: last screenshot (to see what the robot saw)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keeper-last-screenshot
+          path: keeper_last.png
+          if-no-files-found: ignore
+          retention-days: 1

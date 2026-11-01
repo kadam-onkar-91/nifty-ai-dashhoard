@@ -63,7 +63,7 @@ def parse_heartbeat(body: str, now: datetime):
         found = HEARTBEAT_RE.findall(body or "")
         if not found:
             return None
-        t = datetime.strptime(found[0], "%d-%b-%Y %H:%M:%S").replace(tzinfo=IST)
+        t = max(datetime.strptime(x, "%d-%b-%Y %H:%M:%S") for x in found).replace(tzinfo=IST)
         return (now - t).total_seconds()
     except Exception:
         return None
@@ -94,9 +94,31 @@ def main() -> int:
     wake_btn = re.compile(r"get this app back up", re.I)
     bad_text = ("Connection error", "Disconnected", "Oh no.", "This app has gone to sleep")
     with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+        launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+        browser = p.chromium.launch(args=launch_args)
         ctx = browser.new_context(viewport={"width": 1366, "height": 900})
         page = ctx.new_page()
+
+        def restart_page() -> None:
+            """Throw the tab (and, if needed, the whole browser) away and start clean -- for a crashed/closed tab that a plain reload
+            cannot fix (before this, a crashed tab made every later check fail until the session ended)."""
+            nonlocal browser, ctx, page
+            log("Restarting the browser tab from scratch.")
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            try:
+                ctx = browser.new_context(viewport={"width": 1366, "height": 900})
+                page = ctx.new_page()
+            except Exception:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                browser = p.chromium.launch(args=launch_args)
+                ctx = browser.new_context(viewport={"width": 1366, "height": 900})
+                page = ctx.new_page()
 
         def app_scope():
             """The frame that really holds the Streamlit app.  On Streamlit Cloud the app lives INSIDE an iframe, so looking only at the
@@ -177,9 +199,14 @@ def main() -> int:
             log(f"First open failed: {exc}")
         last_reload = time.time()
         fails = 0
+        errors = 0
         while ist_now() < end:
             time.sleep(CHECK_EVERY_S)
             try:
+                if fails >= 4:
+                    fails = 2
+                    restart_page(); open_app(); last_reload = time.time()
+                    continue
                 if wake_if_asleep():
                     last_reload = time.time()
                     continue
@@ -199,8 +226,16 @@ def main() -> int:
                     open_app(); last_reload = time.time()
                 else:
                     log(f"tab alive | {note}")
+                errors = 0
             except Exception as exc:
-                log(f"loop problem (will retry): {exc}")
+                errors += 1
+                log(f"loop problem #{errors} (will retry): {exc}")
+                if errors >= 3:
+                    errors = 0
+                    try:
+                        restart_page(); open_app(); last_reload = time.time()
+                    except Exception as exc2:
+                        log(f"restart failed (will retry): {exc2}")
         try:
             page.screenshot(path="keeper_last.png", full_page=False)
         except Exception:

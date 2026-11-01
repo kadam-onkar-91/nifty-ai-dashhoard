@@ -78,17 +78,17 @@ Streamlit tabhi chalta hai jab koi browser tab khula ho. GitHub Actions (free) m
 khol ke rakhta hai -- jaise tum phone pe website khule rakhte ho.
 
 ## Ek baar setup (5 minute)
-1. Ye 3 cheezein repo me upload karo (folders ke saath):
+1. Ye 2 cheezein repo me upload karo (folders ke saath):
    - `.github/workflows/keep_app_awake.yml`
-   - `.github/keeper/keep_open.py`
-   - `KEEPER_SETUP.md` (optional)
+   - `keep_open.py` (repo ke root me, `app.py` ke saath)
    (GitHub me Add file -> Create new file -> naam me `.github/workflows/keep_app_awake.yml` likho, content paste karo.)
 2. Repo -> **Settings -> Secrets and variables -> Actions -> Variables tab -> New repository variable**
    - Name: `APP_URL`   Value: tumhari Streamlit app ka poora link (browser se copy karke)
    - (Optional) Name: `SKIP_DATES`  Value: market holidays, jaise `2026-11-08,2026-12-25`
 3. Repo -> **Actions** tab -> "keep dashboard open in market hours" -> **Run workflow** (ek baar test).
    Logs me "tab alive" har minute dikhna chahiye. Test sirf kuch minute chalao, phir Cancel kar sakte ho.
-4. Uske baad ye Mon-Fri 09:00 se 15:35 IST tak apne aap chalega.
+4. Uske baad ye Mon-Fri ~08:40 se 15:35 IST tak apne aap chalega (har 15 min pe ek trigger; ek time pe sirf ek robot tab chalta hai.
+   Subah ka session 13:50 tak, uske baad ka session 15:35 tak. Beech me 1-2 minute ka gap normal hai).
 
 ## Roz ka kaam
 - Subah market se pehle **ek baar** Upstox login (app kholo -> Login with Upstox -> PIN). Token server pe save hota hai,
@@ -99,7 +99,8 @@ khol ke rakhta hai -- jaise tum phone pe website khule rakhte ho.
   Private rakhna ho to ye free me nahi chalega (tab Oracle Cloud ka free VM use karo, batao to guide kar dunga).
 - Public karne se pehle: repo me `trade_learning.db` ya koi secret/key to nahi? (secrets sirf `.streamlit/secrets.toml` / Streamlit
   Secrets me rakho, wo repo me nahi jaati.) Trade history Supabase me hai.
-- GitHub ka schedule kabhi 5-15 minute late ho sakta hai. Subah 09:00 pe start hota hai, to 9:15 tak aam taur pe chal jaata hai.
+- GitHub ka schedule kabhi 5-15 minute late ho sakta hai. Subah ~08:40 IST ke baad pehla trigger start hota hai, to 9:15 tak aam taur pe chal jaata hai. Actions me kuch runs "Cancelled" dikhen to ghabrao mat -- wo extra queued triggers hain.
+- GitHub public repo me 60 din koi commit na ho to schedule band kar deta hai -- Actions tab me "Enable workflow" dabana padega.
 - Agar kuch na chale: Actions -> run -> neeche "keeper-last-screenshot" download karke dekho robot ko kya dikha.
 
 
@@ -183,7 +184,7 @@ The historical ML test is **not** a full historical replay of the complete tradi
 - 30-Oct evidence from the dashboard: setups refused by the calibrated-edge gate (shadow rows labelled "No positive edge (EV)" + the pre-v54 mislabelled "S/R location / confirmation", ~90 resolved) won ~48 % at R:R ~2, while the trades the gate let through won 28 %. The gate was keeping out winners.
 - `EVIDENCE_RELIEF`: for strategy-led entries the EV bar and win-floor stand aside WHILE shadow_trades.edge_gate_record() (n>=30) has a 90 % Wilson lower bound above break-even + 2 pts. It switches itself off if >=8 real trades taken under it (flag `evidence_relief`) win less than break-even-5 pts. All other gates (knife, cooldown, confluence, entry distance, SL<=28, Gemini) unchanged. Kill switch `ai_trade_decision.EVIDENCE_RELIEF=False`.
 - Gemini review: the verdict is awaited up to `REVIEW_WAIT_S` (14 s) inside the same refresh instead of always arriving one 30 s refresh (often a full candle) late ("Gemini review pending" blocked 29 candles on 30-Oct). Set `REVIEW_WAIT_S = 0` for the old behaviour. Gemini's veto itself is kept (its rejects won 38 % vs approvals 34 %: no edge either way yet).
-- Not fixable in code: the engine saw no candles before 10:00 on 30-Oct (two of the four 50+ pt moves were before that) -- keep the keeper/app running from 09:15 (KEEPER_SETUP.md).
+- Not fixable in code: the engine saw no candles before 10:00 on 30-Oct (two of the four 50+ pt moves were before that) -- keep the keeper/app running from 09:15 (README: "Mobile band, tab chalta rahe").
 
 ## v55 -- live-dominant entries judged by their own record + edge-blocked setups shadow-tracked
 - The "No positive edge" gate was charging every candidate (even fully aligned live-dominant BUYs, e.g. 29-Oct +147 pts) with the engine's old 25-29 % late-chase record.

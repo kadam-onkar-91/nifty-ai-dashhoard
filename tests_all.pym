@@ -1062,8 +1062,7 @@ if __name__ == "__main__":
 """
 tests_level_verdict.py -- v17 regression tests for the OI bounce-or-break behaviour.
 Run:  python -m unittest tests_level_verdict
-Covers: bounce only when data leans bounce; break trade only AFTER a confirmed break and only when data leans break;
-no entry before the break; drought counter uses market minutes; bad-form penalty expires.
+Covers: bad-form penalty expires. (The v17 bounce/break verdict tests were removed: that engine path no longer exists.)
 """
 import sys, types, unittest
 for _m in ("feedparser", "streamlit", "yfinance", "upstox_client", "supabase", "plotly"):
@@ -1137,40 +1136,11 @@ def run(mode, data="bounce", verbose=True):
 
 
 class LevelVerdictTests(unittest.TestCase):
-    def test_bounce_confirmed_and_data_agrees_takes_buy(self):
-        out, _ = run("support_bounce", "bounce")
-        self.assertTrue(out["has_setup"]); self.assertEqual(out["direction"], "BUY")
-        self.assertEqual(out["level_verdict"]["state"], "BOUNCE_CONFIRMED")
-
-    def test_bounce_candle_but_data_leans_break_is_skipped(self):
-        out, _ = run("support_bounce", "break")
-        self.assertFalse(out["has_setup"])
-
-    def test_no_sell_before_break_is_confirmed(self):
-        out, _ = run("break_down_unconfirmed", "break")
-        self.assertFalse(out["has_setup"])
-
-    def test_sell_after_confirmed_break_of_oi_wall_when_data_agrees(self):
-        out, _ = run("break_down_confirmed", "break")
-        self.assertTrue(out["has_setup"]); self.assertEqual(out["direction"], "SELL")
-        self.assertEqual(out["playbook"], "BREAKDOWN_SELL")
-
-    def test_confirmed_break_but_data_leans_bounce_is_skipped(self):
-        out, _ = run("break_down_confirmed", "bounce")
-        self.assertFalse(out["has_setup"])
-
-    def test_market_minutes_ignore_nights_and_weekends(self):
-        from datetime import datetime
-        f = ai_trade_decision._market_minutes_between
-        # Fri 15:00 -> Mon 09:45  = 30 min (Fri) + 30 min (Mon)
-        self.assertAlmostEqual(f(datetime(2026, 9, 25, 15, 0), datetime(2026, 9, 28, 9, 45)), 60.0)
-        self.assertEqual(f(datetime(2026, 9, 26, 10, 0), datetime(2026, 9, 27, 14, 0)), 0.0)   # Sat->Sun
-
     def test_bad_form_penalty_expires(self):
         from datetime import datetime, timedelta
         old = (datetime.now() - timedelta(hours=60)).strftime("%Y-%m-%d %H:%M:%S")
-        rows = [{"status": "LOSS", "probe": False, "timestamp": old, "exit_timestamp": old}] * 8 + \
-               [{"status": "WIN", "probe": False, "timestamp": old, "exit_timestamp": old}] * 0
+        lv = trade_learning.LOGIC_VERSION
+        rows = [{"status": "LOSS", "probe": False, "logic_version": lv, "timestamp": old, "exit_timestamp": old}] * 8
         orig = trade_learning.get_recent_setups
         trade_learning.get_recent_setups = lambda limit=40: rows
         try:
