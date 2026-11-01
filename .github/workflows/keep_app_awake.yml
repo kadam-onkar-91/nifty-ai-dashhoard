@@ -4,18 +4,17 @@ name: keep dashboard open in market hours
 # even when YOUR phone is off.  Setup steps: see KEEPER_SETUP.md
 on:
   schedule:
-    # GitHub sometimes delays or DROPS a scheduled run, so the morning start is scheduled several times.  Extra triggers are harmless:
-    # while one run is active the others just wait in the queue (concurrency below) and the waiting one becomes the afternoon run.
-    - cron: "30 3 * * 1-5"    # 09:00 IST  -> morning run, stays until 14:55 IST
-    - cron: "50 3 * * 1-5"    # 09:20 IST  (backup start)
-    - cron: "10 4 * * 1-5"    # 09:40 IST  (backup start)
-    - cron: "40 4 * * 1-5"    # 10:10 IST  (backup start)
-    - cron: "20 9 * * 1-5"    # 14:50 IST  -> afternoon run, waits for the morning run to finish, stays until 15:35 IST
+    # GitHub can delay or DROP a scheduled run, so there is a trigger every 15 minutes through the whole market day (odd minutes: GitHub is
+    # busiest at :00/:30).  All times are UTC: 03:07 UTC = 08:37 IST ... 09:52 UTC = 15:22 IST, Monday-Friday.
+    # Only ONE keeper runs at a time (concurrency below); the extra triggers wait in the queue, so if the running keeper ever dies the
+    # next queued one starts at once (self-healing), and a late start still covers the rest of the day.
+    # Sessions (IST, set in keep_open.py): anything that starts before 13:45 stays until 13:50, anything later stays until 15:35.
+    - cron: "7,22,37,52 3-9 * * 1-5"
   workflow_dispatch:           # "Run workflow" button for a manual test
 
 concurrency:
   group: market-keeper
-  cancel-in-progress: false    # the afternoon run QUEUES behind the morning run (no two tabs at once)
+  cancel-in-progress: false    # the next run QUEUES behind the running one (no two tabs at once)
 
 jobs:
   keep-open:
