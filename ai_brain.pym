@@ -2596,38 +2596,114 @@ def _is_explicit_trade_request(text: str) -> bool:
 
 
 def _clean_for_speech(text: str) -> str:
-    """Strips markdown symbols (*, #, `, bullet dashes) before sending text
-    to TTS, so the voice doesn't read out literal asterisks/hashes."""
-    text = re.sub(r'[*_#`]', '', text)
+    """Strips markdown symbols, links and emoji before sending text to TTS (so the voice does not read out asterisks/hashes/emoji),
+    and turns line breaks into sentence pauses so the voice does not run bullet points together."""
+    text = re.sub(r'https?://\S+', ' ', text or "")
+    text = re.sub(r'[\U00010000-\U0010ffff\u2600-\u27bf\u2b00-\u2bff\ufe0f\u200d]', '', text)
+    text = re.sub(r'[*_#`>|~]', ' ', text)
     text = re.sub(r'^\s*[-•]\s*', '', text, flags=re.MULTILINE)
-    return text
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    joined = ""
+    for ln in lines:
+        joined += ln if ln[-1] in ".!?:;,।" else ln + "."
+        joined += " "
+    return re.sub(r'\s{2,}', ' ', joined).strip()
+
+
+_TTS_MAX_CHARS = 4000
+_TTS_VOICES_DEVANAGARI = ("hi-IN-MadhurNeural", "hi-IN-SwaraNeural")
+_TTS_VOICES_ROMAN = ("en-IN-PrabhatNeural", "en-IN-NeerjaNeural", "hi-IN-MadhurNeural")
+
+
+def _speech_chunks(text: str, size: int = 600):
+    """Short pieces (cut at sentence ends) so one slow / failed piece never kills the whole voice."""
+    text = text[:_TTS_MAX_CHARS]
+    parts, cur = [], ""
+    for sent in re.split(r'(?<=[.!?।])\s+', text):
+        if cur and len(cur) + len(sent) + 1 > size:
+            parts.append(cur)
+            cur = ""
+        cur = (cur + " " + sent).strip()
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+async def _collect_audio(text: str, voice: str, rate: str) -> bytes:
+    audio = b""
+    async for chunk in edge_tts.Communicate(text=text, voice=voice, rate=rate).stream():
+        if chunk["type"] == "audio":
+            audio += chunk["data"]
+    return audio
 
 
 async def _generate_speech_bytes(text: str) -> bytes:
-    """Natural, human-sounding Hindi male voice (Microsoft Edge Neural TTS,
-    free, no API key). '+12%' rate makes it speak a bit faster/livelier
-    than the default pace, closer to how a person actually talks."""
-    communicate = edge_tts.Communicate(text=text, voice="hi-IN-MadhurNeural", rate="+12%")
-    audio_bytes = b""
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            audio_bytes += chunk["data"]
-    return audio_bytes
+    """Natural Microsoft Edge Neural voice (free, no API key).  Devanagari text -> Hindi voice; Roman (English / Hinglish) text -> Indian-English
+    neural voice (a Hindi voice spells English words badly).  Every piece is retried once and has a timeout; if a voice fails the next voice
+    is tried."""
+    voices = _TTS_VOICES_DEVANAGARI if re.search(r'[\u0900-\u097F]', text) else _TTS_VOICES_ROMAN
+    last_exc = None
+    for voice in voices:
+        try:
+            audio = b""
+            for piece in _speech_chunks(text):
+                got = b""
+                for _attempt in range(2):
+                    try:
+                        got = await asyncio.wait_for(_collect_audio(piece, voice, "+8%"), timeout=30)
+                        if got:
+                            break
+                    except Exception as exc:
+                        last_exc = exc
+                if not got:
+                    raise RuntimeError(f"voice {voice}: no audio for a piece ({type(last_exc).__name__ if last_exc else 'empty'})")
+                audio += got
+            if audio:
+                return audio
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("TTS voice %s failed: %s", voice, exc)
+    raise RuntimeError(f"TTS failed: {type(last_exc).__name__ if last_exc else 'no audio'}: {last_exc}")
+
+
+def _browser_speak(text: str):
+    """Fallback when the server voice is unavailable: a Play button that reads the text with the voice of the viewer's own device/browser
+    (Hindi or Indian-English voice if the device has one)."""
+    import json
+    import streamlit.components.v1 as components
+    payload = json.dumps(text[:_TTS_MAX_CHARS]).replace("</", "<\\/")
+    components.html(
+        "<button id='b' style='padding:8px 16px;border-radius:8px;border:0;background:#22d3ee;color:#05060d;font-weight:600;cursor:pointer'>"
+        "🔊 Awaaz sunao</button><script>const t=" + payload + ";document.getElementById('b').onclick=function(){speechSynthesis.cancel();"
+        "const u=new SpeechSynthesisUtterance(t);const v=speechSynthesis.getVoices();"
+        "const p=v.find(x=>/hi-IN/i.test(x.lang))||v.find(x=>/en-IN/i.test(x.lang))||v.find(x=>/^en/i.test(x.lang));"
+        "if(p){u.voice=p;u.lang=p.lang;}else{u.lang='en-IN';}u.rate=1.0;speechSynthesis.speak(u);};</script>",
+        height=48,
+    )
 
 
 def _speak(text: str):
-    """Renders an audio player for the given text using the natural Hindi
-    voice. Safe to call from inside a normal (sync) Streamlit script."""
+    """Renders an audio player for the given text (server neural voice; browser voice button if that fails).
+    Safe to call from inside a normal (sync) Streamlit script."""
+    clean_text = _clean_for_speech(text)
+    if not clean_text.strip():
+        return
     try:
-        clean_text = _clean_for_speech(text)
-        if not clean_text.strip():
-            return
-        audio_bytes = asyncio.run(_generate_speech_bytes(clean_text))
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            audio_bytes = ex.submit(lambda: asyncio.run(_generate_speech_bytes(clean_text))).result(timeout=150)
         if audio_bytes:
             st.audio(io.BytesIO(audio_bytes), format="audio/mp3")
+            return
+        raise RuntimeError("empty audio")
     except Exception:
-        logger.exception("Broad exception caught; fallback path executed")
-        st.caption("🔇 Awaaz generate nahi ho payi is baar -- text jawab upar hai.")
+        logger.exception("Server TTS failed; browser voice button used instead")
+        try:
+            _browser_speak(clean_text)
+            st.caption("🔇 Server wali awaaz abhi nahi bani -- upar wale button se apne device ki awaaz mein sun sakte ho.")
+        except Exception:
+            logger.exception("Browser TTS fallback failed")
+            st.caption("🔇 Awaaz generate nahi ho payi is baar -- text jawab upar hai.")
 
 
 SYSTEM_PREAMBLE = """You are a trading-desk research assistant embedded inside a live Nifty 50 dashboard.
