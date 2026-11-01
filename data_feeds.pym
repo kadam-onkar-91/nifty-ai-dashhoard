@@ -1,0 +1,2496 @@
+# data_feeds.pym -- module bundle: Live data: candles, option chain, breadth, order flow, global markets/news/research, events, live chart
+# Each section between '# @@MODULE name' and '# @@END name' is the ORIGINAL module source, unchanged.
+# bundle_loader.py imports every section as its own module (same import names as before).
+# Modules in this bundle: market_data, option_chain, market_breadth, order_flow, global_markets, global_news, global_research, news_rss, event_calendar, live_chart, index_correlation
+# @@MODULE market_data
+from app_logging import get_logger
+logger = get_logger(__name__)
+import pandas as pd
+import requests
+import urllib.parse
+import yfinance as yf
+from xgboost import XGBClassifier
+from datetime import datetime, timedelta
+import indicators  # Custom indicators module
+
+NIFTY_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
+
+
+def _load_upstox_nifty_future_key():
+    """Finds the current near-month Nifty 50 index futures contract from
+    Upstox's official instrument master. Returns (instrument_key_or_None,
+    debug_reason).
+
+    Why this exists: NSE_INDEX|Nifty 50 (the spot index) genuinely has
+    ZERO traded volume in Upstox's own data -- an index isn't a
+    tradeable instrument, only its derivatives are. So any "Volume
+    Profile" or volume-weighted VWAP built purely on the spot index
+    candles is, by definition, not really volume-weighted (this app's
+    existing code already correctly falls back to a price-based proxy
+    when Volume sums to zero -- that fallback was NOT a bug, it was the
+    honest thing to do given zero real volume). The standard real fix,
+    same as what professional platforms do for index order-flow
+    analysis, is to use the near-month INDEX FUTURES contract instead --
+    futures are genuinely, continuously traded and carry real volume.
+    """
+    try:
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
+        df = pd.read_csv(url, compression="gzip")
+
+        if 'segment' not in df.columns or 'instrument_type' not in df.columns:
+            return None, f"Instrument master missing expected columns: {list(df.columns)}"
+
+        fo_df = df[df['segment'].astype(str).str.upper() == 'NSE_FO']
+        fo_df = fo_df[fo_df['instrument_type'].astype(str).str.upper() == 'FUTIDX']
+
+        # Match the NIFTY (not BANKNIFTY/FINNIFTY/MIDCPNIFTY) index future.
+        # Prefer an exact 'name' column match if present (most reliable);
+        # fall back to a tradingsymbol pattern that requires digits right
+        # after "NIFTY" (e.g. NIFTY24MARFUT) so it can't accidentally match
+        # NIFTYNXT50FUT or similar.
+        nifty_rows = pd.DataFrame()
+        if 'name' in fo_df.columns:
+            candidate = fo_df[fo_df['name'].astype(str).str.upper() == 'NIFTY']
+            if not candidate.empty:
+                nifty_rows = candidate
+        if nifty_rows.empty and 'tradingsymbol' in fo_df.columns:
+            candidate = fo_df[fo_df['tradingsymbol'].astype(str).str.match(r'^NIFTY\d', na=False)]
+            if not candidate.empty:
+                nifty_rows = candidate
+
+        if nifty_rows.empty:
+            return None, f"No NIFTY FUTIDX rows matched (found {len(fo_df)} other index futures)"
+
+        if 'expiry' in nifty_rows.columns:
+            nifty_rows = nifty_rows.copy()
+            nifty_rows['expiry_parsed'] = pd.to_datetime(nifty_rows['expiry'], errors='coerce')
+            nifty_rows = nifty_rows.dropna(subset=['expiry_parsed']).sort_values('expiry_parsed')
+            upcoming = nifty_rows[nifty_rows['expiry_parsed'] >= pd.Timestamp.now().normalize()]
+            nifty_rows = upcoming if not upcoming.empty else nifty_rows
+
+        if nifty_rows.empty or 'instrument_key' not in nifty_rows.columns:
+            return None, "Matched NIFTY future rows but couldn't resolve a valid near-month instrument_key"
+
+        return nifty_rows.iloc[0]['instrument_key'], "OK"
+    except Exception as e:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None, f"Futures instrument lookup failed: {type(e).__name__}: {e}"
+
+
+def get_nifty_futures_instrument_key():
+    """Public wrapper -- PHASE 3's order_flow.py needs the same near-month
+    NIFTY futures instrument_key this module already resolves for real
+    volume, so it's exposed here instead of duplicating the instrument
+    master lookup logic in a second file."""
+    key, _debug = _load_upstox_nifty_future_key()
+    return key
+
+
+def fetch_nifty_futures_volume(access_token):
+    """Real traded Volume from the near-month Nifty futures contract, as a
+    Timestamp-indexed Series. Returns None if unavailable for any reason
+    (no access token, lookup failure, no candles) -- callers should treat
+    that as 'no real volume available' and keep using the existing
+    price-based proxy, not raise an error."""
+    if not access_token:
+        return None
+    fut_key, _debug = _load_upstox_nifty_future_key()
+    if not fut_key:
+        return None
+    fut_df = _fetch_upstox_candles(access_token, instrument_key=fut_key)
+    if fut_df is None or fut_df.empty or 'Volume' not in fut_df.columns:
+        return None
+    return fut_df['Volume']
+
+
+def fetch_candles_for_timeframe(access_token, unit, interval, days_back=5, instrument_key=NIFTY_INSTRUMENT_KEY):
+    """Public wrapper -- PHASE 4's multi_timeframe.py needs real candles at
+    several different unit/interval combinations (1D, 1H, 30M, 15M, 5M),
+    so it reuses this module's existing, already-fixed V3 candle fetch
+    instead of duplicating the historical+intraday stitching logic."""
+    return _fetch_upstox_candles(access_token, instrument_key=instrument_key, unit=unit, interval=interval, days_back=days_back)
+
+
+def _fetch_upstox_ltp(access_token, instrument_key=NIFTY_INSTRUMENT_KEY):
+    """Real live LTP from Upstox. Previously this hardcoded the response
+    dict key as 'NSE_Index:Nifty 50' (wrong case -- Upstox actually returns
+    'NSE_INDEX:Nifty 50'), so the lookup silently KeyError'd and fell
+    through to the except-pass every single time, even when the request
+    itself succeeded. Now we just take the first (only) value returned,
+    the same safe pattern used elsewhere in this app."""
+    try:
+        encoded_key = urllib.parse.quote(instrument_key, safe='')
+        url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={encoded_key}"
+        headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+        _resp = requests.get(url, headers=headers, timeout=6)
+        if _resp.status_code == 401:            # v51: expired / revoked token -> drop it now (see upstox_auth.mark_invalid)
+            try:
+                import upstox_auth
+                upstox_auth.mark_invalid(access_token)
+            except Exception:
+                pass
+            return None
+        res = _resp.json()
+        if res.get('status') != 'success':
+            return None
+        data = res.get('data', {})
+        match = next(iter(data.values()), None)
+        if match is None or match.get('last_price') is None:
+            return None
+        return float(match['last_price'])
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None
+
+
+def _fetch_upstox_candles(access_token, instrument_key=NIFTY_INSTRUMENT_KEY, unit="minutes", interval="5", days_back=5):
+    """Real live 5-minute candles from Upstox.
+
+    Previously this called the V2 `/historical-candle/.../5minute/...`
+    endpoint -- but the V2 historical-candle API does NOT support a
+    '5minute' interval at all (V2 only supports 1minute, 30minute, day,
+    week, month), so every request here returned an error and silently
+    fell back to Yahoo Finance. Fixed by using the V3 historical-candle
+    API (which supports custom minute intervals) for past days, combined
+    with the V3 intraday-candle API for today's live candles -- both
+    using the correct 'NSE_INDEX' instrument key casing (the old code
+    used 'NSE_Index', also wrong)."""
+    if not access_token:
+        return None
+    encoded_key = urllib.parse.quote(instrument_key, safe='')
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+    candles = []
+
+    # Past days, up to (not including) today
+    try:
+        to_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        hist_url = f"https://api.upstox.com/v3/historical-candle/{encoded_key}/{unit}/{interval}/{to_date}/{from_date}"
+        res = requests.get(hist_url, headers=headers, timeout=8)
+        res_json = res.json()
+        if res_json.get('status') == 'success':
+            candles.extend(res_json.get('data', {}).get('candles', []))
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        pass
+
+    # Today's live/intraday candles
+    try:
+        intraday_url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/{unit}/{interval}"
+        res = requests.get(intraday_url, headers=headers, timeout=8)
+        res_json = res.json()
+        if res_json.get('status') == 'success':
+            candles.extend(res_json.get('data', {}).get('candles', []))
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        pass
+
+    if not candles:
+        return None
+
+    df = pd.DataFrame(candles, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+    df.drop_duplicates(subset='Timestamp', inplace=True)
+    df.sort_values('Timestamp', inplace=True)
+    df.set_index('Timestamp', inplace=True)
+    return df
+
+
+def fetch_live_market_data(access_token):
+    df = None
+    live_price = None
+
+    # Step 1: Try fetching data from Upstox API (real, live, broker feed)
+    if access_token:
+        live_price = _fetch_upstox_ltp(access_token)
+        df = _fetch_upstox_candles(access_token)
+
+    # Step 2: Fallback to Yahoo Finance if Upstox fails or returns empty
+    market_source = "UPSTOX_LIVE" if (df is not None and not df.empty and live_price is not None) else "UNAVAILABLE"
+
+    if df is None or df.empty:
+        # Dashboard-only fallback. It is explicitly marked non-tradable so no
+        # strategy/AI decision can mistake Yahoo data for the authenticated
+        # Upstox feed requested by the trading engine.
+        df = yf.download("^NSEI", period="5d", interval="5m", progress=False)
+        market_source = "YAHOO_FALLBACK_NON_TRADABLE"
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if 'Adj Close' in df.columns:
+            df.drop(columns=['Adj Close'], inplace=True)
+        if not df.empty:
+            live_price = float(df['Close'].iloc[-1])
+
+    if df is None or df.empty:
+        return None, None, [], None
+
+    # Step 3: Base columns & Technical Indicators calculation
+    # Never fabricate volume. NIFTY spot can legitimately have zero volume;
+    # app.py may replace it with the real near-month NIFTY futures volume.
+    df['Volume'] = df.get('Volume', 0.0)
+    df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0.0)
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    
+    # ATR Calculation
+    df['High-Low'] = df['High'] - df['Low']
+    df['High-PrevClose'] = abs(df['High'] - df['Close'].shift(1))
+    df['Low-PrevClose'] = abs(df['Low'] - df['Close'].shift(1))
+    df['TR'] = df[['High-Low', 'High-PrevClose', 'Low-PrevClose']].max(axis=1)
+    df['ATR'] = df['TR'].ewm(span=14, adjust=False).mean().fillna(df['Close'] * 0.01)
+
+    # Safely calculate additional indicators from indicators.py module
+    try:
+        df['RSI'] = indicators.calculate_rsi(df, period=14).fillna(50)
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        df['RSI'] = 50
+
+    try:
+        df['MACD'], df['MACD_Signal'], df['MACD_Hist'] = indicators.calculate_macd(df)
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        df['MACD'], df['MACD_Signal'], df['MACD_Hist'] = 0, 0, 0
+
+    try:
+        df['BB_Upper'], df['BB_Middle'], df['BB_Lower'] = indicators.calculate_bollinger_bands(df, period=20)
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        df['BB_Upper'], df['BB_Middle'], df['BB_Lower'] = df['Close'], df['Close'], df['Close']
+
+    # -------------------------------------------------------------
+    # 🚀 ADVANCED MEMORY FEATURES (Giving model past candles context)
+    # -------------------------------------------------------------
+    df['Close_Lag1'] = df['Close'].shift(1)
+    df['Close_Lag2'] = df['Close'].shift(2)
+    df['RSI_Lag1'] = df['RSI'].shift(1)
+    df['MACD_Lag1'] = df['MACD'].shift(1)
+    # -------------------------------------------------------------
+
+    # Clean up missing values WITHOUT using future candles.
+    # bfill() is forbidden here because it can copy a future candle's
+    # indicator value backwards into an earlier observation (look-ahead bias).
+    # Forward-fill is causal; the remaining warm-up NaNs are neutralized only
+    # after the causal fill.
+    df.ffill(inplace=True)
+    df.fillna(0, inplace=True)
+
+    # Step 4: Safe Live Price Injection using .iloc (No KeyError)
+    if live_price is not None and not df.empty:
+        try:
+            df.iloc[-1, df.columns.get_loc('Close')] = live_price
+        except Exception:
+            logger.exception("Broad exception caught; fallback path executed")
+            pass
+
+    # Step 5: Advanced Machine Learning Setup (XGBoost + Memory)
+    df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
+    model_df = df.iloc[:-1].copy()
+
+    # Expanded feature list including memory lag columns
+    feature_cols = [
+        'EMA_20', 'EMA_50', 'ATR', 'RSI', 'MACD', 
+        'BB_Upper', 'BB_Lower', 'Close_Lag1', 'Close_Lag2', 
+        'RSI_Lag1', 'MACD_Lag1'
+    ]
+    feature_cols = [col for col in feature_cols if col in model_df.columns]
+    
+    if not feature_cols:
+        model_df['Dummy_Feature'] = model_df['Close'].pct_change().fillna(0)
+        feature_cols = ['Dummy_Feature']
+
+    X = model_df[feature_cols]
+    y = model_df['Target']
+
+    # Train Advanced XGBoost Model with Regularization & Memory
+    model = XGBClassifier(
+        n_estimators=150,        # More trees for deeper pattern matching
+        max_depth=4,             # Optimized depth to prevent fake noise/overfitting
+        learning_rate=0.03,      # Gradual learning for high accuracy
+        subsample=0.8,           # Random sampling for robustness
+        colsample_bytree=0.8,    # Feature diversity
+        random_state=42,
+        eval_metric='logloss'
+    )
+    model.fit(X, y)
+    
+    # Persist source metadata on the dataframe without changing the public
+    # four-value return contract used throughout the dashboard.
+    df.attrs['market_source'] = market_source
+    df.attrs['live_upstox'] = market_source == 'UPSTOX_LIVE'
+    df.attrs['live_price_source'] = 'UPSTOX_LTP' if market_source == 'UPSTOX_LIVE' else market_source
+    return df, model, feature_cols, live_price
+
+
+_DAILY_CACHE = {"ts": 0.0, "df": None}
+DAILY_CACHE_SECONDS = 1800   # daily candles barely change intraday; refresh every 30 min (saves API quota)
+
+
+def fetch_daily_candles(access_token=None, days_back=180):
+    """Daily NIFTY candles (~6 months) for REAL support/resistance:
+    previous-day / previous-week / previous-month H/L and daily swing points.
+    The 5-minute frame only holds ~5 days, which is not enough for those.
+
+    Tries Upstox first, then Yahoo (^NSEI). Returns a DataFrame indexed by date
+    with Open/High/Low/Close, or None if nothing is available -- never fabricated.
+    Cached for DAILY_CACHE_SECONDS."""
+    import time as _t
+    now = _t.time()
+    if _DAILY_CACHE["df"] is not None and now - _DAILY_CACHE["ts"] < DAILY_CACHE_SECONDS:
+        return _DAILY_CACHE["df"]
+    df = None
+    if access_token:
+        try:
+            df = _fetch_upstox_candles(access_token, unit="days", interval="1", days_back=days_back)
+        except Exception:
+            logger.exception("Upstox daily candles failed")
+            df = None
+        if df is not None and not df.empty:
+            try:
+                df = df[["Open", "High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce").dropna()
+                df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+                df = df[~df.index.duplicated(keep="last")]
+            except Exception:
+                logger.exception("Upstox daily candle cleanup failed")
+                df = None
+    if df is None or df.empty or len(df) < 20:
+        try:
+            y = yf.download("^NSEI", period="6mo", interval="1d", progress=False)
+            if isinstance(y.columns, pd.MultiIndex):
+                y.columns = y.columns.get_level_values(0)
+            y = y[["Open", "High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce").dropna()
+            y.index = pd.to_datetime(y.index).tz_localize(None).normalize()
+            df = y if not y.empty else None
+        except Exception:
+            logger.exception("Yahoo daily candles failed")
+            df = None
+    if df is not None and not df.empty:
+        _DAILY_CACHE["ts"] = now
+        _DAILY_CACHE["df"] = df
+    return df
+# @@END market_data
+# @@MODULE option_chain
+from app_logging import get_logger
+logger = get_logger(__name__)
+import math
+import requests
+import urllib.parse
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import streamlit as st
+from datetime import datetime, timedelta
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_available_expiries(access_token, instrument_key):
+    """Real list of currently-tradeable expiry dates straight from Upstox's
+    own option-contract master, instead of guessing a weekday. This is the
+    authoritative source -- it's correct even across NSE expiry-day rule
+    changes, holidays, and monthly/quarterly contract weeks."""
+    if not access_token:
+        return None
+    try:
+        encoded_key = urllib.parse.quote(instrument_key, safe='')
+        url = f"https://api.upstox.com/v2/option/contract?instrument_key={encoded_key}"
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
+        res = requests.get(url, headers=headers, timeout=8)
+        res_json = res.json()
+        if res_json.get("status") != "success":
+            return None
+        data = res_json.get("data", [])
+        expiries = sorted({item.get("expiry") for item in data if item.get("expiry")})
+        return expiries or None
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None
+
+
+def get_valid_expiry(access_token=None, instrument_key="NSE_INDEX|Nifty 50"):
+    """Picks the nearest upcoming real expiry. Tries the live Upstox
+    contract list first (always correct). Only if that's unavailable
+    (not logged in / API down) does it fall back to a computed guess.
+
+    IMPORTANT: the old fallback guessed "next Thursday" -- that was the
+    Nifty weekly expiry day until 31 Aug 2025. Since 1 Sept 2025, NSE
+    moved Nifty 50 weekly options expiry to TUESDAY (SEBI-mandated
+    exchange derivatives-expiry standardization). Guessing Thursday meant
+    every fallback request asked Upstox for a strike chain on a day with
+    no contract, which came back empty and silently forced the app onto
+    the SIMULATED chain -- even for users who were logged in, if the
+    contract-list call itself hiccuped.
+    """
+    expiries = _fetch_available_expiries(access_token, instrument_key) if access_token else None
+    if expiries:
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        upcoming = [e for e in expiries if e >= today_str]
+        if upcoming:
+            return upcoming[0]
+
+    today = datetime.now()
+    days_ahead = 1 - today.weekday()  # Tuesday = 1 (Mon=0, Tue=1, ...)
+    if days_ahead <= 0:
+        days_ahead += 7
+    next_tuesday = today + timedelta(days=days_ahead)
+    return next_tuesday.strftime('%Y-%m-%d')
+
+
+# -------------------------------------------------------------------
+# REAL Black-Scholes Greeks (used only for the SIMULATED fallback chain
+# below, when the live Upstox option chain isn't available). Previously
+# every single strike showed the exact same hardcoded Vega=10.5,
+# Delta=0.5, Theta=-5.2, IV=14.5% regardless of strike or moneyness --
+# that was fake. This computes real Greeks from the actual spot price,
+# real time-to-expiry, and the live India VIX as the IV estimate.
+# -------------------------------------------------------------------
+def _norm_pdf(x):
+    return math.exp(-x * x / 2.0) / math.sqrt(2 * math.pi)
+
+
+def _norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _bs_greeks(S, K, T, sigma, r=0.065, option_type="call"):
+    """Black-Scholes Greeks. T = years to expiry, sigma = IV as a decimal."""
+    if T <= 0:
+        T = 1.0 / 365.0
+    if sigma <= 0:
+        sigma = 0.12
+    try:
+        d1 = (math.log(S / K) + (r + sigma ** 2 / 2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        if option_type == "call":
+            delta = _norm_cdf(d1)
+            theta = (-(S * _norm_pdf(d1) * sigma) / (2 * math.sqrt(T))
+                     - r * K * math.exp(-r * T) * _norm_cdf(d2)) / 365.0
+        else:
+            delta = _norm_cdf(d1) - 1.0
+            theta = (-(S * _norm_pdf(d1) * sigma) / (2 * math.sqrt(T))
+                     + r * K * math.exp(-r * T) * _norm_cdf(-d2)) / 365.0
+        vega = S * _norm_pdf(d1) * math.sqrt(T) / 100.0
+        return round(delta, 4), round(theta, 2), round(vega, 2)
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return 0.5, -5.0, 10.0
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _get_estimated_iv():
+    """Real India VIX from Yahoo Finance, used as the IV estimate instead
+    of a hardcoded 14.5% for every strike."""
+    try:
+        vix_hist = yf.Ticker("^INDIAVIX").history(period="2d")
+        if not vix_hist.empty:
+            return float(vix_hist['Close'].iloc[-1]) / 100.0
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        pass
+    return 0.13  # sane fallback only if VIX itself is unreachable
+
+
+# =====================================================================
+# PHASE 2 — Deep Option Chain: ATM±15 window, IV skew, IV percentile
+# =====================================================================
+
+def get_atm_window(df_option_chain, spot, n_strikes=15, strike_step=50):
+    """Strict ATM±15-strike window for deep option chain analysis (skew,
+    OI concentration), separate from the wider NTM_BAND used for the
+    main PCR/footprint calc above -- that one intentionally stays wider
+    since summing more strikes is fine for a simple OI ratio, but a
+    proper skew read should stay tight around the money."""
+    if df_option_chain is None or df_option_chain.empty:
+        return df_option_chain
+    band = n_strikes * strike_step
+    window = df_option_chain[(df_option_chain['Strike'] >= spot - band) & (df_option_chain['Strike'] <= spot + band)]
+    return window if not window.empty else df_option_chain
+
+
+def calculate_iv_skew(df_option_chain, spot, strike_step=50):
+    """
+    25-delta-ish IV skew proxy: compares IV of an OTM strike below spot
+    (downside/put-side protection, ~5% OTM) against an OTM strike above
+    spot (upside/call-side, ~5% OTM), using the SAME 'IV (%)' column
+    already populated from real Upstox Greeks (LIVE) or Black-Scholes on
+    real VIX (SIMULATED) -- no separate/fake IV series.
+
+    Positive skew (downside IV > upside IV) is normal/expected for index
+    options -- it reflects real-world demand for downside hedges. A
+    skew that's unusually flat or inverted is itself informative (complacency
+    or aggressive call-side speculation), which is why this is reported as
+    a number + a plain-language read, not just a yes/no flag.
+    """
+    if df_option_chain is None or df_option_chain.empty or 'IV (%)' not in df_option_chain.columns:
+        return None
+
+    window = get_atm_window(df_option_chain, spot, n_strikes=15, strike_step=strike_step)
+    target_dn = round((spot * 0.95) / strike_step) * strike_step
+    target_up = round((spot * 1.05) / strike_step) * strike_step
+
+    def _nearest_iv(target_strike):
+        if window.empty:
+            return None
+        idx = (window['Strike'] - target_strike).abs().idxmin()
+        row = window.loc[idx]
+        iv = row.get('IV (%)')
+        if iv is None or iv == 0:
+            return None
+        return float(iv), float(row['Strike'])
+
+    dn = _nearest_iv(target_dn)
+    up = _nearest_iv(target_up)
+    if dn is None or up is None:
+        return None
+
+    dn_iv, dn_strike = dn
+    up_iv, up_strike = up
+    skew = round(dn_iv - up_iv, 2)
+
+    if skew > 1.5:
+        read = f"Normal put skew (downside IV {dn_iv}% > upside IV {up_iv}%) -- real demand for downside protection, typical index behaviour"
+    elif skew < -1.5:
+        read = f"Inverted/call skew (upside IV {up_iv}% > downside IV {dn_iv}%) -- unusual; often reflects aggressive upside speculation or a short-squeeze setup building"
+    else:
+        read = f"Flat skew (downside IV {dn_iv}% ≈ upside IV {up_iv}%) -- no strong directional hedging bias priced in either wing right now"
+
+    return {
+        "downside_strike": dn_strike, "downside_iv": dn_iv,
+        "upside_strike": up_strike, "upside_iv": up_iv,
+        "skew": skew, "read": read
+    }
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_vix_history(period="1y"):
+    try:
+        hist = yf.Ticker("^INDIAVIX").history(period=period)
+        if hist.empty:
+            return None
+        return hist['Close'].dropna()
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None
+
+
+def get_iv_percentile(current_iv_pct=None):
+    """
+    Real IV percentile using 1-year of actual India VIX history (India
+    VIX IS the market's own real-time implied-vol-of-Nifty-options gauge
+    -- it's the standard, honest proxy here since there's no free public
+    source of a full historical option-IV surface). Returns None (never
+    a fabricated number) if VIX history is unavailable.
+    """
+    hist = _get_vix_history()
+    if hist is None or len(hist) < 30:
+        return None
+    current = current_iv_pct if current_iv_pct is not None else float(hist.iloc[-1])
+    percentile = float((hist < current).sum()) / len(hist) * 100
+    percentile = round(percentile, 1)
+
+    if percentile >= 80:
+        read = f"IV percentile {percentile}% -- expensive/elevated vs the last year, options are pricing in real fear -- premium SELLING setups favoured"
+    elif percentile <= 20:
+        read = f"IV percentile {percentile}% -- cheap vs the last year, options are unusually calm -- premium BUYING setups favoured"
+    else:
+        read = f"IV percentile {percentile}% -- mid-range vs the last year, no strong edge from volatility pricing alone"
+
+    return {"percentile": percentile, "current_iv": round(current, 2), "read": read}
+
+
+def get_mock_option_chain(spot=24250.0):
+    """
+    SIMULATED fallback chain -- used when there's no live Upstox login/data.
+    Greeks are now real Black-Scholes math (live spot, live VIX-based IV,
+    real time-to-expiry). Open Interest is still a modelled estimate (no
+    public free real-time OI source exists without a broker connection) --
+    this is disclosed to the user via the "SIMULATED" source flag returned
+    by generate_option_chain_data(), not hidden.
+    """
+    sigma = _get_estimated_iv()
+    expiry_str = get_valid_expiry()
+    try:
+        expiry_dt = datetime.strptime(expiry_str, '%Y-%m-%d')
+        T = max((expiry_dt - datetime.now()).days, 1) / 365.0
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        T = 7 / 365.0
+
+    strikes = [spot - 200, spot - 150, spot - 100, spot - 50, spot, spot + 50, spot + 100, spot + 150, spot + 200]
+    parsed_rows = []
+    for strike in strikes:
+        strike = round(strike / 50) * 50
+        if abs(strike - spot) < 30:
+            opt_type = "ATM"
+            call_oi = 100000
+            put_oi = 100000
+        elif strike < spot:
+            opt_type = "ITM"
+            call_oi = int(10000 + (spot - strike) * 100)
+            put_oi = int(20000 + (spot - strike) * 150)
+        else:
+            opt_type = "OTM"
+            call_oi = int(20000 + (strike - spot) * 150)
+            put_oi = int(10000 + (strike - spot) * 100)
+
+        delta, theta, vega = _bs_greeks(spot, strike, T, sigma, option_type="call")
+
+        parsed_rows.append({
+            "Strike": strike,
+            "Type": opt_type,
+            "Call OI": call_oi,
+            "Vega": vega,
+            "Put OI": put_oi,
+            "IV (%)": round(sigma * 100, 2),
+            "Delta": delta,
+            "Theta": theta,
+            "PCR": round(put_oi / call_oi, 2)
+        })
+    return pd.DataFrame(parsed_rows)
+
+
+def generate_option_chain_data(current_price=None):
+    """
+    Returns (df_option_chain, source) where source is "LIVE" (real Upstox
+    option chain with real OI/Greeks) or "SIMULATED" (Black-Scholes
+    estimate, disclosed -- see get_mock_option_chain). Previously this
+    silently returned a mock table with no way for the UI to tell the
+    difference from live data.
+    """
+    possible_keys = ['access_token', 'UPSTOX_ACCESS_TOKEN', 'token', 'upstox_token', 'auth_token']
+    access_token = None
+
+    for key in possible_keys:
+        if key in st.session_state and st.session_state[key]:
+            access_token = st.session_state[key]
+            break
+
+    spot = current_price if current_price else 24250.0
+
+    if not access_token:
+        return get_mock_option_chain(spot), "SIMULATED"
+
+    instrument_key = "NSE_INDEX|Nifty 50"
+    expiry_date = get_valid_expiry(access_token, instrument_key)
+
+    url = "https://api.upstox.com/v2/option/chain"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
+    params = {
+        "instrument_key": instrument_key,
+        "expiry_date": expiry_date
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=8)
+        if response.status_code == 200:
+            res_json = response.json()
+            data_list = res_json.get('data', [])
+
+            if data_list:
+                parsed_rows = []
+                for item in data_list:
+                    strike = item.get('strike_price', 0)
+
+                    call_options = item.get('call_options', {})
+                    call_market = call_options.get('market_data', {})
+                    call_greeks = call_options.get('option_greeks', {})
+                    call_oi = call_market.get('oi', 0)
+                    call_prev_oi = call_market.get('prev_oi', 0) or 0   # yesterday's closing OI (used by oi_buildup.py)
+
+                    put_options = item.get('put_options', {})
+                    put_market = put_options.get('market_data', {})
+                    put_oi = put_market.get('oi', 0)
+                    put_prev_oi = put_market.get('prev_oi', 0) or 0
+
+                    if abs(strike - spot) < 30:
+                        opt_type = "ATM"
+                    elif strike < spot:
+                        opt_type = "ITM"
+                    else:
+                        opt_type = "OTM"
+
+                    pcr = round(put_oi / call_oi, 2) if call_oi > 0 else 0.0
+
+                    parsed_rows.append({
+                        "Strike": strike,
+                        "Type": opt_type,
+                        "Call OI": call_oi,
+                        "Vega": call_greeks.get('vega', 0.0),
+                        "Put OI": put_oi,
+                        "Call Prev OI": call_prev_oi,
+                        "Put Prev OI": put_prev_oi,
+                        "IV (%)": call_greeks.get('iv', 0.0),
+                        "Delta": call_greeks.get('delta', 0.0),
+                        "Theta": call_greeks.get('theta', 0.0),
+                        "PCR": pcr
+                    })
+
+                df = pd.DataFrame(parsed_rows)
+                if not df.empty:
+                    # Restrict to a realistic near-the-money strike band before
+                    # returning. Upstox's /option/chain endpoint returns EVERY
+                    # listed strike for the expiry -- often 2000+ points deep
+                    # ITM/OTM on both sides. At those far strikes, Call OI is
+                    # frequently near-zero (nobody trades deep-ITM calls) while
+                    # the matching far-OTM Put OI stays substantial (hedging
+                    # positions accumulate there). Summing PCR across the FULL
+                    # unrestricted chain let that imbalance compound strike
+                    # after strike, producing PCR values like 184 instead of
+                    # the realistic ~0.5-1.5 range -- a real distortion, not a
+                    # decimal/formatting bug. Standard PCR (NSE, brokers) is
+                    # always computed on a near-the-money band, not the whole
+                    # chain, so this filter brings the number back in line
+                    # with what every other platform reports.
+                    NTM_BAND = 1000
+                    df = df[(df['Strike'] >= spot - NTM_BAND) & (df['Strike'] <= spot + NTM_BAND)]
+                    if not df.empty:
+                        return df.sort_values(by="Strike"), "LIVE"
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        pass
+
+    # Live API failed (e.g. weekend, market closed, token expired) -->
+    # fall back to the disclosed simulated chain, never silently.
+    return get_mock_option_chain(spot), "SIMULATED"
+
+
+def calculate_max_pain(df_option_chain):
+    try:
+        if df_option_chain is None or df_option_chain.empty:
+            return 24250.0
+        df = df_option_chain.reset_index(drop=True)
+        strikes = df['Strike'].values
+        call_oi = df['Call OI'].values if 'Call OI' in df.columns else np.zeros(len(strikes))
+        put_oi = df['Put OI'].values if 'Put OI' in df.columns else np.zeros(len(strikes))
+
+        total_pain = {}
+        for expiry_price in strikes:
+            pain = 0
+            for i, strike in enumerate(strikes):
+                if expiry_price > strike:
+                    pain += (expiry_price - strike) * call_oi[i]
+                if expiry_price < strike:
+                    pain += (strike - expiry_price) * put_oi[i]
+            total_pain[expiry_price] = pain
+
+        if not total_pain:
+            return 24250.0
+        return float(min(total_pain, key=total_pain.get))
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return 24250.0
+
+
+def get_fii_dii_fo_footprint(df_option_chain):
+    try:
+        if df_option_chain is None or df_option_chain.empty:
+            return "NEUTRAL", 1.0
+        df = df_option_chain.reset_index(drop=True)
+        total_call_oi = df['Call OI'].sum() if 'Call OI' in df.columns else 1
+        total_put_oi = df['Put OI'].sum() if 'Put OI' in df.columns else 0
+        pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 1.0
+
+        if pcr > 1.2:
+            footprint = "BULLISH (FIIs Writing Puts / Accumulating Longs)"
+        elif pcr < 0.8:
+            footprint = "BEARISH (FIIs Writing Calls / Hedging Short)"
+        else:
+            footprint = "NEUTRAL / RANGE-BOUND (Balanced Institutional Positioning)"
+        return footprint, round(pcr, 2)
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return "NEUTRAL", 1.0
+# @@END option_chain
+# @@MODULE market_breadth
+from app_logging import get_logger
+logger = get_logger(__name__)
+import pandas as pd
+import requests
+import urllib.parse
+import yfinance as yf
+import streamlit as st
+from datetime import datetime, timedelta
+
+HEAVYWEIGHTS = [
+    {"Stock": "HDFC BANK", "Weight (%)": 13.2, "instrument_key": "NSE_EQ|INE040A01034", "symbol": "HDFCBANK", "yf": "HDFCBANK.NS"},
+    {"Stock": "RELIANCE", "Weight (%)": 10.5, "instrument_key": "NSE_EQ|INE002A01018", "symbol": "RELIANCE", "yf": "RELIANCE.NS"},
+    {"Stock": "ICICI BANK", "Weight (%)": 7.8, "instrument_key": "NSE_EQ|INE090A01021", "symbol": "ICICIBANK", "yf": "ICICIBANK.NS"},
+    {"Stock": "INFOSYS", "Weight (%)": 6.1, "instrument_key": "NSE_EQ|INE009A01021", "symbol": "INFY", "yf": "INFY.NS"},
+    {"Stock": "TCS", "Weight (%)": 4.5, "instrument_key": "NSE_EQ|INE467B01029", "symbol": "TCS", "yf": "TCS.NS"},
+    {"Stock": "BHARTI AIRTEL", "Weight (%)": 4.3, "instrument_key": "NSE_EQ|INE397D01024", "symbol": "BHARTIARTL", "yf": "BHARTIARTL.NS"},
+    {"Stock": "ITC", "Weight (%)": 3.9, "instrument_key": "NSE_EQ|INE154A01025", "symbol": "ITC", "yf": "ITC.NS"},
+    {"Stock": "LARSEN & TOUBRO", "Weight (%)": 3.6, "instrument_key": "NSE_EQ|INE018A01030", "symbol": "LT", "yf": "LT.NS"},
+    {"Stock": "KOTAK BANK", "Weight (%)": 3.0, "instrument_key": "NSE_EQ|INE237A01028", "symbol": "KOTAKBANK", "yf": "KOTAKBANK.NS"},
+    {"Stock": "AXIS BANK", "Weight (%)": 3.0, "instrument_key": "NSE_EQ|INE238A01034", "symbol": "AXISBANK", "yf": "AXISBANK.NS"},
+    {"Stock": "SBI", "Weight (%)": 2.9, "instrument_key": "NSE_EQ|INE062A01020", "symbol": "SBIN", "yf": "SBIN.NS"},
+    {"Stock": "HUL", "Weight (%)": 2.2, "instrument_key": "NSE_EQ|INE030A01027", "symbol": "HINDUNILVR", "yf": "HINDUNILVR.NS"},
+]
+
+NIFTY50_YF = [
+    "HDFCBANK.NS", "RELIANCE.NS", "ICICIBANK.NS", "INFY.NS", "TCS.NS",
+    "BHARTIARTL.NS", "ITC.NS", "LT.NS", "KOTAKBANK.NS", "AXISBANK.NS",
+    "SBIN.NS", "HINDUNILVR.NS", "BAJFINANCE.NS", "M&M.NS", "SUNPHARMA.NS",
+    "NTPC.NS", "HCLTECH.NS", "MARUTI.NS", "TITAN.NS", "TATAMOTORS.NS",
+    "ULTRACEMCO.NS", "POWERGRID.NS", "BAJAJFINSV.NS", "ASIANPAINT.NS",
+    "NESTLEIND.NS", "ONGC.NS", "ADANIPORTS.NS", "COALINDIA.NS", "WIPRO.NS",
+    "JSWSTEEL.NS", "TATASTEEL.NS", "INDUSINDBK.NS", "GRASIM.NS", "TECHM.NS",
+    "HINDALCO.NS", "CIPLA.NS", "SBILIFE.NS", "DRREDDY.NS", "BRITANNIA.NS",
+    "EICHERMOT.NS", "APOLLOHOSP.NS", "BAJAJ-AUTO.NS", "DIVISLAB.NS",
+    "TATACONSUM.NS", "HDFCLIFE.NS", "SHRIRAMFIN.NS", "TRENT.NS",
+    "ADANIENT.NS", "LTIM.NS", "HEROMOTOCO.NS",
+]
+
+
+# =====================================================================
+# PHASE 2 — Sector Breadth. Real, static NSE sector classification for
+# all 49 constituents above (sector membership doesn't change day to day,
+# so this is accurate without needing a live classification feed). Used
+# to compute which SECTORS are actually driving the index move, not just
+# the index-level advance/decline count.
+# =====================================================================
+SECTOR_MAP = {
+    "HDFCBANK": "Banking", "ICICIBANK": "Banking", "KOTAKBANK": "Banking",
+    "AXISBANK": "Banking", "SBIN": "Banking", "INDUSINDBK": "Banking",
+    "BAJFINANCE": "Financial Services (NBFC/Insurance)", "BAJAJFINSV": "Financial Services (NBFC/Insurance)",
+    "SBILIFE": "Financial Services (NBFC/Insurance)", "HDFCLIFE": "Financial Services (NBFC/Insurance)",
+    "SHRIRAMFIN": "Financial Services (NBFC/Insurance)",
+    "INFY": "IT", "TCS": "IT", "HCLTECH": "IT", "WIPRO": "IT", "TECHM": "IT", "LTIM": "IT",
+    "RELIANCE": "Energy / Oil & Gas", "ONGC": "Energy / Oil & Gas", "COALINDIA": "Energy / Oil & Gas",
+    "BHARTIARTL": "Telecom",
+    "ITC": "FMCG", "HINDUNILVR": "FMCG", "NESTLEIND": "FMCG", "BRITANNIA": "FMCG", "TATACONSUM": "FMCG",
+    "LT": "Infra / Capital Goods / Power", "ADANIPORTS": "Infra / Capital Goods / Power",
+    "POWERGRID": "Infra / Capital Goods / Power", "NTPC": "Infra / Capital Goods / Power",
+    "ADANIENT": "Infra / Capital Goods / Power",
+    "MARUTI": "Auto", "TATAMOTORS": "Auto", "M&M": "Auto", "EICHERMOT": "Auto",
+    "BAJAJ-AUTO": "Auto", "HEROMOTOCO": "Auto",
+    "SUNPHARMA": "Pharma / Healthcare", "CIPLA": "Pharma / Healthcare", "DRREDDY": "Pharma / Healthcare",
+    "DIVISLAB": "Pharma / Healthcare", "APOLLOHOSP": "Pharma / Healthcare",
+    "ULTRACEMCO": "Cement / Materials", "GRASIM": "Cement / Materials",
+    "JSWSTEEL": "Metals", "TATASTEEL": "Metals", "HINDALCO": "Metals",
+    "ASIANPAINT": "Consumer Durables / Retail", "TITAN": "Consumer Durables / Retail",
+    "TRENT": "Consumer Durables / Retail",
+}
+
+
+def get_sector_breadth(df_full):
+    """
+    Groups the already-fetched full-50 breadth dataframe (Symbol, Change (%))
+    by real sector and returns per-sector advances/declines/avg change --
+    sorted strongest-to-weakest. Real aggregation of real per-stock data,
+    no separate live fetch needed.
+    """
+    if df_full is None or df_full.empty:
+        return None
+
+    work = df_full.copy()
+    work["Sector"] = work["Symbol"].map(SECTOR_MAP)
+    work = work.dropna(subset=["Sector"])
+    if work.empty:
+        return None
+
+    rows = []
+    for sector, grp in work.groupby("Sector"):
+        advances = int((grp["Change (%)"] > 0.05).sum())
+        declines = int((grp["Change (%)"] < -0.05).sum())
+        rows.append({
+            "Sector": sector,
+            "Stocks": len(grp),
+            "Advances": advances,
+            "Declines": declines,
+            "Avg Change (%)": round(float(grp["Change (%)"].mean()), 2),
+        })
+
+    df_sector = pd.DataFrame(rows).sort_values("Avg Change (%)", ascending=False).reset_index(drop=True)
+    return df_sector
+
+
+def _find_match(data_dict, symbol):
+    for key, val in data_dict.items():
+        if symbol.upper() in key.upper():
+            return val
+    return None
+
+
+@st.cache_data(ttl=14400, show_spinner=False)
+def _get_upstox_prev_close_map(access_token, symbol_key_pairs):
+    """
+    Previous-close reference sourced from UPSTOX's OWN historical-candle API
+    (day interval) -- not Yahoo Finance. This means the whole calculation
+    (live price AND previous close) comes from Upstox for every symbol this
+    succeeds for. Requires one API call per symbol, so it's cached for 4
+    hours (previous close never changes intraday, so this is safe) to avoid
+    hammering the API on every 30-second auto-refresh.
+    symbol_key_pairs: tuple of (symbol, instrument_key) tuples (hashable for caching).
+    """
+    if not access_token:
+        return {}
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
+    to_date = datetime.now().strftime("%Y-%m-%d")
+    from_date = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
+    result = {}
+    for symbol, instrument_key in symbol_key_pairs:
+        try:
+            encoded_key = urllib.parse.quote(instrument_key, safe="|")
+            url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/day/{to_date}/{from_date}"
+            res = requests.get(url, headers=headers, timeout=5)
+            res_json = res.json()
+            if res_json.get("status") != "success":
+                continue
+            candles = res_json.get("data", {}).get("candles", [])
+            if not candles:
+                continue
+            # Upstox returns candles newest-first; each candle is
+            # [timestamp, open, high, low, close, volume, oi]. Skip today's
+            # candle if present (it's still forming) and take the most
+            # recent COMPLETE prior session's close.
+            non_today = [c for c in candles if not str(c[0]).startswith(to_date)]
+            chosen = non_today[0] if non_today else candles[0]
+            result[symbol] = float(chosen[4])
+        except Exception:
+            logger.exception("Broad exception caught; fallback path executed")
+            continue
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_prev_close_reference_map():
+    """
+    Upstox's live quote 'ohlc.close' field turned out to mirror the LIVE
+    last_price during market hours instead of the prior session's closing
+    price (confirmed: every single stock showed exactly 0.00% change,
+    which is not real market behaviour). Rather than guess at Upstox's
+    field semantics again, we use a definitively unambiguous reference:
+    yesterday's actual closing print, sourced once per hour from Yahoo
+    Finance's daily bar (this is just a static prior-day print, not a
+    live/delayed feed -- every data vendor agrees on it). Upstox's LIVE
+    last_price is still used as the CURRENT price everywhere; only the
+    "previous close" denominator comes from this reference.
+    """
+    try:
+        all_tickers = list(set(NIFTY50_YF))
+        data = yf.download(tickers=all_tickers, period="5d", interval="1d",
+                            group_by="ticker", progress=False, threads=True)
+        ref = {}
+        for t in all_tickers:
+            try:
+                closes = data[t]["Close"].dropna()
+                if len(closes) >= 2:
+                    ref[t.replace(".NS", "")] = float(closes.iloc[-2])
+                elif len(closes) == 1:
+                    ref[t.replace(".NS", "")] = float(closes.iloc[-1])
+            except Exception:
+                logger.exception("Broad exception caught; fallback path executed")
+                continue
+        return ref
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return {}
+
+
+def _fetch_real_heavyweights(access_token):
+    """Primary source: live Upstox quotes. Returns (df_or_None, debug_reason)
+    -- the reason is ALWAYS captured, even on success, so the caller (and the
+    UI) can show exactly why a fallback happened instead of failing silently."""
+    if not access_token:
+        return None, "No Upstox access_token in session (not logged in)."
+
+    try:
+        keys_param = ",".join([h["instrument_key"] for h in HEAVYWEIGHTS])
+        encoded_keys = urllib.parse.quote(keys_param, safe=",|")
+        url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={encoded_keys}"
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
+        res = requests.get(url, headers=headers, timeout=6)
+        res_json = res.json()
+
+        if res_json.get("status") != "success":
+            return None, f"Upstox API returned non-success status (HTTP {res.status_code}): {res_json}"
+
+        data = res_json.get("data", {})
+        if not data:
+            return None, f"Upstox API returned success but an EMPTY data payload (raw: {res_json})"
+
+        symbol_key_pairs = tuple((h["symbol"], h["instrument_key"]) for h in HEAVYWEIGHTS)
+        upstox_prev_close = _get_upstox_prev_close_map(access_token, symbol_key_pairs)
+        yahoo_prev_close = _get_prev_close_reference_map()
+
+        rows = []
+        missing = []
+        used_yahoo_prevclose_for = []
+        for h in HEAVYWEIGHTS:
+            match = _find_match(data, h["symbol"])
+            if match is None:
+                missing.append(h)
+                continue
+            ltp = match.get("last_price")
+            prev_close = upstox_prev_close.get(h["symbol"])
+            if prev_close is None:
+                prev_close = yahoo_prev_close.get(h["symbol"])
+                if prev_close is not None:
+                    used_yahoo_prevclose_for.append(h["symbol"])
+            if ltp is None or prev_close is None or prev_close == 0:
+                missing.append(h)
+                continue
+            change_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+            rows.append({"Stock": h["Stock"], "Weight (%)": h["Weight (%)"], "Change (%)": change_pct})
+
+        topped_up_note = ""
+        if missing:
+            yf_fallback = _fetch_heavyweights_yfinance()
+            if yf_fallback is not None:
+                yf_map = dict(zip(yf_fallback["Stock"], yf_fallback["Change (%)"]))
+                still_missing = []
+                for h in missing:
+                    if h["Stock"] in yf_map:
+                        rows.append({"Stock": h["Stock"], "Weight (%)": h["Weight (%)"], "Change (%)": yf_map[h["Stock"]]})
+                    else:
+                        still_missing.append(h["symbol"])
+                if still_missing:
+                    return None, f"Upstox missing {[h['symbol'] for h in missing]}, and Yahoo top-up also failed for: {still_missing}"
+                topped_up_note = f" (+{len(missing)} topped up from Yahoo Finance: {[h['symbol'] for h in missing]})"
+            else:
+                return None, f"Upstox response missing/incomplete for: {[h['symbol'] for h in missing]}, and Yahoo Finance top-up also failed."
+
+        prevclose_note = f" (prev-close via Yahoo for: {used_yahoo_prevclose_for})" if used_yahoo_prevclose_for else " (prev-close 100% via Upstox)"
+        return pd.DataFrame(rows), f"OK (Upstox live){topped_up_note}{prevclose_note}"
+    except Exception as e:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None, f"Upstox request raised an exception: {type(e).__name__}: {e}"
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def _fetch_heavyweights_yfinance():
+    """Fallback source: real (slightly delayed) Yahoo Finance quotes."""
+    try:
+        tickers = [h["yf"] for h in HEAVYWEIGHTS]
+        data = yf.download(tickers=tickers, period="5d", interval="1d",
+                            group_by="ticker", progress=False, threads=True)
+        rows = []
+        for h in HEAVYWEIGHTS:
+            t_data = data[h["yf"]] if len(tickers) > 1 else data
+            closes = t_data["Close"].dropna()
+            if len(closes) < 2:
+                return None
+            change_pct = round(((closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2]) * 100, 2)
+            rows.append({"Stock": h["Stock"], "Weight (%)": h["Weight (%)"], "Change (%)": change_pct})
+        return pd.DataFrame(rows)
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None
+
+
+def get_nifty_internal_breadth(access_token=None):
+    df_heavyweights, upstox_debug = _fetch_real_heavyweights(access_token)
+    source = "Upstox (Live Broker Feed)"
+
+    if df_heavyweights is None:
+        df_heavyweights = _fetch_heavyweights_yfinance()
+        source = "Yahoo Finance (delayed ~15-20 min)"
+
+    if df_heavyweights is None:
+        placeholder = pd.DataFrame([
+            {"Stock": h["Stock"], "Weight (%)": h["Weight (%)"], "Change (%)": None}
+            for h in HEAVYWEIGHTS
+        ])
+        return placeholder, None, None, None, "DATA UNAVAILABLE (both Upstox and Yahoo Finance failed)", upstox_debug
+
+    advances = int((df_heavyweights["Change (%)"] > 0).sum())
+    declines = int((df_heavyweights["Change (%)"] <= 0).sum())
+    breadth_ratio = round(advances / declines, 2) if declines > 0 else float(advances)
+
+    avg_change = df_heavyweights["Change (%)"].mean()
+    if avg_change > 0.3:
+        label = "BULLISH HEAVYWEIGHTS"
+    elif avg_change < -0.3:
+        label = "BEARISH HEAVYWEIGHTS"
+    else:
+        label = "MIXED HEAVYWEIGHTS"
+
+    breadth_status = f"{label} ({len(HEAVYWEIGHTS)}-stock proxy, not full Nifty 50) -- Source: {source}"
+    return df_heavyweights, advances, declines, breadth_ratio, breadth_status, upstox_debug
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_upstox_nse_equity_map():
+    """
+    Downloads Upstox's official NSE instrument master file and builds a
+    tradingsymbol -> instrument_key map. This avoids hand-typing 50 ISINs
+    (risky -- one typo would silently pull the WRONG stock's data). Returns
+    (map_or_None, debug_reason).
+    """
+    try:
+        url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
+        df = pd.read_csv(url, compression="gzip")
+        if 'tradingsymbol' not in df.columns or 'instrument_key' not in df.columns:
+            return None, f"Instrument master downloaded but columns unexpected: {list(df.columns)}"
+
+        eq_df = pd.DataFrame()
+        matched_via = None
+
+        # Try 1: segment == 'NSE_EQ' (matches the "NSE_EQ|<ISIN>" instrument_key
+        # prefix already used everywhere else in this app -- the most reliable
+        # signal if the column exists).
+        if 'segment' in df.columns:
+            candidate = df[df['segment'].astype(str).str.upper() == 'NSE_EQ']
+            if not candidate.empty:
+                eq_df, matched_via = candidate, "segment == 'NSE_EQ'"
+
+        # Try 2: instrument_type, case-insensitive, either 'EQ' or 'EQUITY'.
+        if eq_df.empty and 'instrument_type' in df.columns:
+            it = df['instrument_type'].astype(str).str.upper()
+            candidate = df[it.isin(['EQ', 'EQUITY'])]
+            if not candidate.empty:
+                eq_df, matched_via = candidate, "instrument_type in ['EQ','EQUITY'] (case-insensitive)"
+
+        if eq_df.empty:
+            sample_cols = [c for c in ['segment', 'instrument_type', 'exchange'] if c in df.columns]
+            sample = {c: df[c].astype(str).unique().tolist()[:8] for c in sample_cols}
+            return None, (f"Instrument master downloaded ({len(df)} rows, columns={list(df.columns)}) "
+                          f"but no equity rows matched any known filter. Sample observed values: {sample}")
+
+        return dict(zip(eq_df['tradingsymbol'], eq_df['instrument_key'])), f"OK ({len(eq_df)} equity symbols loaded via {matched_via})"
+    except Exception as e:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None, f"Instrument master download/parse failed: {type(e).__name__}: {e}"
+
+
+def _fetch_full50_upstox(access_token):
+    """Batched live Upstox quotes for all 50 Nifty constituents.
+    Returns (rows_or_None, debug_reason)."""
+    if not access_token:
+        return None, "No Upstox access_token in session (not logged in)."
+
+    symbol_map, map_debug = _load_upstox_nse_equity_map()
+    if not symbol_map:
+        return None, map_debug
+
+    base_symbols = [s.replace(".NS", "") for s in NIFTY50_YF]
+    found = {s: symbol_map[s] for s in base_symbols if s in symbol_map}
+    missing_syms = [s for s in base_symbols if s not in symbol_map]
+    keys = list(found.values())
+
+    if len(keys) < 40:
+        return None, f"Only {len(keys)}/50 symbols matched in Upstox instrument master. Missing: {missing_syms}"
+
+    try:
+        rows = []
+        chunk_size = 25
+        symbol_key_pairs = tuple(found.items())
+        upstox_prev_close = _get_upstox_prev_close_map(access_token, symbol_key_pairs)
+        yahoo_prev_close = _get_prev_close_reference_map()
+        yahoo_used_count = 0
+
+        for i in range(0, len(keys), chunk_size):
+            chunk = keys[i:i + chunk_size]
+            encoded_keys = urllib.parse.quote(",".join(chunk), safe=",|")
+            url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={encoded_keys}"
+            headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
+            res = requests.get(url, headers=headers, timeout=8)
+            res_json = res.json()
+            if res_json.get("status") != "success":
+                return None, f"Upstox quotes API (chunk {i//chunk_size + 1}) returned non-success (HTTP {res.status_code}): {res_json}"
+            data = res_json.get("data", {})
+            for match in data.values():
+                symbol = match.get("symbol") or match.get("trading_symbol")
+                ltp = match.get("last_price")
+                prev_close = upstox_prev_close.get(symbol)
+                if prev_close is None:
+                    prev_close = yahoo_prev_close.get(symbol)
+                    if prev_close is not None:
+                        yahoo_used_count += 1
+                if symbol is None or ltp is None or prev_close is None or prev_close == 0:
+                    continue
+                chg = round(((ltp - prev_close) / prev_close) * 100, 2)
+                rows.append({"Symbol": symbol, "Change (%)": chg})
+
+        if len(rows) < 40:
+            return None, f"Upstox quotes returned only {len(rows)}/50 usable rows (rest had missing ltp/prev_close)."
+        prevclose_note = f", prev-close via Yahoo for {yahoo_used_count} symbol(s)" if yahoo_used_count else ", prev-close 100% via Upstox"
+        return rows, f"OK ({len(rows)}/50 from Upstox live{prevclose_note})"
+    except Exception as e:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None, f"Upstox batched quotes request raised an exception: {type(e).__name__}: {e}"
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def _fetch_full50_yfinance():
+    try:
+        data = yf.download(tickers=NIFTY50_YF, period="5d", interval="1d",
+                            group_by="ticker", progress=False, threads=True)
+        rows = []
+        for sym in NIFTY50_YF:
+            try:
+                closes = data[sym]["Close"].dropna()
+                if len(closes) < 2:
+                    continue
+                chg = ((closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2]) * 100
+                rows.append({"Symbol": sym.replace(".NS", ""), "Change (%)": round(chg, 2)})
+            except Exception:
+                logger.exception("Broad exception caught; fallback path executed")
+                continue
+        return rows if len(rows) >= 30 else None
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None
+
+
+def get_full_nifty50_breadth(access_token=None):
+    """
+    REAL market breadth across all 50 Nifty index constituents. Tries live
+    Upstox quotes first (100% accurate, real-time -- needs login), then
+    falls back to Yahoo Finance (delayed ~15-20 min).
+    Returns: df_full, advances, declines, ratio, status_text, debug_reason
+    """
+    rows, upstox_debug = _fetch_full50_upstox(access_token)
+    source = "Upstox (Live)"
+
+    if rows is None:
+        rows = _fetch_full50_yfinance()
+        source = "Yahoo Finance (delayed ~15-20 min)"
+    else:
+        # Upstox sometimes doesn't return every single one of the 50 in its
+        # response (thin/illiquid instruments, brief API hiccups, etc).
+        # Top up any missing ones with Yahoo Finance so the breadth count
+        # always accounts for all 50 -- never silently drops stocks.
+        have = {r["Symbol"] for r in rows}
+        base_symbols = [s.replace(".NS", "") for s in NIFTY50_YF]
+        missing = [s for s in base_symbols if s not in have]
+        if missing:
+            yf_rows = _fetch_full50_yfinance() or []
+            yf_map = {r["Symbol"]: r for r in yf_rows}
+            topped_up = [sym for sym in missing if sym in yf_map]
+            for sym in topped_up:
+                rows.append(yf_map[sym])
+            if topped_up:
+                source = f"Upstox (Live) + Yahoo Finance for {len(topped_up)} symbol(s) Upstox didn't return"
+
+    if rows is None:
+        return None, None, None, None, "DATA UNAVAILABLE (both Upstox and Yahoo Finance failed to return enough Nifty 50 data)", upstox_debug
+
+    advances, declines, unchanged = 0, 0, 0
+    for r in rows:
+        if r["Change (%)"] > 0.05:
+            advances += 1
+        elif r["Change (%)"] < -0.05:
+            declines += 1
+        else:
+            unchanged += 1
+    total = advances + declines + unchanged
+
+    ratio = round(advances / declines, 2) if declines > 0 else float(advances)
+    breakdown = f"{advances} up, {declines} down, {unchanged} flat -- {total}/50 stocks fetched"
+    if advances > declines * 1.5:
+        status = f"BROAD-BASED BULLISH ({breakdown})"
+    elif declines > advances * 1.5:
+        status = f"BROAD-BASED BEARISH ({breakdown})"
+    else:
+        status = f"MIXED / NARROW BREADTH ({breakdown})"
+    status = f"{status} -- Source: {source}"
+
+    df_full = pd.DataFrame(rows).sort_values("Change (%)", ascending=False).reset_index(drop=True)
+    return df_full, advances, declines, ratio, status, upstox_debug
+
+
+def unavailable_heavyweights(note="DATA UNAVAILABLE (timed out - retrying in background)"):
+    """Same shape as get_nifty_internal_breadth() returns when no data could be fetched."""
+    placeholder = pd.DataFrame([{"Stock": h["Stock"], "Weight (%)": h["Weight (%)"], "Change (%)": None} for h in HEAVYWEIGHTS])
+    return placeholder, None, None, None, note, "timeout"
+# @@END market_breadth
+# @@MODULE order_flow
+from app_logging import get_logger
+logger = get_logger(__name__)
+import requests
+import urllib.parse
+import market_data
+
+"""
+PHASE 3 -- ORDER FLOW / MARKET MICROSTRUCTURE ENGINE
+------------------------------------------------------
+Honesty note up front: true tick-by-tick Cumulative Volume Delta (CVD)
+needs a live WebSocket tick feed classifying every trade as buyer- or
+seller-initiated. This app polls a REST snapshot every ~30s (Streamlit
+fragment refresh), so it CANNOT produce real tick-level CVD -- and per
+this project's own rule ("never fabricate CVD/order-flow values"), it
+does not pretend to.
+
+What IS real and available: Upstox's free market-quote/quotes endpoint
+(the same one this app already calls for LTP/OHLC) returns a `depth`
+object with the top-5 resting Buy and Sell orders -- real, live order
+book data, no paid Level-2 subscription required. From this we compute
+a genuine, live **Order Book Imbalance (OBI)**: how much more resting
+buy quantity vs sell quantity sits in the top 5 levels right now. This
+is a real, standard order-flow metric (just not the same thing as CVD),
+so it's reported honestly under its own name rather than mislabeled.
+
+Note the underlying instrument: the NIFTY spot index itself has no
+order book at all (an index isn't directly tradable). So this reads
+depth from the near-month NIFTY FUTURES contract instead -- the same
+instrument market_data.py already uses for real Volume, for the same
+reason (futures are genuinely, continuously traded).
+"""
+
+
+def get_order_flow_snapshot(access_token):
+    """
+    Returns a dict describing the current live Order Book Imbalance on
+    the near-month NIFTY futures contract. On any failure (no token, no
+    futures key resolvable, no depth in the response, market closed with
+    an empty book), returns a DATA_UNAVAILABLE status instead of a
+    fabricated number.
+    """
+    out = {
+        "status": "DATA_UNAVAILABLE", "reason": None,
+        "instrument": None, "total_buy_qty": None, "total_sell_qty": None,
+        "imbalance_pct": None, "pressure": None, "best_bid": None, "best_ask": None,
+        "spread": None,
+    }
+    if not access_token:
+        out["reason"] = "No Upstox access token -- login required for live order book data."
+        return out
+
+    fut_key = market_data.get_nifty_futures_instrument_key()
+    if not fut_key:
+        out["reason"] = "Could not resolve the near-month NIFTY futures instrument_key from Upstox's instrument master."
+        return out
+    out["instrument"] = fut_key
+
+    try:
+        encoded_key = urllib.parse.quote(fut_key, safe="|")
+        url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={encoded_key}"
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
+        res = requests.get(url, headers=headers, timeout=6)
+        res_json = res.json()
+        if res_json.get("status") != "success":
+            out["reason"] = f"Upstox API did not return success: {res_json.get('status')}"
+            return out
+        data = res_json.get("data", {})
+        match = next(iter(data.values()), None)
+        if match is None:
+            out["reason"] = "Upstox returned no quote data for the futures instrument."
+            return out
+
+        depth = match.get("depth", {})
+        buy_levels = depth.get("buy", [])
+        sell_levels = depth.get("sell", [])
+        if not buy_levels and not sell_levels:
+            out["reason"] = "Upstox response had no depth data (market likely closed or feed not entitled)."
+            return out
+
+        total_buy_qty = sum(float(lv.get("quantity", 0) or 0) for lv in buy_levels)
+        total_sell_qty = sum(float(lv.get("quantity", 0) or 0) for lv in sell_levels)
+        if total_buy_qty == 0 and total_sell_qty == 0:
+            out["reason"] = "Order book is empty on both sides right now (no resting orders)."
+            return out
+
+        total = total_buy_qty + total_sell_qty
+        imbalance = (total_buy_qty - total_sell_qty) / total if total > 0 else 0.0
+
+        best_bid = next((lv.get("price") for lv in buy_levels if lv.get("price")), None)
+        best_ask = next((lv.get("price") for lv in sell_levels if lv.get("price")), None)
+        spread = (best_ask - best_bid) if (best_bid and best_ask) else None
+
+        if imbalance > 0.15:
+            pressure = "BUYING PRESSURE (Order Book) 🟢"
+        elif imbalance < -0.15:
+            pressure = "SELLING PRESSURE (Order Book) 🔴"
+        else:
+            pressure = "BALANCED ORDER BOOK ⚪"
+
+        out.update({
+            "status": "OK",
+            "total_buy_qty": int(total_buy_qty), "total_sell_qty": int(total_sell_qty),
+            "imbalance_pct": round(imbalance * 100, 1), "pressure": pressure,
+            "best_bid": best_bid, "best_ask": best_ask,
+            "spread": round(spread, 2) if spread is not None else None,
+        })
+        return out
+    except Exception as e:
+        logger.exception("Broad exception caught; fallback path executed")
+        out["reason"] = f"Order flow fetch failed: {type(e).__name__}: {e}"
+        return out
+# @@END order_flow
+# @@MODULE global_markets
+from app_logging import get_logger
+logger = get_logger(__name__)
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
+import pandas as pd
+import yfinance as yf
+
+# ---------------------------------------------------------------------
+# SPEED FIX: this function used to fetch 18 tickers ONE BY ONE (no cache,
+# no timeout) on every 30s refresh -> a single slow ticker froze the whole
+# page ("ghumta rehta hai"). Now: all tickers are fetched in PARALLEL with a
+# hard overall deadline, the result is cached for a short time, and if a
+# refresh fails we keep serving the last good table instead of blanking it.
+# ---------------------------------------------------------------------
+_GM_CACHE = {"ts": 0.0, "df": None}
+_GM_LOCK = threading.Lock()
+GLOBAL_MARKETS_TTL = 45        # seconds a good result is reused
+GLOBAL_MARKETS_DEADLINE = 9    # hard cap for the whole parallel fetch
+_GM_LAST_GOOD = {}             # ticker -> (ts, price, change_pct): reused if a ticker is stuck
+GM_LAST_GOOD_MAX_AGE = 1800
+
+
+def _fetch_one_ticker(ticker):
+    """Returns (current_price, change_pct) or None. Runs inside a worker thread."""
+    try:
+        hist = yf.Ticker(ticker).history(period="2d", timeout=8)
+    except TypeError:
+        hist = yf.Ticker(ticker).history(period="2d")
+    if hist is None or hist.empty:
+        return None
+    current_price = float(hist['Close'].iloc[-1])
+    prev_close = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current_price
+    if prev_close == 0:
+        return None
+    return current_price, ((current_price - prev_close) / prev_close) * 100
+
+def get_global_market_indices():
+    """
+    Fetches real-time prices and percentage changes for global stock markets 
+    and macro indicators with official country flags/logos.
+    """
+    indices_data = [
+        {"name": "S&P 500 (US)", "ticker": "^GSPC", "code": "us"},
+        {"name": "Nasdaq Composite (US)", "ticker": "^IXIC", "code": "us"},
+        {"name": "Dow Jones (US)", "ticker": "^DJI", "code": "us"},
+        {"name": "Nikkei 225 (Japan)", "ticker": "^N225", "code": "jp"},
+        {"name": "Shanghai Composite (China)", "ticker": "000001.SS", "code": "cn"},
+        {"name": "Hang Seng (Hong Kong)", "ticker": "^HSI", "code": "hk"},
+        {"name": "KOSPI (South Korea)", "ticker": "^KS11", "code": "kr"},
+        {"name": "FTSE 100 (UK)", "ticker": "^FTSE", "code": "gb"},
+        {"name": "DAX (Germany)", "ticker": "^GDAXI", "code": "de"},
+        {"name": "CAC 40 (France)", "ticker": "^FCHI", "code": "fr"},
+        {"name": "ASX 200 (Australia)", "ticker": "^AXJO", "code": "au"},
+        {"name": "Straits Times (Singapore)", "ticker": "^STI", "code": "sg"},
+        {"name": "India VIX", "ticker": "^INDIAVIX", "code": "in"},
+        {"name": "Crude Oil (WTI)", "ticker": "CL=F", "code": "oil"},
+        {"name": "USD/INR", "ticker": "USDINR=X", "code": "in"},
+        # Phase 2 — expanded macro set
+        {"name": "US Dollar Index (DXY)", "ticker": "DX-Y.NYB", "code": "us"},
+        {"name": "Gold", "ticker": "GC=F", "code": "gold"},
+        {"name": "US 10-Year Treasury Yield", "ticker": "^TNX", "code": "us"},
+    ]
+    
+    now = time.time()
+    with _GM_LOCK:
+        if _GM_CACHE["df"] is not None and now - _GM_CACHE["ts"] < GLOBAL_MARKETS_TTL:
+            return _GM_CACHE["df"].copy()
+
+    def _flag(code):
+        if code == "oil":
+            return "https://img.icons8.com/color/48/oil-industry.png"
+        if code == "gold":
+            return "https://img.icons8.com/color/48/gold-bars.png"
+        return f"https://flagcdn.com/w40/{code}.png"
+
+    executor = ThreadPoolExecutor(max_workers=9)
+    futures = {}
+    try:
+        for item in indices_data:
+            futures[item["ticker"]] = executor.submit(_fetch_one_ticker, item["ticker"])
+        _futures_wait(list(futures.values()), timeout=GLOBAL_MARKETS_DEADLINE)
+    finally:
+        # never block on stragglers -- they are simply reported as Neutral
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    data = []
+    got_any = False
+    for item in indices_data:
+        name, ticker, code = item["name"], item["ticker"], item["code"]
+        flag_url = _flag(code)
+        res = None
+        fut = futures.get(ticker)
+        if fut is not None and fut.done():
+            try:
+                res = fut.result()
+            except Exception:
+                logger.exception("Global market ticker fetch failed: %s", ticker)
+                res = None
+        if res is not None:
+            _GM_LAST_GOOD[ticker] = (time.time(), res[0], res[1])
+        elif ticker in _GM_LAST_GOOD and time.time() - _GM_LAST_GOOD[ticker][0] < GM_LAST_GOOD_MAX_AGE:
+            # ticker stuck/failed this refresh -> reuse its last real value (max 30 min old)
+            res = (_GM_LAST_GOOD[ticker][1], _GM_LAST_GOOD[ticker][2])
+        if res is not None:
+            got_any = True
+            current_price, change_pct = res
+            data.append({
+                "Logo": flag_url,
+                "Global Market / Asset": name,
+                "Latest Price": round(current_price, 2),
+                "Change (%)": round(change_pct, 2),
+                "Status": "Bullish 🟢" if change_pct >= 0 else "Bearish 🔴"
+            })
+        else:
+            data.append({
+                "Logo": flag_url,
+                "Global Market / Asset": name,
+                "Latest Price": 0.0,
+                "Change (%)": 0.0,
+                "Status": "Neutral 🟡"
+            })
+
+    df_markets = pd.DataFrame(data)
+    with _GM_LOCK:
+        if got_any:
+            _GM_CACHE["ts"], _GM_CACHE["df"] = time.time(), df_markets.copy()
+        elif _GM_CACHE["df"] is not None:
+            # total failure this time -> keep showing the last good table
+            return _GM_CACHE["df"].copy()
+    return df_markets
+
+def get_global_market_summary(df_markets):
+    """
+    Calculates an automatic Global Market Sentiment Score based on live data.
+    """
+    if df_markets.empty:
+        return "Neutral / Mixed 🟡", 0.0
+    
+    bullish_count = len(df_markets[df_markets['Status'].str.contains('Bullish')])
+    bearish_count = len(df_markets[df_markets['Status'].str.contains('Bearish')])
+    avg_change = df_markets['Change (%)'].mean()
+    
+    if bullish_count >= bearish_count + 4:
+        score = "🚀 Strong Bullish"
+    elif bullish_count > bearish_count:
+        score = "🟢 Mild Bullish"
+    elif bearish_count >= bullish_count + 4:
+        score = "🚨 Strong Bearish"
+    elif bearish_count > bullish_count:
+        score = "🔴 Mild Bearish"
+    else:
+        score = "🟡 Neutral / Sideways"
+        
+    return score, round(avg_change, 2)
+
+
+def get_live_vix(df_markets):
+    """
+    NEW: Pulls the real India VIX value out of the global markets table so
+    it can be fed into ml_engine.py as an actual model feature — instead of
+    being just a display number that never touches the model (which is
+    what was happening before).
+    Returns None if VIX couldn't be fetched, so the model can honestly
+    drop the feature rather than use a fake constant.
+    """
+    if df_markets is None or df_markets.empty:
+        return None
+    try:
+        vix_row = df_markets[df_markets["Global Market / Asset"] == "India VIX"]
+        if vix_row.empty:
+            return None
+        value = float(vix_row["Latest Price"].iloc[0])
+        return value if value > 0 else None
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None
+# @@END global_markets
+# @@MODULE global_news
+from app_logging import get_logger
+logger = get_logger(__name__)
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
+import pandas as pd
+import feedparser
+import requests
+
+# SPEED FIX: feedparser.parse(url) has NO timeout and used to run 8 times in a
+# row on every refresh (one stuck feed froze the whole page). Now each feed is
+# downloaded with a real timeout, all 8 in PARALLEL, cached for a few minutes,
+# and the last good result is kept if a refresh fails.
+_GN_CACHE = {"ts": 0.0, "value": None}
+_GN_LOCK = threading.Lock()
+GLOBAL_NEWS_TTL = 240
+GLOBAL_NEWS_DEADLINE = 9
+
+
+def _fetch_feed_entries(rss_url):
+    r = requests.get(rss_url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    feed = feedparser.parse(r.content)
+    return [str(e.title) for e in feed.entries[:5] if getattr(e, "title", None)]
+
+
+def get_global_market_sentiment():
+    """
+    Fetches real-time today's financial news headlines across key regions
+    (India, US, China, Japan, Eurozone, UK, Russia, Middle East) using live
+    RSS feeds, and scores them with a simple positive/negative keyword
+    heuristic (not full AI sentiment analysis -- disclosed as such).
+    """
+    regions = {
+        "🇮🇳 India": "India stock market economy news",
+        "🇺🇸 United States (US)": "US stock market Wall Street economy",
+        "🇨🇳 China": "China economy market news",
+        "🇯🇵 Japan": "Japan Nikkei economy news",
+        "🇪🇺 Eurozone": "Eurozone European economy ECB news",
+        "🇬🇧 United Kingdom (UK)": "UK FTSE economy London market",
+        "🇷🇺 Russia": "Russia economy sanctions market news",
+        "🌍 Middle East": "Middle East oil economy geopolitical news"
+    }
+
+    now = time.time()
+    with _GN_LOCK:
+        if _GN_CACHE["value"] is not None and now - _GN_CACHE["ts"] < GLOBAL_NEWS_TTL:
+            _df, _top = _GN_CACHE["value"]
+            return _df.copy(), _top
+
+    sentiment_data = []
+    all_headlines = []
+
+    positive_keywords = ['surge', 'jump', 'gain', 'growth', 'rally', 'positive', 'boost', 'up', 'high', 'deal', 'peace']
+    negative_keywords = ['fall', 'drop', 'slump', 'crash', 'loss', 'inflation', 'war', 'tension', 'negative', 'down', 'crisis', 'sanction']
+
+    executor = ThreadPoolExecutor(max_workers=8)
+    futures = {}
+    try:
+        for region, query in regions.items():
+            rss_url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-IN&gl=IN&ceid=IN:en"
+            futures[region] = executor.submit(_fetch_feed_entries, rss_url)
+        _futures_wait(list(futures.values()), timeout=GLOBAL_NEWS_DEADLINE)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    for region, query in regions.items():
+        pos_count = 0
+        neg_count = 0
+        fetch_failed = False
+
+        try:
+            fut = futures.get(region)
+            titles = fut.result() if (fut is not None and fut.done()) else []
+            if not titles:
+                fetch_failed = True
+
+            for title_raw in titles:
+                title = title_raw.lower()
+                all_headlines.append({"region": region, "title": title_raw})
+
+                if any(word in title for word in positive_keywords):
+                    pos_count += 1
+                if any(word in title for word in negative_keywords):
+                    neg_count += 1
+
+            # NOTE: a genuine 0/0 (no keyword hits) is honestly reported as Neutral.
+
+        except Exception:
+            logger.exception("Broad exception caught; fallback path executed")
+            fetch_failed = True
+
+        if fetch_failed:
+            sentiment_data.append({
+                "Region / Country": region,
+                "Positive News": "N/A",
+                "Negative News": "N/A",
+                "Net Sentiment": "Data Unavailable 🚫"
+            })
+            continue
+
+        if pos_count > neg_count:
+            net_status = "Bullish (Positive) 🟢"
+        elif neg_count > pos_count:
+            net_status = "Bearish (Negative) 🔴"
+        else:
+            net_status = "Neutral / Mixed 🟡"
+
+        sentiment_data.append({
+            "Region / Country": region,
+            "Positive News": pos_count,
+            "Negative News": neg_count,
+            "Net Sentiment": net_status
+        })
+
+    df_sentiment = pd.DataFrame(sentiment_data)
+
+    # World's Strongest / Most Impactful News Story for today
+    top_headline = all_headlines[0]['title'] if all_headlines else "Global markets react to latest macroeconomic data releases."
+
+    with _GN_LOCK:
+        if all_headlines:
+            _GN_CACHE["ts"], _GN_CACHE["value"] = time.time(), (df_sentiment.copy(), top_headline)
+        elif _GN_CACHE["value"] is not None:
+            # every feed failed this time -> keep showing the last good result
+            _df, _top = _GN_CACHE["value"]
+            return _df.copy(), _top
+    return df_sentiment, top_headline
+# @@END global_news
+# @@MODULE global_research
+"""Structured global-to-NIFTY research layer.
+
+This module does not invent market data. It consumes the already-fetched global
+market/news tables and turns them into an auditable macro context for the
+NIFTY decision engine. It is deliberately secondary to domestic price,
+structure, breadth, options and order-flow evidence.
+"""
+from app_logging import get_logger
+logger = get_logger(__name__)
+
+
+def _pct(df, name):
+    try:
+        row = df[df["Global Market / Asset"] == name]
+        if row.empty:
+            return None
+        v = float(row["Change (%)"].iloc[0])
+        return v if v == v else None
+    except Exception:
+        return None
+
+
+def _price(df, name):
+    try:
+        row = df[df["Global Market / Asset"] == name]
+        if row.empty:
+            return None
+        v = float(row["Latest Price"].iloc[0])
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+
+def build_global_research(df_markets, df_news=None, india_news_sentiment=None):
+    """Return an auditable macro/global context for NIFTY.
+
+    No single global variable is allowed to override the domestic NIFTY
+    structure. The output is evidence + a bounded directional bias only.
+    """
+    df = df_markets
+    if df is None or getattr(df, "empty", True):
+        return {
+            "status": "UNAVAILABLE",
+            "directional_bias": "UNKNOWN",
+            "strength": "NONE",
+            "risk_regime": "UNKNOWN",
+            "evidence": [],
+            "conflicts": [],
+            "data_points": 0,
+            "warning": "Global market table unavailable; global research is not used as a trade trigger.",
+        }
+
+    equity_names = [
+        "S&P 500 (US)", "Nasdaq Composite (US)", "Dow Jones (US)",
+        "Nikkei 225 (Japan)", "Shanghai Composite (China)",
+        "Hang Seng (Hong Kong)", "KOSPI (South Korea)",
+        "FTSE 100 (UK)", "DAX (Germany)", "CAC 40 (France)",
+        "ASX 200 (Australia)", "Straits Times (Singapore)",
+    ]
+    equity_changes = [_pct(df, n) for n in equity_names]
+    equity_changes = [x for x in equity_changes if x is not None]
+
+    positives = sum(x > 0 for x in equity_changes)
+    negatives = sum(x < 0 for x in equity_changes)
+    avg_equity = sum(equity_changes) / len(equity_changes) if equity_changes else None
+
+    vix = _price(df, "India VIX")
+    dxy = _pct(df, "US Dollar Index (DXY)")
+    us10y = _pct(df, "US 10-Year Treasury Yield")
+    crude = _pct(df, "Crude Oil (WTI)")
+    gold = _pct(df, "Gold")
+    usdinr = _pct(df, "USD/INR")
+
+    bull = 0
+    bear = 0
+    evidence = []
+    conflicts = []
+
+    # Broad global equity risk appetite: secondary evidence only.
+    if positives >= negatives + 3:
+        bull += 2
+        evidence.append(f"Global equities broadly risk-on ({positives} positive vs {negatives} negative markets).")
+    elif negatives >= positives + 3:
+        bear += 2
+        evidence.append(f"Global equities broadly risk-off ({negatives} negative vs {positives} positive markets).")
+    elif equity_changes:
+        evidence.append(f"Global equities mixed ({positives} positive / {negatives} negative); no strong global equity impulse.")
+
+    # India VIX: higher volatility is risk context, not an automatic sell signal.
+    if vix is not None:
+        if vix >= 20:
+            bear += 1
+            evidence.append(f"India VIX elevated at {vix:.2f}; risk/volatility is elevated.")
+        elif vix < 14:
+            bull += 1
+            evidence.append(f"India VIX relatively calm at {vix:.2f}.")
+        else:
+            evidence.append(f"India VIX is {vix:.2f}; neither extreme is detected by this rule.")
+
+    # USD pressure is normally a macro headwind for risk assets; keep it as a
+    # small contextual factor rather than a standalone trade trigger.
+    if dxy is not None:
+        if dxy > 0.25:
+            bear += 1
+            evidence.append(f"DXY is firmer ({dxy:+.2f}%), a potential risk-asset headwind.")
+        elif dxy < -0.25:
+            bull += 1
+            evidence.append(f"DXY is softer ({dxy:+.2f}%), a potential relief factor for risk assets.")
+
+    if us10y is not None:
+        if us10y > 0.35:
+            bear += 1
+            evidence.append(f"US 10Y yield is rising ({us10y:+.2f}% daily move); rates are a potential headwind.")
+        elif us10y < -0.35:
+            bull += 1
+            evidence.append(f"US 10Y yield is falling ({us10y:+.2f}% daily move); rates pressure is easing.")
+
+    if crude is not None:
+        if crude > 1.0:
+            bear += 1
+            evidence.append(f"WTI is up {crude:+.2f}%; higher oil can matter for India's imported energy cost.")
+        elif crude < -1.0:
+            bull += 1
+            evidence.append(f"WTI is down {crude:+.2f}%; oil pressure is easing.")
+
+    if usdinr is not None:
+        if usdinr > 0.25:
+            bear += 1
+            evidence.append(f"USD/INR is higher ({usdinr:+.2f}%), indicating rupee pressure.")
+        elif usdinr < -0.25:
+            bull += 1
+            evidence.append(f"USD/INR is lower ({usdinr:+.2f}%), indicating rupee relief.")
+
+    # Gold is not a direct NIFTY signal. Its move is retained as risk/defensive
+    # evidence only, preventing the common mistake of treating gold strength as
+    # an automatic equity sell signal.
+    if gold is not None and gold > 1.0:
+        evidence.append(f"Gold is strong ({gold:+.2f}%); this is treated as defensive/macro evidence, not an automatic NIFTY sell signal.")
+
+    if india_news_sentiment:
+        s = str(india_news_sentiment).upper()
+        if "BULLISH" in s:
+            bull += 1
+            evidence.append("India news sentiment is classified bullish by the live RSS heuristic.")
+        elif "BEARISH" in s:
+            bear += 1
+            evidence.append("India news sentiment is classified bearish by the live RSS heuristic.")
+        else:
+            evidence.append("India news sentiment is mixed/neutral.")
+
+    # v43: "STRONG" must be backed by the global EQUITY markets themselves.  VIX / DXY / yields / crude / USD-INR / news can
+    # add up to +3 on their own while most world indices are actually red (the dashboard then said "STRONGLY BUY" next to
+    # a "Mild Bearish" global tracker).  Macro-only points can reach MODERATE at most.
+    equity_backs_buy = positives >= negatives + 2 and (avg_equity is None or avg_equity > 0)
+    equity_backs_sell = negatives >= positives + 2 and (avg_equity is None or avg_equity < 0)
+    if bull >= bear + 3 and equity_backs_buy:
+        bias, strength = "BUY", "STRONG"
+    elif bear >= bull + 3 and equity_backs_sell:
+        bias, strength = "SELL", "STRONG"
+    elif bull > bear:
+        bias, strength = "BUY", "MODERATE"
+    elif bear > bull:
+        bias, strength = "SELL", "MODERATE"
+    else:
+        bias, strength = "NEUTRAL", "WEAK"
+
+    if positives >= negatives + 3 and negatives >= positives + 3:
+        conflicts.append("Internal global breadth calculation conflict.")
+    if dxy is not None and us10y is not None and dxy > 0.25 and us10y < -0.35:
+        conflicts.append("USD and Treasury-yield signals are pulling in different macro directions.")
+    if vix is not None and vix >= 20 and bias == "BUY":
+        conflicts.append("High VIX conflicts with the otherwise bullish global score; domestic confirmation must be strong.")
+
+    return {
+        "status": "AVAILABLE",
+        "directional_bias": bias,
+        "strength": strength,
+        "risk_regime": "RISK_ON" if bull >= bear + 2 else "RISK_OFF" if bear >= bull + 2 else "MIXED",
+        "score": int(bull - bear),
+        "bull_points": int(bull),
+        "bear_points": int(bear),
+        "data_points": len(equity_changes),
+        "metrics": {
+            "global_equity_avg_change_pct": round(avg_equity, 3) if avg_equity is not None else None,
+            "india_vix": vix,
+            "dxy_change_pct": dxy,
+            "us10y_change_pct": us10y,
+            "wti_change_pct": crude,
+            "gold_change_pct": gold,
+            "usd_inr_change_pct": usdinr,
+            "global_equity_positive_count": positives,
+            "global_equity_negative_count": negatives,
+        },
+        "evidence": evidence[:12],
+        "conflicts": conflicts[:8],
+        "news_source": "Google News RSS heuristic" if df_news is not None else "Not supplied",
+        "note": "Global research is contextual evidence. NIFTY price structure, breadth, options, order flow and risk gates remain primary.",
+    }
+# @@END global_research
+# @@MODULE news_rss
+"""
+news_rss.py -- v56: free, key-less market news from Google News RSS.
+
+Why: the Gemini "Google Search" tool has its own small quota; when it answers HTTP 429 the dashboard showed
+"Google research: no brief".  Google News RSS needs no key and no quota, so the engine / chat always have a fresh, real Google-sourced brief
+(headlines + time + source).  It is only HEADLINES -- facts to read, not advice.
+"""
+from __future__ import annotations
+
+import re
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus
+
+import requests
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+QUERIES = (
+    ("India market", "Nifty OR Sensex stock market India today"),
+    ("FII/DII", "FII DII flows India market"),
+    ("Global cues", "Wall Street Asian markets crude oil dollar yields today"),
+    ("Bank Nifty", "Bank Nifty RBI banking stocks"),
+)
+MAX_AGE_H = 20
+PER_QUERY = 4
+_CACHE = {"ts": 0.0, "text": ""}
+TTL_S = 600
+
+
+def _fetch(query, timeout=8):
+    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return r.text
+
+
+def parse_items(xml_text, now=None, max_age_h=MAX_AGE_H, limit=PER_QUERY):
+    """-> [(age_minutes, title, source)] newest first, only items younger than max_age_h."""
+    now = now or datetime.now(timezone.utc)
+    out = []
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return out
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        src = (it.findtext("source") or "").strip()
+        try:
+            dt = parsedate_to_datetime(it.findtext("pubDate") or "")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        age = (now - dt).total_seconds() / 60.0
+        if not title or age < -5 or age > max_age_h * 60:
+            continue
+        if src and title.endswith(" - " + src):
+            title = title[: -len(src) - 3]
+        out.append((max(0, int(age)), re.sub(r"\s+", " ", title)[:180], src))
+    out.sort(key=lambda x: x[0])
+    return out[:limit]
+
+
+def brief(force=False, fetch=_fetch):
+    """Short bullet brief (cached 10 min).  '' when nothing could be fetched.  Never raises."""
+    now = time.time()
+    if not force and _CACHE["text"] and now - _CACHE["ts"] < TTL_S:
+        return _CACHE["text"]
+    lines, seen = [], set()
+    for label, q in QUERIES:
+        try:
+            for age, title, src in parse_items(fetch(q)):
+                k = title.lower()[:60]
+                if k in seen:
+                    continue
+                seen.add(k)
+                a = f"{age} min" if age < 120 else f"{age // 60} h"
+                lines.append(f"- [{label}] {title} ({src or 'news'}, {a} ago)")
+        except Exception as exc:
+            logger.warning("news rss '%s' failed: %s", label, type(exc).__name__)
+    text = "\n".join(lines)[:2500]
+    if text:
+        _CACHE.update({"ts": now, "text": text})
+    return text
+# @@END news_rss
+# @@MODULE event_calendar
+"""
+event_calendar.py -- "is today / right now a dangerous time to open a NEW trade?"
+
+Why: a model cannot know that an RBI announcement, a Fed night or the Budget is coming.  On such days price jumps on news, not on
+the OI / S-R levels the engine reads, so a perfectly "valid" setup loses.  This module is a small, EDITABLE calendar.
+
+Levels
+  BLOCK    -> no new entries inside the window (the engine returns "no setup: event risk").
+  CAUTION  -> entries allowed, but the win probability is reduced by `penalty_logit`.
+Add your own events in EXTRA_EVENTS below, or in a file `events_extra.json` next to app.py:
+  [{"date": "2026-11-12", "start": "09:15", "end": "15:30", "level": "CAUTION", "label": "US CPI night (gap risk)"}]
+
+Dates below were checked against the official RBI MPC schedule (press release of 23 Mar 2026) and the Fed's FOMC calendar.
+Union Budget day is NOT confirmed yet -- it is usually 1 Feb; check it when it is announced.
+
+Also exposes expiry-day flags (Nifty weekly expiry is Tuesday; the monthly one is the last Tuesday) so the learner can find out
+by itself whether expiry days lose for this engine.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+from datetime import date, datetime, time, timedelta
+
+logger = logging.getLogger(__name__)
+
+CAUTION_PENALTY_LOGIT = 0.25
+
+# (date, start, end, level, label)
+EVENTS = [
+    # RBI policy decision is announced at 10:00 IST on the LAST day of the MPC meeting.
+    ("2026-12-04", "09:15", "11:30", "BLOCK", "RBI policy announcement (10:00 IST)"),
+    ("2026-12-04", "11:30", "15:30", "CAUTION", "RBI policy day (after-announcement volatility)"),
+    ("2027-02-05", "09:15", "11:30", "BLOCK", "RBI policy announcement (10:00 IST)"),
+    ("2027-02-05", "11:30", "15:30", "CAUTION", "RBI policy day (after-announcement volatility)"),
+    # Fed decision comes at ~23:30 IST, so the Indian session NEXT morning gaps / reacts.
+    ("2026-10-29", "09:15", "11:00", "CAUTION", "Reaction to the US Fed decision (28 Oct night)"),
+    ("2026-12-10", "09:15", "11:00", "CAUTION", "Reaction to the US Fed decision (9 Dec night)"),
+    # Budget: date not yet confirmed -> caution only, whole day
+    ("2027-02-01", "09:15", "15:30", "CAUTION", "Union Budget day (confirm the date)"),
+]
+
+
+def _load_extra():
+    out = []
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "events_extra.json")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                for e in json.load(fh):
+                    out.append((str(e["date"]), str(e.get("start", "09:15")), str(e.get("end", "15:30")),
+                                str(e.get("level", "CAUTION")).upper(), str(e.get("label", "event"))))
+    except Exception:
+        logger.exception("events_extra.json could not be read (ignored)")
+    return out
+
+
+def _t(s):
+    h, m = str(s).split(":")[:2]
+    return time(int(h), int(m))
+
+
+def _last_tuesday(d: date) -> bool:
+    return d.weekday() == 1 and (d + timedelta(days=7)).month != d.month
+
+
+def event_risk(now: datetime | None = None):
+    """-> {"level": "NONE"|"CAUTION"|"BLOCK", "reason": str, "penalty_logit": float, "expiry_day": bool, "monthly_expiry": bool}"""
+    out = {"level": "NONE", "reason": "", "penalty_logit": 0.0, "expiry_day": False, "monthly_expiry": False}
+    try:
+        now = now or datetime.now()
+        d, t = now.date(), now.time()
+        out["expiry_day"] = d.weekday() == 1
+        out["monthly_expiry"] = _last_tuesday(d)
+        worst = None
+        for ds, st, en, level, label in list(EVENTS) + _load_extra():
+            if ds != d.isoformat():
+                continue
+            if _t(st) <= t <= _t(en):
+                if worst is None or (level == "BLOCK" and worst[0] != "BLOCK"):
+                    worst = (level, label)
+        if worst:
+            out["level"], out["reason"] = worst
+            out["penalty_logit"] = CAUTION_PENALTY_LOGIT if worst[0] == "CAUTION" else 0.0
+    except Exception:
+        logger.exception("event_risk failed (ignored)")
+    return out
+# @@END event_calendar
+# @@MODULE live_chart
+"""TradingView-style LIVE 5-minute candle chart for NIFTY 50  (v43: was 1-minute; hidden behind a one-line switch).
+
+* 5-minute candles (Upstox intraday feed), the last ~1 session shown, zoom/pan stays put.
+* The candle that is forming RIGHT NOW moves up/down every few seconds from the live LTP
+  (its High / Low stretch as price moves) and a new candle opens every 5 minutes.
+* One-line ON/OFF switch above the chart.  OFF (default) = nothing is fetched or drawn, so the page is lighter.
+* Own tiny auto-refresh (TICK_SECONDS) that only fetches the live price -- it does NOT re-run the
+  heavy dashboard pipeline.  While the market is closed there is no timer: the last session is shown.
+
+Switch off any time with  TICK_SECONDS = 0  (the dashboard then keeps its old chart).
+Pure presentation: no signal / scoring / trading logic is touched.
+"""
+from __future__ import annotations
+
+import time as _time
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+import market_data
+import market_status
+import upstox_auth
+
+TICK_SECONDS = 2        # live refresh speed while market is OPEN. 0 = feature off (old chart is used)
+INTERVAL_MIN = 5        # candle size in minutes
+MAX_CANDLES = 300       # candles kept in memory / on chart (~4 sessions of 5-min candles)
+VISIBLE_CANDLES = 80    # candles visible when the chart first opens (~1 session)
+CANDLE_TTL = 20         # seconds before candle history is re-fetched from broker
+SWITCH_KEY = "lc_show_chart"
+
+UP, DOWN = "#26A69A", "#EF5350"
+
+
+def enabled() -> bool:
+    return bool(TICK_SECONDS and TICK_SECONDS > 0)
+
+
+# ----------------------------------------------------------------------------- data
+@st.cache_data(ttl=CANDLE_TTL, show_spinner=False)
+def _history(token: str):
+    return market_data.fetch_candles_for_timeframe(token, "minutes", str(INTERVAL_MIN), days_back=6)
+
+
+@st.cache_data(ttl=1, show_spinner=False)
+def _ltp(token: str):
+    return market_data._fetch_upstox_ltp(token)
+
+
+def _to_naive_ist(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    idx = pd.DatetimeIndex(df.index)
+    if idx.tz is not None:
+        idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+    df.index = idx
+    return df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
+
+
+def apply_live_tick(df: pd.DataFrame, ltp: float, now_naive: pd.Timestamp, forming: dict | None, interval_min: int = INTERVAL_MIN):
+    """Merge the live price into the candle frame (default 5-minute buckets).
+
+    Returns (df, forming).  `forming` remembers the running High/Low of the current candle so it
+    keeps stretching tick after tick even between broker history refreshes.
+    """
+    minute = now_naive.floor(f"{int(interval_min)}min")
+    prev_close = float(df["Close"].iloc[-1]) if len(df) and df.index[-1] < minute else None
+
+    if not forming or forming.get("minute") != minute:
+        o = prev_close if prev_close is not None else ltp
+        forming = {"minute": minute, "o": o, "h": max(o, ltp), "l": min(o, ltp)}
+    else:
+        forming["h"] = max(forming["h"], ltp)
+        forming["l"] = min(forming["l"], ltp)
+
+    df = df.copy()
+    if minute in df.index:                      # broker already has a (partial) candle for this minute
+        row = df.loc[minute]
+        df.loc[minute, "Open"] = float(row["Open"])
+        df.loc[minute, "High"] = max(float(row["High"]), forming["h"])
+        df.loc[minute, "Low"] = min(float(row["Low"]), forming["l"])
+        df.loc[minute, "Close"] = ltp
+    else:                                       # brand-new candle just opened
+        df.loc[minute] = [forming["o"], forming["h"], forming["l"], ltp, 0.0]
+    return df.sort_index(), forming
+
+
+def _session_vwap(df: pd.DataFrame):
+    """Per-day VWAP. Index has no real volume, so fall back to an equal-weight average (flagged)."""
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    day = df.index.normalize()
+    if df["Volume"].sum() > 0:
+        pv = (tp * df["Volume"]).groupby(day).cumsum()
+        v = df["Volume"].groupby(day).cumsum().replace(0, float("nan"))
+        return (pv / v).ffill(), True
+    return tp.groupby(day).expanding().mean().reset_index(level=0, drop=True).sort_index(), False
+
+
+# ----------------------------------------------------------------------------- figure
+def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None):
+    d = df.tail(MAX_CANDLES)
+    ema = d["Close"].ewm(span=20, adjust=False).mean()
+    vwap, real_vol = _session_vwap(d)
+
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name=f"Nifty 50 · {INTERVAL_MIN}m",
+        increasing=dict(line=dict(color=UP, width=1), fillcolor=UP),
+        decreasing=dict(line=dict(color=DOWN, width=1), fillcolor=DOWN),
+        whiskerwidth=0.4))
+    fig.add_trace(go.Scatter(x=d.index, y=ema, mode="lines", name="EMA 20",
+                             line=dict(color="#2962FF", width=1.2), hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=d.index, y=vwap, mode="lines",
+                             name="VWAP" if real_vol else "VWAP (avg proxy)",
+                             line=dict(color="#E040FB", width=1.8, dash="dot"), hoverinfo="skip"))
+
+    if poc:
+        fig.add_hline(y=poc, line_width=1.2, line_color="#FFEA00", opacity=0.7,
+                      annotation_text=f"POC {poc:,.0f}", annotation_position="top left",
+                      annotation_font_color="#FFEA00")
+    if ltp:
+        last_up = d["Close"].iloc[-1] >= d["Open"].iloc[-1]
+        col = UP if last_up else DOWN
+        fig.add_hline(y=ltp, line_width=1, line_dash="dot", line_color=col,
+                      annotation_text=f" {ltp:,.2f} ", annotation_position="right",
+                      annotation_font=dict(color="#fff", size=12), annotation_bgcolor=col)
+
+    vis = d.tail(VISIBLE_CANDLES)
+    lo, hi = float(vis["Low"].min()), float(vis["High"].max())
+    pad = max((hi - lo) * 0.08, 5.0)
+    x_end = d.index[-1] + pd.Timedelta(minutes=INTERVAL_MIN * 5)
+
+    fig.update_layout(
+        template="plotly_dark", height=520, uirevision=f"nifty-live-{INTERVAL_MIN}m",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=4, r=4, t=36, b=8), hovermode="x unified", dragmode="pan",
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0, font=dict(size=11)),
+    )
+    fig.update_xaxes(
+        range=[vis.index[0], x_end], tickformat="%H:%M", nticks=6, showgrid=True,
+        gridcolor="rgba(255,255,255,.05)", rangebreaks=[
+            dict(bounds=["sat", "mon"]),                  # weekends
+            dict(bounds=[15.5, 9.25], pattern="hour"),    # overnight (NSE 09:15 - 15:30)
+        ])
+    fig.update_yaxes(range=[lo - pad, hi + pad], side="right", showgrid=True,
+                     gridcolor="rgba(255,255,255,.06)", tickformat=",.0f")
+    return fig
+
+
+# ----------------------------------------------------------------------------- UI
+def _header(ltp, prev_day_close, is_open):
+    if ltp is None:
+        return
+    chg = (ltp - prev_day_close) if prev_day_close else 0.0
+    pct = (chg / prev_day_close * 100) if prev_day_close else 0.0
+    col = UP if chg >= 0 else DOWN
+    arrow = "▲" if chg >= 0 else "▼"
+    _n = pd.Timestamp.now(tz="Asia/Kolkata")
+    secs = INTERVAL_MIN * 60 - ((_n.minute % INTERVAL_MIN) * 60 + _n.second)
+    secs_txt = f"{secs // 60}m {secs % 60:02d}s"
+    badge = ('<span class="lc-live"><i></i>LIVE</span>' if is_open
+             else '<span class="lc-live off">MARKET CLOSED</span>')
+    timer = f'<span class="lc-t">candle closes in {secs_txt}</span>' if is_open else ""
+    st.markdown(f"""
+<style>
+.lc-bar{{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 14px;margin:2px 0 6px}}
+.lc-px{{font:600 clamp(26px,5vw,40px)/1 'JetBrains Mono',monospace;letter-spacing:-.02em}}
+.lc-ch{{font:500 15px 'JetBrains Mono',monospace}}
+.lc-t{{font:500 12px 'JetBrains Mono',monospace;color:#8b93ad}}
+.lc-live{{display:inline-flex;align-items:center;gap:6px;font:600 11px 'JetBrains Mono',monospace;
+  letter-spacing:.12em;color:#22e6a8;padding:4px 10px;border:1px solid rgba(34,230,168,.4);border-radius:999px}}
+.lc-live i{{width:7px;height:7px;border-radius:50%;background:#22e6a8;animation:lcp 1.4s infinite}}
+.lc-live.off{{color:#ff8a9b;border-color:rgba(255,93,122,.4)}}
+@keyframes lcp{{50%{{opacity:.25}}}}
+</style>
+<div class="lc-bar"><span class="lc-px">{ltp:,.2f}</span>
+<span class="lc-ch" style="color:{col}">{arrow} {chg:+,.2f} ({pct:+.2f}%)</span>{badge}{timer}</div>
+""", unsafe_allow_html=True)
+
+
+def _body(was_open: bool):
+    state = market_status.get_market_status()["state"]
+    is_open = state == "OPEN"
+    if is_open != was_open:          # market just opened/closed -> re-pick refresh speed once
+        st.rerun()
+
+    token = st.session_state.get("access_token")
+    if not token:
+        try:
+            token = upstox_auth._stored_token()      # shared login token (no UI side effects)
+        except Exception:
+            token = None
+    if not token:
+        st.info("⏳ Live chart: broker login hone ka wait... (dashboard login hote hi chalu ho jaayega)")
+        return
+
+    hist = _history(token)
+    if hist is None or len(hist) == 0:
+        st.warning("5-minute candles abhi broker se nahi mile -- thodi der mein dobara try hoga.")
+        return
+
+    df = _to_naive_ist(hist)
+    ltp = None
+    if is_open:
+        ltp = _ltp(token)
+        if ltp:
+            now_naive = pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None)
+            df, st.session_state["_lc_forming"] = apply_live_tick(
+                df, float(ltp), now_naive, st.session_state.get("_lc_forming"))
+    if ltp is None:
+        ltp = float(df["Close"].iloc[-1])
+
+    last_day = df.index[-1].normalize()
+    prev = df[df.index.normalize() < last_day]
+    prev_day_close = float(prev["Close"].iloc[-1]) if len(prev) else None
+
+    _header(ltp, prev_day_close, is_open)
+    st.plotly_chart(
+        build_figure(df, ltp, st.session_state.get("_live_poc")),
+        width="stretch", key="live_candle_chart",
+        config={"displaylogo": False, "scrollZoom": True,
+                "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"]})
+    st.caption(f"{INTERVAL_MIN}-minute candles · Upstox live feed · chalti hui candle har "
+               f"{TICK_SECONDS}s mein update hoti hai" if is_open else
+               f"{INTERVAL_MIN}-minute candles · Upstox · market band hai, aakhri session dikh raha hai")
+
+
+def render() -> bool:
+    """One-line switch + the live 5-minute chart.  Returns False if the feature is disabled (caller then keeps its old chart);
+    True otherwise -- also when the switch is OFF, so the old chart does not pop up in its place."""
+    if not enabled():
+        return False
+    try:
+        if not st.toggle("📈 Live 5-min chart dikhao", value=False, key=SWITCH_KEY,
+                         help="ON karo to TradingView jaisa live 5-minute chart khulega. OFF = chhupa hua (page halka rehta hai)."):
+            return True
+        is_open = market_status.get_market_status()["state"] == "OPEN"
+        frag = st.fragment(run_every=TICK_SECONDS if is_open else None)(_body)
+        frag(is_open)
+        return True
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("live_chart failed; falling back to old chart")
+        return False
+# @@END live_chart
+# @@MODULE index_correlation
+from app_logging import get_logger
+logger = get_logger(__name__)
+import requests
+import yfinance as yf
+import streamlit as st
+
+# Bank Nifty carries ~35% effective weight inside Nifty 50 (via the bank
+# stocks that sit in both indices) and is the single biggest driver of
+# Nifty option chain sentiment on any given day. Sensex is tracked as a
+# broader market cross-check. Both follow the same Upstox-first (live,
+# most accurate) -> Yahoo Finance fallback (delayed) pattern used
+# everywhere else in this app, for consistency and best-available accuracy.
+
+INDEX_TARGETS = [
+    {"name": "Bank Nifty", "instrument_key": "NSE_INDEX|Nifty Bank", "yf": "^NSEBANK"},
+    {"name": "Sensex", "instrument_key": "BSE_INDEX|SENSEX", "yf": "^BSESN"},
+]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_prev_close(yf_ticker):
+    """Fetches the LAST COMPLETED trading day's close from Yahoo Finance.
+    We deliberately don't trust Upstox's own ohlc.close for this: once the
+    market closes for the day, Upstox starts returning TODAY's own closing
+    price in that field (same as the live price), which would make every
+    change_pct compute as a false 0.0% after-hours -- even though the index
+    genuinely moved during the session. Using an independent previous-close
+    source keeps change_pct correct at all times, live or after close."""
+    try:
+        hist = yf.Ticker(yf_ticker).history(period="5d")
+        if hist.empty or len(hist) < 2:
+            return None
+        return float(hist['Close'].iloc[-2])
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None
+
+
+def _fetch_upstox_index(access_token, instrument_key, prev_close):
+    if not access_token or prev_close is None or prev_close == 0:
+        return None
+    try:
+        import urllib.parse
+        encoded_key = urllib.parse.quote(instrument_key, safe="|")
+        url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={encoded_key}"
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
+        res = requests.get(url, headers=headers, timeout=6)
+        res_json = res.json()
+        if res_json.get("status") != "success":
+            return None
+        data = res_json.get("data", {})
+        if not data:
+            return None
+        # Upstox keys responses by a symbol-ish key, not always the exact
+        # instrument_key string -- take the first (only) entry returned.
+        match = next(iter(data.values()), None)
+        if match is None:
+            return None
+        ltp = match.get("last_price")
+        if ltp is None:
+            return None
+        # prev_close comes from Yahoo (see _get_prev_close), NOT from
+        # Upstox's own ohlc.close -- that field is unreliable after
+        # market hours (see docstring above).
+        change_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+        return round(float(ltp), 2), change_pct
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def _fetch_yfinance_index(ticker):
+    try:
+        hist = yf.Ticker(ticker).history(period="2d")
+        if hist.empty or len(hist) < 1:
+            return None
+        current = float(hist['Close'].iloc[-1])
+        prev = float(hist['Close'].iloc[-2]) if len(hist) > 1 else current
+        if prev == 0:
+            return None
+        change_pct = round(((current - prev) / prev) * 100, 2)
+        return round(current, 2), change_pct
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _get_nifty_prev_close():
+    try:
+        hist = yf.Ticker("^NSEI").history(period="5d")
+        if hist.empty or len(hist) < 2:
+            return None
+        return float(hist['Close'].iloc[-2])
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        return None
+
+
+def get_nifty_change_pct(live_price):
+    """Approximate Nifty 50 day change % using live_price vs the last
+    completed session's close (from Yahoo Finance), used only for the
+    Bank Nifty divergence comparison below."""
+    prev_close = _get_nifty_prev_close()
+    if prev_close is None or prev_close == 0 or live_price is None:
+        return None
+    return round(((live_price - prev_close) / prev_close) * 100, 2)
+
+
+def get_bank_nifty_sensex(access_token=None, nifty_change_pct=None):
+    """
+    Returns a list of dicts: [{name, price, change_pct, source}, ...] for
+    Bank Nifty and Sensex, plus a correlation note vs Nifty 50's own
+    change (passed in as nifty_change_pct) since a Bank Nifty vs Nifty
+    divergence is a well-known real-world fakeout warning signal.
+    """
+    results = []
+    for target in INDEX_TARGETS:
+        prev_close = _get_prev_close(target["yf"])
+        value = _fetch_upstox_index(access_token, target["instrument_key"], prev_close)
+        source = "Upstox (Live)"
+        if value is None:
+            value = _fetch_yfinance_index(target["yf"])
+            source = "Yahoo Finance (delayed)"
+        if value is None:
+            results.append({"name": target["name"], "price": None, "change_pct": None, "source": "Unavailable"})
+        else:
+            price, change_pct = value
+            results.append({"name": target["name"], "price": price, "change_pct": change_pct, "source": source})
+
+    correlation_note = None
+    bn = next((r for r in results if r["name"] == "Bank Nifty"), None)
+    if bn and bn["change_pct"] is not None and nifty_change_pct is not None:
+        diff = bn["change_pct"] - nifty_change_pct
+        if abs(diff) < 0.15:
+            correlation_note = "CONFIRMED — Bank Nifty and Nifty 50 are moving together (healthy participation)."
+        elif diff <= -0.15 and nifty_change_pct > 0:
+            correlation_note = "DIVERGENCE WARNING — Nifty is up but Bank Nifty is lagging/negative. Classic fake-breakout risk."
+        elif diff >= 0.15 and nifty_change_pct < 0:
+            correlation_note = "DIVERGENCE WARNING — Nifty is down but Bank Nifty is holding up. Possible fake-breakdown risk."
+        else:
+            correlation_note = f"Mild divergence ({diff:+.2f} pts gap) — not a strong confirmation either way."
+
+    return results, correlation_note
+# @@END index_correlation

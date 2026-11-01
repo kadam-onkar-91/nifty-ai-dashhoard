@@ -1,0 +1,2784 @@
+# trade_core.pym -- module bundle: Trade learning (self-learning), shadow trades, notifications, post-mortem, diagnostics, gate log
+# Each section between '# @@MODULE name' and '# @@END name' is the ORIGINAL module source, unchanged.
+# bundle_loader.py imports every section as its own module (same import names as before).
+# Modules in this bundle: trade_learning, shadow_trades, trade_notify, trade_postmortem, trade_diagnostics, gate_log, stock_learning
+# @@MODULE trade_learning
+"""
+trade_learning.py — self-learning trade DECISION engine, separate from
+the existing database.py trade log (left completely untouched).
+
+STORAGE: uses Supabase (a free, permanent Postgres database) as the
+primary backend, so trade history SURVIVES app restarts, redeploys, and
+Streamlit Cloud's own sleep/wake cycles -- fixing the earlier problem
+where local SQLite lived only in the app's temporary container and was
+wiped every time that container was recreated.
+
+If Supabase isn't configured (no secrets set), this module falls back
+to local SQLite so the app doesn't crash -- but that fallback is NOT
+persistent, and get_storage_status() reports that plainly so the UI can
+warn about it instead of silently losing data again.
+
+Everything else about this module is unchanged from before:
+  1. Only speaks up when a real minimum bar of confluence is met.
+  2. Reads every factor this tool computes.
+  3. Logs every recommendation with its exact factor snapshot, then
+     auto-resolves it (WIN/LOSS/EXPIRED) against live price.
+  4. Learns, per factor, whether it has actually been predictive in
+     THIS user's own resolved history -- with too little data, it says
+     so instead of pretending to be confident.
+  5. Confidence is capped well below 90% -- no tool can promise more.
+"""
+from app_logging import get_logger
+logger = get_logger(__name__)
+
+import sqlite3
+import json
+import requests
+from datetime import datetime, timedelta, time as _dtime
+
+import edge_model
+
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    _IST = _ZI("Asia/Kolkata")
+except Exception:  # pragma: no cover
+    _IST = None
+
+
+def _now_ist():
+    """Naive IST wall-clock.  Streamlit Cloud runs in UTC; trade timestamps, expiry and the
+    end-of-day square-off must all use the exchange clock or they drift by 5.5 hours."""
+    return datetime.now(_IST).replace(tzinfo=None) if _IST is not None else datetime.now()
+
+
+def _now_str():
+    return _now_ist().strftime("%Y-%m-%d %H:%M:%S")
+
+
+DB_NAME = "trade_learning.db"
+TABLE = "ai_trade_setups"
+
+CONFIDENCE_FLOOR = 32.0
+CONFIDENCE_CEILING = 78.0
+MIN_SAMPLES_FOR_LEARNING = 8
+MIN_FACTORS_TRUE_TO_QUALIFY = 7
+MAX_HOLD_MINUTES = 120
+TRAIL_TRIGGER_PTS = 40      # (unused: trailing stays disabled, see resolve_open_setups)
+EOD_SQUAREOFF = _dtime(15, 20)   # open trades are closed (EXPIRED, mark-to-market) at this IST time
+TIME_STOP_MIN = 60               # a trade that has NOT moved in our favour by this time is closed (frees the slot for a better setup)
+TIME_STOP_MIN_FAV_R = 0.35       # ... 'moved in our favour' = best excursion >= this many R
+EXPIRED_LEARN_MIN_R = 0.5        # an EXPIRED trade teaches the learner only if it moved >= this many R
+LEARNING_WINDOW = 80             # most recent resolved trades used by the edge model
+COOLDOWN_AFTER_LOSS_MIN = 10     # no re-entry in the SAME direction this soon after a stop-out (~2 candles)
+LOSS_STREAK_PAUSE = None         # None = off.  Set e.g. 3 to pause after that many straight losses today ...
+LOSS_STREAK_PAUSE_MIN = 45       # ... pause new entries for this long
+
+ALL_FACTOR_KEYS = [
+    "main_signal_aligned", "ml_agrees", "level_pct_ge_65",
+    "banknifty_no_divergence", "breadth_aligned", "global_aligned",
+    "oi_aligned", "fvg_ob_confluence", "vwap_aligned",
+    "htf_1h_aligned", "htf_15min_aligned", "round_number_level",
+    "liquidity_sweep", "low_vix", "news_sentiment_aligned", "ladder_confluence_aligned",
+    "sniper_setup_aligned", "away_from_max_pain", "global_research_aligned",
+    "order_flow_aligned", "regime_aligned", "mtf_stack_aligned",
+    "data_quality_pass", "strong_daily_level", "strong_opening_range_level",
+    "entry_timing_safe", "no_opposite_transition", "immediate_reversal_risk_low",
+    "nifty50_news_aligned", "nifty50_fundamentals_aligned", "external_ai_aligned",
+    "entry_not_extended", "entry_confirmed_bounce", "pcr_velocity_aligned",
+]
+
+FACTOR_LABELS = {
+    "main_signal_aligned": "Main Institutional Confluence Signal",
+    "ml_agrees": "ML Ensemble Model agrees",
+    "level_pct_ge_65": "Nearest level Break/Bounce% >= 65",
+    "banknifty_no_divergence": "Bank Nifty -- no divergence warning",
+    "breadth_aligned": "Market breadth aligned",
+    "global_aligned": "Global markets aligned",
+    "oi_aligned": "Option-chain OI/PCR aligned",
+    "fvg_ob_confluence": "FVG / Order Block at this level",
+    "vwap_aligned": "VWAP bias aligned",
+    "htf_1h_aligned": "1-Hour structure aligned",
+    "htf_15min_aligned": "15-Minute structure aligned",
+    "round_number_level": "Level is a round psychological number",
+    "liquidity_sweep": "ICT liquidity sweep already seen at level",
+    "low_vix": "India VIX calm (not an elevated-risk day)",
+    "news_sentiment_aligned": "Live India news sentiment aligned (real RSS feed)",
+    "ladder_confluence_aligned": "2+ of next 3 round-number ladder levels also agree",
+    "sniper_setup_aligned": "Sniper Setup (PDH/PDL/CPR + SMC + OI) aligned",
+    "global_research_aligned": "Structured global research agrees or is neutral",
+    "away_from_max_pain": "Price moving away from Options Max Pain (less resistance)",
+    "order_flow_aligned": "Live Nifty futures order-book imbalance aligned",
+    "regime_aligned": "Market regime supports the trade direction/setup",
+    "mtf_stack_aligned": "Multi-timeframe structure stack aligned",
+    "data_quality_pass": "Live data/context quality passed",
+    "strong_daily_level": "Strong previous-day / daily-close structural level",
+    "strong_opening_range_level": "Strong opening-range structural level",
+    "entry_timing_safe": "Entry timing is safe",
+    "no_opposite_transition": "No immediate opposite trend transition",
+    "immediate_reversal_risk_low": "Immediate post-entry reversal risk is low",
+    "nifty50_news_aligned": "NIFTY 50-specific live news sentiment aligned (own RSS scoring)",
+    "nifty50_fundamentals_aligned": "NIFTY 50 constituent-aggregate fundamentals tilt aligned/neutral",
+    "external_ai_aligned": "Independent Gemini dashboard research agrees",
+    "entry_not_extended": "Entry is not chasing an extended move",
+    "entry_confirmed_bounce": "Bounce/rejection candle confirmed at the entry",
+    "pcr_velocity_aligned": "PCR velocity (OI change speed) aligned",
+}
+
+# ---------------------------------------------------------------------
+# STORAGE CONFIGURATION
+# ---------------------------------------------------------------------
+_supabase_url = None
+_supabase_key = None
+
+
+def configure_supabase(url, key):
+    """Call ONCE at app startup (from app.py, right after reading
+    st.secrets) to switch this module onto permanent Supabase storage.
+    If never called (or called with empty values), this module quietly
+    keeps using local SQLite -- see get_storage_status()."""
+    global _supabase_url, _supabase_key
+    if url and key:
+        _supabase_url = url.rstrip("/")
+        _supabase_key = key
+
+
+def _is_supabase_configured():
+    return bool(_supabase_url and _supabase_key)
+
+
+def get_storage_status():
+    """Returns (is_persistent: bool, message: str) -- app.py uses this to
+    show an honest banner instead of silently risking data loss again."""
+    if _is_supabase_configured():
+        return True, "Supabase se connected -- trade history permanently safe hai, app restart/redeploy se bhi nahi mitegi."
+    return False, ("⚠️ Persistent storage configure nahi hai -- trade history sirf is session ke liye hai, "
+                    "app restart ya redeploy hone par MIT JAAYEGI. Supabase setup karo isse permanent banane ke liye.")
+
+
+def _supabase_headers():
+    return {
+        "apikey": _supabase_key,
+        "Authorization": f"Bearer {_supabase_key}",
+        "Content-Type": "application/json",
+    }
+
+
+# ---------------------------------------------------------------------
+# LOCAL SQLITE BACKEND (fallback only -- NOT persistent across restarts)
+# ---------------------------------------------------------------------
+def _sqlite_init():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS ai_trade_setups
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  timestamp TEXT, direction TEXT, strike INTEGER, option_type TEXT,
+                  underlying_entry REAL, stop_loss REAL, target REAL,
+                  confidence_pct REAL, factors_json TEXT,
+                  status TEXT DEFAULT 'OPEN', exit_price REAL, exit_timestamp TEXT)''')
+    conn.commit()
+    conn.close()
+
+
+def _sqlite_insert(row):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""INSERT INTO ai_trade_setups
+                 (timestamp, direction, strike, option_type, underlying_entry,
+                  stop_loss, target, confidence_pct, factors_json, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
+              (row["timestamp"], row["direction"], row["strike"], row["option_type"],
+               row["underlying_entry"], row["stop_loss"], row["target"],
+               row["confidence_pct"], row["factors_json"]))
+    setup_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return setup_id
+
+
+def _sqlite_open_signature():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT direction, strike FROM ai_trade_setups WHERE status='OPEN' ORDER BY id DESC LIMIT 1")
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def _sqlite_get_open():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT id, timestamp, direction, underlying_entry, stop_loss, target, factors_json FROM ai_trade_setups WHERE status='OPEN'")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "timestamp": r[1], "direction": r[2], "underlying_entry": r[3],
+             "stop_loss": r[4], "target": r[5], "factors_json": r[6]} for r in rows]
+
+
+def _sqlite_update_factors(setup_id, factors_json):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE ai_trade_setups SET factors_json=? WHERE id=?", (factors_json, setup_id))
+    conn.commit(); conn.close()
+
+
+def _sqlite_update_sl(setup_id, new_sl):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE ai_trade_setups SET stop_loss=? WHERE id=?", (new_sl, setup_id))
+    conn.commit()
+    conn.close()
+
+
+def _sqlite_close(setup_id, status, exit_price):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    now = _now_str()
+    c.execute("UPDATE ai_trade_setups SET status=?, exit_price=?, exit_timestamp=? WHERE id=?",
+              (status, exit_price, now, setup_id))
+    conn.commit()
+    conn.close()
+
+
+def _sqlite_get_latest_open_full():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""SELECT id, timestamp, direction, strike, option_type, underlying_entry,
+                        stop_loss, target, confidence_pct
+                 FROM ai_trade_setups WHERE status='OPEN' ORDER BY id DESC LIMIT 1""")
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"id": row[0], "timestamp": row[1], "direction": row[2], "strike": row[3],
+            "option_type": row[4], "underlying_entry": row[5], "stop_loss": row[6],
+            "target": row[7], "confidence_pct": row[8]}
+
+
+def _sqlite_recent(limit):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("""SELECT timestamp, direction, strike, option_type, underlying_entry,
+                        stop_loss, target, confidence_pct, status, exit_price, exit_timestamp,
+                        factors_json
+                 FROM ai_trade_setups ORDER BY id DESC LIMIT ?""", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        d = {"timestamp": r[0], "direction": r[1], "strike": r[2], "option_type": r[3],
+             "entry": r[4], "stop_loss": r[5], "target": r[6], "confidence_pct": r[7],
+             "status": r[8], "exit_price": r[9], "exit_timestamp": r[10]}
+        d.update(_extract_entry_reasoning(r[11]))
+        out.append(d)
+    return out
+
+
+def _sqlite_resolved_factors_status():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT factors_json, status FROM ai_trade_setups WHERE status IN ('WIN','LOSS','EXPIRED') ORDER BY id ASC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def _sqlite_status_counts():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    counts = {}
+    for s in ("WIN", "LOSS", "EXPIRED"):
+        c.execute("SELECT COUNT(*) FROM ai_trade_setups WHERE status=?", (s,))
+        counts[s] = c.fetchone()[0]
+    conn.close()
+    return counts
+
+
+# ---------------------------------------------------------------------
+# SUPABASE BACKEND (permanent -- survives restarts/redeploys)
+# ---------------------------------------------------------------------
+# SPEED FIX: the 30s refresh used to fire ~8-10 separate Supabase GETs (each
+# with a 10s timeout) every cycle. Reads are now cached for a few seconds and
+# the cache is cleared immediately after ANY write (insert/update/close), so the
+# engine never sees stale open-trade state after it changes something.
+import time as _sb_time
+import threading as _sb_threading
+_SB_READ_CACHE = {}
+_SB_READ_LOCK = _sb_threading.Lock()
+_SB_READ_TTL = 12
+
+
+def _sb_cache_clear():
+    with _SB_READ_LOCK:
+        _SB_READ_CACHE.clear()
+
+
+def _sb_read_cached(fn):
+    def wrapper(*args, **kwargs):
+        key = (fn.__name__, args, tuple(sorted(kwargs.items())))
+        now = _sb_time.time()
+        with _SB_READ_LOCK:
+            hit = _SB_READ_CACHE.get(key)
+            if hit and now - hit[0] < _SB_READ_TTL:
+                return hit[1]
+        value = fn(*args, **kwargs)
+        with _SB_READ_LOCK:
+            _SB_READ_CACHE[key] = (now, value)
+        return value
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
+def _sb_insert(row):
+    url = f"{_supabase_url}/rest/v1/{TABLE}"
+    resp = requests.post(url, headers={**_supabase_headers(), "Prefer": "return=representation"},
+                          json=row, timeout=10)
+    resp.raise_for_status()
+    _sb_cache_clear()
+    data = resp.json()
+    return data[0]["id"] if data else None
+
+
+@_sb_read_cached
+def _sb_open_signature():
+    url = f"{_supabase_url}/rest/v1/{TABLE}?status=eq.OPEN&order=id.desc&limit=1&select=direction,strike"
+    resp = requests.get(url, headers=_supabase_headers(), timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    return (data[0]["direction"], data[0]["strike"]) if data else None
+
+
+@_sb_read_cached
+def _sb_get_open():
+    url = f"{_supabase_url}/rest/v1/{TABLE}?status=eq.OPEN&select=id,timestamp,direction,underlying_entry,stop_loss,target,factors_json"
+    resp = requests.get(url, headers=_supabase_headers(), timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _sb_update_factors(setup_id, factors_json):
+    url = f"{_supabase_url}/rest/v1/{TABLE}?id=eq.{setup_id}"
+    resp = requests.patch(url, headers=_supabase_headers(), json={"factors_json": factors_json}, timeout=10)
+    resp.raise_for_status()
+    _sb_cache_clear()
+
+
+def _sb_update_sl(setup_id, new_sl):
+    url = f"{_supabase_url}/rest/v1/{TABLE}?id=eq.{setup_id}"
+    resp = requests.patch(url, headers=_supabase_headers(),
+                           json={"stop_loss": new_sl}, timeout=10)
+    resp.raise_for_status()
+    _sb_cache_clear()
+
+
+def _sb_close(setup_id, status, exit_price):
+    url = f"{_supabase_url}/rest/v1/{TABLE}?id=eq.{setup_id}"
+    now = _now_str()
+    resp = requests.patch(url, headers=_supabase_headers(),
+                           json={"status": status, "exit_price": exit_price, "exit_timestamp": now}, timeout=10)
+    resp.raise_for_status()
+    _sb_cache_clear()
+
+
+@_sb_read_cached
+def _sb_get_latest_open_full():
+    url = (f"{_supabase_url}/rest/v1/{TABLE}?status=eq.OPEN&order=id.desc&limit=1"
+           f"&select=id,timestamp,direction,strike,option_type,underlying_entry,stop_loss,target,confidence_pct")
+    resp = requests.get(url, headers=_supabase_headers(), timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    return data[0] if data else None
+
+
+@_sb_read_cached
+def _sb_recent(limit):
+    url = (f"{_supabase_url}/rest/v1/{TABLE}?order=id.desc&limit={limit}"
+           f"&select=timestamp,direction,strike,option_type,underlying_entry,stop_loss,target,"
+           f"confidence_pct,status,exit_price,exit_timestamp,factors_json")
+    resp = requests.get(url, headers=_supabase_headers(), timeout=10)
+    resp.raise_for_status()
+    rows = resp.json()
+    out = []
+    for r in rows:
+        d = {"timestamp": r["timestamp"], "direction": r["direction"], "strike": r["strike"],
+             "option_type": r["option_type"], "entry": r["underlying_entry"], "stop_loss": r["stop_loss"],
+             "target": r["target"], "confidence_pct": r["confidence_pct"], "status": r["status"],
+             "exit_price": r["exit_price"], "exit_timestamp": r["exit_timestamp"]}
+        d.update(_extract_entry_reasoning(r.get("factors_json")))
+        out.append(d)
+    return out
+
+
+@_sb_read_cached
+def _sb_resolved_factors_status():
+    url = f"{_supabase_url}/rest/v1/{TABLE}?status=in.(WIN,LOSS,EXPIRED)&order=id.asc&select=factors_json,status"
+    resp = requests.get(url, headers=_supabase_headers(), timeout=10)
+    resp.raise_for_status()
+    return [(r["factors_json"], r["status"]) for r in resp.json()]
+
+
+@_sb_read_cached
+def _sb_status_counts():
+    url = f"{_supabase_url}/rest/v1/{TABLE}?select=status"
+    resp = requests.get(url, headers=_supabase_headers(), timeout=10)
+    resp.raise_for_status()
+    counts = {"WIN": 0, "LOSS": 0, "EXPIRED": 0}
+    for r in resp.json():
+        if r["status"] in counts:
+            counts[r["status"]] += 1
+    return counts
+
+
+# ---------------------------------------------------------------------
+# PUBLIC API — same signatures regardless of backend; every function
+# below tries Supabase first (if configured), and transparently falls
+# back to local SQLite only on genuine failure or when not configured,
+# so a temporary network hiccup doesn't crash the dashboard.
+# ---------------------------------------------------------------------
+def init_db():
+    _sqlite_init()  # always available as the fallback path
+
+
+def _extract_entry_reasoning(factors_json):
+    """
+    Pull the human-readable "why this trade was taken" (playbook, score,
+    top reasons) back out of the stored factors_json, so the Recent AI
+    Setups table can show it for every PAST trade too -- not just the
+    live moment it fired. This is what actually lets you verify, for any
+    row, that it wasn't a random buy/sell.
+    """
+    try:
+        factors = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+    except Exception:
+        factors = {}
+    return {
+        "playbook": factors.get("_playbook_label", "-"),
+        "setup_score": factors.get("_setup_score"),
+        "reasons_short": " · ".join((factors.get("_reasons") or [])[:3]) or "-",
+        "probe": bool(factors.get("_probe")),
+        # Gemini review that approved this trade (None for trades logged before v37.3 -- not recorded then)
+        "gemini": factors.get("_gemini") if isinstance(factors.get("_gemini"), dict) else None,
+        # v18: which decision-logic version produced this trade. Used by recent_performance()
+        # so a bad streak from an OLD, since-changed logic can never keep penalising a NEWER one.
+        "logic_version": (factors.get("_entry_meta") or {}).get("logic_version"),
+    }
+
+
+def log_setup(direction, strike, option_type, underlying_entry, stop_loss, target,
+              confidence_pct, factor_flags: dict):
+    factors_json = json.dumps(factor_flags)
+    timestamp = _now_str()
+    if _is_supabase_configured():
+        try:
+            existing = _sb_open_signature()
+            if existing is not None and existing[0] == direction and existing[1] == strike:
+                return None
+            row = {"timestamp": timestamp, "direction": direction, "strike": strike,
+                   "option_type": option_type, "underlying_entry": underlying_entry,
+                   "stop_loss": stop_loss, "target": target, "confidence_pct": confidence_pct,
+                   "factors_json": factors_json, "status": "OPEN"}
+            return _sb_insert(row)
+        except Exception as e:
+            logger.exception("Broad exception caught; fallback path executed")
+            print(f"[trade_learning] Supabase insert failed, falling back to local: {e}")
+
+    existing = _sqlite_open_signature()
+    if existing is not None and existing[0] == direction and existing[1] == strike:
+        return None
+    return _sqlite_insert({"timestamp": timestamp, "direction": direction, "strike": strike,
+                            "option_type": option_type, "underlying_entry": underlying_entry,
+                            "stop_loss": stop_loss, "target": target,
+                            "confidence_pct": confidence_pct, "factors_json": factors_json})
+
+
+def _scan_bars(is_buy, sl, target, bars):
+    """Walk completed candles (oldest first) and return (outcome, exit_price) for the first
+    candle that touched SL or target, else (None, None).
+
+    `bars` = list of (high, low).  If ONE candle touched BOTH levels we cannot know the order,
+    so it is scored as a LOSS (pessimistic) -- the tracker must never flatter itself.
+    The old logic only compared the 30-second snapshot price with SL/target, so a spike that hit
+    the stop and came back between two refreshes was silently ignored.
+    """
+    for hi, lo in bars:
+        try:
+            hi, lo = float(hi), float(lo)
+        except Exception:
+            continue
+        if is_buy:
+            hit_sl, hit_tp = lo <= sl, hi >= target
+        else:
+            hit_sl, hit_tp = hi >= sl, lo <= target
+        if hit_sl:                       # both-in-one-candle also lands here (pessimistic)
+            return "LOSS", sl
+        if hit_tp:
+            return "WIN", target
+    return None, None
+
+
+def _bars_since(df, opened_at):
+    """(high, low) of fully-formed candles that OPENED after the trade did.  Index may be tz-aware."""
+    try:
+        if df is None or len(df) == 0 or "High" not in df.columns or "Low" not in df.columns:
+            return []
+        idx = df.index
+        try:
+            if getattr(idx, "tz", None) is not None:
+                idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+        except Exception:
+            pass
+        out = []
+        # the last row is the still-forming candle: the live price check already covers it
+        for t, hi, lo in list(zip(idx, df["High"], df["Low"]))[:-1]:
+            try:
+                tt = t.to_pydatetime()
+                if tt > opened_at and tt.date() == opened_at.date():   # only the trade's own session
+                    out.append((hi, lo))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        logger.exception("bars_since failed")
+        return []
+
+
+_EXIT_HOOK = None
+
+
+def set_exit_hook(fn):
+    """v56: fn(row, outcome, exit_price) is called after a trade is closed (Telegram exit message).  Never allowed to break the resolver."""
+    global _EXIT_HOOK
+    _EXIT_HOOK = fn
+
+
+def _fire_exit(row, outcome, exit_price):
+    try:
+        if _EXIT_HOOK:
+            _EXIT_HOOK(dict(row), outcome, exit_price)
+    except Exception:
+        logger.exception("exit hook failed (ignored)")
+
+
+def resolve_open_setups(live_price, df=None):
+    """Call every refresh with the current underlying price (and, ideally, the OHLC frame).
+
+    Outcome rules (unchanged philosophy, now actually correct):
+      * WIN / LOSS  -- target / original SL touched.  With `df`, candle highs/lows since entry are
+                       scanned so intrabar touches between refreshes are not missed.
+      * EXPIRED     -- MAX_HOLD_MINUTES elapsed, or the EOD square-off time passed, or the trade
+                       survived into another day.  Stored with its mark-to-market R so the
+                       learner can still learn from it (see _resolved_learning_rows).
+    No trailing / breakeven stop: SL stays at the original level.
+    """
+    try:
+        open_rows = _sb_get_open() if _is_supabase_configured() else _sqlite_get_open()
+    except Exception as e:
+        logger.exception("Broad exception caught; fallback path executed")
+        print(f"[trade_learning] Could not fetch open setups, using local fallback: {e}")
+        open_rows = _sqlite_get_open()
+
+    now = _now_ist()
+    for row in open_rows:
+        setup_id, ts, direction = row["id"], row["timestamp"], row["direction"]
+        entry, sl, target = row["underlying_entry"], row["stop_loss"], row["target"]
+        try:
+            factors = json.loads(row.get("factors_json") or "{}") if isinstance(row, dict) else {}
+        except Exception:
+            factors = {}
+        if not isinstance(factors, dict):
+            factors = {}
+        meta = factors.get("_learning_meta") if isinstance(factors.get("_learning_meta"), dict) else {}
+        is_buy = direction == "BUY"
+        risk = max(abs(float(entry) - float(sl)), 1e-9)
+        try:
+            opened_at = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            opened_at = None
+
+        favorable = (live_price - entry) if is_buy else (entry - live_price)
+        adverse = (entry - live_price) if is_buy else (live_price - entry)
+        meta["max_favorable_pts"] = round(max(float(meta.get("max_favorable_pts", 0.0)), float(favorable)), 2)
+        meta["max_adverse_pts"] = round(max(float(meta.get("max_adverse_pts", 0.0)), float(adverse)), 2)
+        meta["immediate_reversal_observed"] = bool(meta["max_adverse_pts"] >= max(0.35 * abs(entry - sl), 6.0))
+
+        # 1) completed candles since entry (catches intrabar SL/target touches)
+        outcome, exit_px = (None, None)
+        if opened_at is not None:
+            _bars = _bars_since(df, opened_at)
+            # best / worst excursion must include candle highs/lows, not only the 30 s snapshots
+            for _hi, _lo in _bars:
+                try:
+                    _fav = (float(_hi) - entry) if is_buy else (entry - float(_lo))
+                    _adv = (entry - float(_lo)) if is_buy else (float(_hi) - entry)
+                    meta["max_favorable_pts"] = round(max(float(meta["max_favorable_pts"]), _fav), 2)
+                    meta["max_adverse_pts"] = round(max(float(meta["max_adverse_pts"]), _adv), 2)
+                except Exception:
+                    pass
+            outcome, exit_px = _scan_bars(is_buy, sl, target, _bars)
+        # 2) a trade that survived into another session is closed at the last price seen in ITS session --
+        #    today's gap-open price is not a price the trade could ever have been filled at
+        carried = opened_at is not None and opened_at.date() != now.date()
+        if outcome is None and carried:
+            outcome = "EXPIRED"
+            exit_px = float(meta.get("last_seen_price", entry))
+            meta["expired_reason"] = "carried_overnight"
+        # 3) the live price right now
+        if outcome is None:
+            if is_buy:
+                if live_price >= target: outcome, exit_px = "WIN", live_price
+                elif live_price <= sl: outcome, exit_px = "LOSS", live_price
+            else:
+                if live_price <= target: outcome, exit_px = "WIN", live_price
+                elif live_price >= sl: outcome, exit_px = "LOSS", live_price
+        # 4) time based exits (same session)
+        if outcome is None and opened_at is not None:
+            stagnant = ((now - opened_at) >= timedelta(minutes=TIME_STOP_MIN)
+                        and float(meta.get("max_favorable_pts", 0.0)) < TIME_STOP_MIN_FAV_R * risk)
+            if now.time() >= EOD_SQUAREOFF or (now - opened_at) > timedelta(minutes=MAX_HOLD_MINUTES) or stagnant:
+                outcome = "EXPIRED"
+                exit_px = live_price
+                meta["expired_reason"] = ("eod_squareoff" if now.time() >= EOD_SQUAREOFF
+                                          else "max_hold" if (now - opened_at) > timedelta(minutes=MAX_HOLD_MINUTES)
+                                          else "time_stop_no_progress")
+        if outcome is None:
+            meta["last_seen_price"] = round(float(live_price), 2)   # used if the trade is ever carried overnight
+        if outcome == "EXPIRED":
+            pnl = (exit_px - entry) if is_buy else (entry - exit_px)
+            meta["expired_r"] = round(pnl / risk, 3)
+
+        factors["_learning_meta"] = meta
+        try:
+            payload = json.dumps(factors)
+            if _is_supabase_configured(): _sb_update_factors(setup_id, payload)
+            else: _sqlite_update_factors(setup_id, payload)
+        except Exception:
+            logger.exception("Could not persist learning excursion metadata")
+
+        if outcome:
+            try:
+                if _is_supabase_configured():
+                    _sb_close(setup_id, outcome, exit_px)
+                else:
+                    _sqlite_close(setup_id, outcome, exit_px)
+                _fire_exit(row, outcome, exit_px)
+            except Exception as e:
+                logger.exception("Broad exception caught; fallback path executed")
+                print(f"[trade_learning] Could not close setup {setup_id}: {e}")
+
+
+def resolve_tick(live_price):
+    """Cheap, price-only check used by tick_guard every ~2 s: close an OPEN trade the moment the LIVE price touches its
+    original stop-loss or its target.  Never applies time exits (those stay in resolve_open_setups) and never trails the stop.
+    Only trades opened today are touched here; a carried-over trade is handled by the heavy path."""
+    try:
+        live_price = float(live_price)
+    except Exception:
+        return 0
+    if not live_price or live_price != live_price:
+        return 0
+    try:
+        open_rows = _sb_get_open() if _is_supabase_configured() else _sqlite_get_open()
+    except Exception:
+        logger.exception("resolve_tick: could not fetch open setups")
+        try:
+            open_rows = _sqlite_get_open()
+        except Exception:
+            return 0
+    now = _now_ist()
+    closed = 0
+    for row in open_rows or []:
+        try:
+            opened_at = datetime.strptime(str(row["timestamp"])[:19], "%Y-%m-%d %H:%M:%S")
+            if opened_at.date() != now.date():
+                continue
+            is_buy = row["direction"] == "BUY"
+            sl, target = float(row["stop_loss"]), float(row["target"])
+            if is_buy:
+                outcome = "WIN" if live_price >= target else ("LOSS" if live_price <= sl else None)
+            else:
+                outcome = "WIN" if live_price <= target else ("LOSS" if live_price >= sl else None)
+            if outcome:
+                if _is_supabase_configured():
+                    _sb_close(row["id"], outcome, live_price)
+                else:
+                    _sqlite_close(row["id"], outcome, live_price)
+                _fire_exit(row, outcome, live_price)
+                closed += 1
+        except Exception:
+            logger.exception("resolve_tick: row failed (ignored)")
+    return closed
+
+
+def get_open_setup():
+    if _is_supabase_configured():
+        try:
+            return _sb_get_latest_open_full()
+        except Exception as e:
+            logger.exception("Broad exception caught; fallback path executed")
+            print(f"[trade_learning] Supabase read failed, using local fallback: {e}")
+    return _sqlite_get_latest_open_full()
+
+
+def get_recent_setups(limit=20):
+    if _is_supabase_configured():
+        try:
+            return _sb_recent(limit)
+        except Exception as e:
+            logger.exception("Broad exception caught; fallback path executed")
+            print(f"[trade_learning] Supabase read failed, using local fallback: {e}")
+    return _sqlite_recent(limit)
+
+
+def get_overall_track_record():
+    try:
+        counts = _sb_status_counts() if _is_supabase_configured() else _sqlite_status_counts()
+    except Exception as e:
+        logger.exception("Broad exception caught; fallback path executed")
+        print(f"[trade_learning] Supabase read failed, using local fallback: {e}")
+        counts = _sqlite_status_counts()
+    wins, losses, expired = counts["WIN"], counts["LOSS"], counts["EXPIRED"]
+    resolved = wins + losses
+    win_rate = round((wins / resolved) * 100, 1) if resolved > 0 else None
+    # Honest rate: EXPIRED trades that ended clearly red / green are included (see _resolved_learning_rows)
+    lab = _resolved_learning_rows()
+    lw = sum(1 for _, st in lab if st == "WIN")
+    ln = len(lab)
+    return {"wins": wins, "losses": losses, "expired": expired, "win_rate": win_rate, "sample_size": resolved,
+            "win_rate_incl_expired": round(100.0 * lw / ln, 1) if ln else None, "sample_incl_expired": ln}
+
+
+def get_factor_reliability():
+    rows = _resolved_learning_rows()
+
+    result = {}
+    for key in ALL_FACTOR_KEYS:
+        true_wins, true_losses, true_total = 0, 0, 0
+        for factors_json, status in rows:
+            try:
+                factors = json.loads(factors_json) if isinstance(factors_json, str) else factors_json
+            except Exception:
+                logger.exception("Broad exception caught; fallback path executed")
+                continue
+            if factors.get(key):
+                true_total += 1
+                if status == "WIN":
+                    true_wins += 1
+                elif status == "LOSS":
+                    true_losses += 1
+        result[key] = {
+            "win_rate_when_true": round((true_wins / true_total) * 100, 1) if true_total >= MIN_SAMPLES_FOR_LEARNING else None,
+            "samples_when_true": true_total,
+            "wins_when_true": true_wins,
+            "losses_when_true": true_losses,
+            "label": FACTOR_LABELS.get(key, key.replace("_", " ").capitalize()),
+        }
+    return result
+
+
+def _resolved_learning_rows():
+    """Resolved factor snapshots as (factors_json, 'WIN'|'LOSS').
+
+    * WIN / LOSS are used as they are.
+    * EXPIRED trades are no longer thrown away.  Throwing them away made the win rate and the
+      learner look better than reality (a trade that drifted -0.8R and timed out simply vanished).
+      An EXPIRED trade is labelled by its mark-to-market result: >= +EXPIRED_LEARN_MIN_R -> WIN,
+      <= -EXPIRED_LEARN_MIN_R -> LOSS, anything in between is genuinely inconclusive and skipped.
+      Old EXPIRED rows without a stored R are skipped.
+    """
+    try:
+        rows = _sb_resolved_factors_status() if _is_supabase_configured() else _sqlite_resolved_factors_status()
+    except Exception as e:
+        logger.exception("Broad exception caught; fallback path executed")
+        print(f"[trade_learning] learning read failed, using local fallback: {e}")
+        rows = _sqlite_resolved_factors_status()
+
+    clean = []
+    for factors_json, status in rows:
+        try:
+            factors = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+            meta = factors.get("_learning_meta") or {}
+        except Exception:
+            factors, meta = {}, {}
+        if status == "EXPIRED":
+            r = meta.get("expired_r")
+            if r is None:
+                continue
+            if r >= EXPIRED_LEARN_MIN_R:
+                status = "WIN"
+            elif r <= -EXPIRED_LEARN_MIN_R:
+                status = "LOSS"
+            else:
+                continue
+        elif status == "LOSS" and meta.get("trailed_to_breakeven"):
+            continue  # legacy rows from the old breakeven-trail version: inconclusive
+        clean.append((factors_json, status))
+    return clean
+
+
+def _labelled_flag_rows(with_version=False):
+    """[(flag_dict_without_private_keys, 1|0)] for the edge model (or triples with the logic_version when asked)."""
+    out = []
+    for factors_json, status in _resolved_learning_rows():
+        if status not in ("WIN", "LOSS"):
+            continue
+        try:
+            f = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+        except Exception:
+            continue
+        if not isinstance(f, dict):
+            continue
+        flags = {k: v for k, v in f.items() if not str(k).startswith("_")}
+        label = 1 if status == "WIN" else 0
+        if with_version:
+            out.append((flags, label, (f.get("_entry_meta") or {}).get("logic_version")))
+        else:
+            out.append((flags, label))
+    # Rolling window: only the most recent trades describe how the market behaves NOW.
+    return out[-LEARNING_WINDOW:]
+
+
+def get_learning_summary():
+    """Human-readable state of the adaptive learner.
+
+    The learner does not rewrite trading rules after one or two trades. It
+    needs a minimum sample per factor, uses Laplace/Beta smoothing, and only
+    changes the confidence weighting. This reduces overfitting to a tiny
+    live sample while still allowing the engine to adapt automatically.
+    """
+    rows = _resolved_learning_rows()
+    resolved = len(rows)
+    learned = 0
+    for key in ALL_FACTOR_KEYS:
+        n = 0
+        for factors_json, _status in rows:
+            try:
+                factors = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+            except Exception:
+                logger.exception("Broad exception caught; fallback path executed")
+                continue
+            if key in factors:
+                n += 1
+        if n >= MIN_SAMPLES_FOR_LEARNING:
+            learned += 1
+    reversal_samples = reversal_wins = reversal_losses = 0
+    for factors_json, status in rows:
+        try:
+            f = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+            if (f.get("_learning_meta") or {}).get("immediate_reversal_observed"):
+                reversal_samples += 1
+                reversal_wins += int(status == "WIN")
+                reversal_losses += int(status == "LOSS")
+        except Exception:
+            continue
+    return {
+        "resolved_trades": resolved,
+        "learned_factors": learned,
+        "min_samples_per_factor": MIN_SAMPLES_FOR_LEARNING,
+        "persistent": _is_supabase_configured(),
+        "mode": "adaptive" if learned else "warming_up",
+        "immediate_reversal": {"samples": reversal_samples, "wins": reversal_wins, "losses": reversal_losses,
+                                "win_rate": round(100*reversal_wins/(reversal_wins+reversal_losses),1) if (reversal_wins+reversal_losses) else None},
+    }
+
+
+def _factor_bayesian_reliability(rows, key):
+    """Smoothed P(WIN | factor=True) and P(WIN | factor=False).
+
+    Beta(1,1) smoothing prevents a tiny sample from producing a 0%/100%
+    reliability and therefore prevents a single lucky/unlucky trade from
+    dominating future decisions.
+    """
+    true_wins = true_n = false_wins = false_n = 0
+    for factors_json, status in rows:
+        try:
+            factors = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+        except Exception:
+            logger.exception("Broad exception caught; fallback path executed")
+            continue
+        if key not in factors:
+            continue
+        if bool(factors.get(key)):
+            true_n += 1
+            true_wins += int(status == "WIN")
+        else:
+            false_n += 1
+            false_wins += int(status == "WIN")
+    # Beta(1,1) prior: posterior mean (wins+1)/(n+2).
+    p_true = (true_wins + 1.0) / (true_n + 2.0) if true_n else None
+    p_false = (false_wins + 1.0) / (false_n + 2.0) if false_n else None
+    return p_true, true_n, p_false, false_n
+
+
+def _labelled_rows_full(include_shadow=True):
+    """Everything the learners may study, OLDEST first: [{flags, label, weight, version, feats, source}].
+    Real trades weigh 1.0.  Resolved SHADOW (paper) trades -- setups that were blocked but followed anyway -- weigh
+    shadow_trades.SHADOW_WEIGHT.  Shadow rows come first so the newest real trades form the out-of-sample test set."""
+    out = []
+    if include_shadow:
+        try:
+            import shadow_trades
+            for flags, y, feats, blocked_by in shadow_trades.labelled_rows()[-150:]:
+                out.append({"flags": flags, "label": y, "weight": shadow_trades.SHADOW_WEIGHT, "version": LOGIC_VERSION,
+                            "feats": feats, "source": "shadow", "blocked_by": blocked_by})
+        except Exception:
+            logger.exception("shadow rows unavailable (ignored)")
+    real = []
+    for factors_json, status in _resolved_learning_rows():
+        if status not in ("WIN", "LOSS"):
+            continue
+        try:
+            f = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+        except Exception:
+            continue
+        if not isinstance(f, dict):
+            continue
+        real.append({"flags": {k: v for k, v in f.items() if not str(k).startswith("_")}, "label": 1 if status == "WIN" else 0,
+                     "weight": 1.0, "version": (f.get("_entry_meta") or {}).get("logic_version"),
+                     "feats": f.get("_features") if isinstance(f.get("_features"), dict) else None, "source": "real"})
+    return out + real[-LEARNING_WINDOW:]
+
+
+SIDE_AWARE_CALIBRATION = True    # v51 kill switch.  False = the v36..v50 behaviour (one win rate for BUY and SELL together)
+SIDE_ROW_MIN = 4                 # fewer same-side rows than this -> the side has no record of its own yet (neutral prior, no drag)
+
+
+def _row_side(r):
+    """'BUY' / 'SELL' / None for one labelled row (from the stored _features.is_buy).  Old rows without features -> None."""
+    try:
+        f = r.get("feats") or {}
+        v = f.get("is_buy")
+        if v is None:
+            return None
+        return "BUY" if float(v) >= 0.5 else "SELL"
+    except Exception:
+        return None
+
+
+ENTRY_TYPE_AWARE = True          # v54 kill switch.  False = side-only calibration (v51..v53).  Only turning-point REACTION entries are judged separately;
+                                 # clean / chasing entries keep the full side record (a chase must never get easier than before)
+ENTRY_TYPE_MIN_ROWS = 6          # fewer comparable rows than this -> this kind of entry has no record of its own yet (neutral prior, no drag)
+
+
+def entry_type_of(flags):
+    """'reaction' (turning-point rejection at a validated level) / 'clean' (entry not extended) / 'extended' (chasing an already-run move) /
+    None when the stored flags can not tell (very old rows) -- unknown rows count for every type, exactly like unknown-side rows."""
+    try:
+        if not isinstance(flags, dict):
+            return None
+        if flags.get("reaction_entry"):
+            return "reaction"
+        if "entry_not_extended" not in flags:
+            return None
+        return "clean" if flags.get("entry_not_extended") else "extended"
+    except Exception:
+        return None
+
+
+def compute_edge(factor_flags: dict, rr: float, extra_penalty_logit: float = 0.0, side=None, entry_type=None):
+    """Calibrated win probability + expectancy (in R) for one candidate -- see edge_model.py.
+    Factor lifts learn from all recent history (real + shadow); the win-rate calibration uses ONLY trades made by the CURRENT
+    decision logic (LOGIC_VERSION) plus shadow trades, so an older logic's losing record can not freeze the new one.
+
+    v51: the reliability correction ("how often does THIS engine really win") is now SIDE-AWARE.  Until v50 one overall win rate
+    (mostly 25-30 % from SELL trades taken into opening reversals) was subtracted from EVERY candidate, so a fully aligned BUY
+    was rated ~27 % and could never pass -- the engine then had no new BUY data and the drag never went away.  A BUY is now judged
+    by the BUY record, a SELL by the SELL record; a side with almost no trades of its own is not punished for the other side's losses."""
+    full = _labelled_rows_full()
+    rows = [(r["flags"], r["label"], r["weight"]) for r in full]
+    cur = [r for r in full if r["version"] == LOGIC_VERSION or r["source"] == "shadow"]
+    if SIDE_AWARE_CALIBRATION and side in ("BUY", "SELL"):
+        # rows whose side is unknown (very old trades stored without features) still count for both sides -- only rows KNOWN to be the
+        # other side are left out.  A side with fewer than SIDE_ROW_MIN usable rows has no record of its own yet.
+        same = [r for r in cur if _row_side(r) in (side, None)]
+        cur = same if len(same) >= SIDE_ROW_MIN else []
+    if ENTRY_TYPE_AWARE and entry_type == "reaction":
+        # v54: a turning-point reaction is judged by REACTION trades only (no record yet -> neutral prior, still capped at 50 % and still
+        # needing the EV bar); the late-chase losses of the past say nothing about a rejection at a validated level.
+        same_t = [r for r in cur if entry_type_of(r["flags"]) in ("reaction", None)]
+        cur = same_t if len(same_t) >= ENTRY_TYPE_MIN_ROWS else []
+    elif ENTRY_TYPE_AWARE and entry_type == "live_dom":
+        # v55: an aligned, not-extended live-dominant trend entry is judged by ITS OWN rows (flag live_dom_entry, real + shadow); until
+        # ENTRY_TYPE_MIN_ROWS exist it has no record yet -> neutral prior (capped 50 %), the EV bar still applies.
+        same_t = [r for r in cur if r["flags"].get("live_dom_entry")]
+        cur = same_t if len(same_t) >= ENTRY_TYPE_MIN_ROWS else []
+    calib = [(r["flags"], r["label"], r["weight"]) for r in cur]
+    return edge_model.estimate_edge(factor_flags, rows, ALL_FACTOR_KEYS, rr=rr,
+                                    extra_penalty_logit=extra_penalty_logit, calib_rows=calib)
+
+
+def learned_adjustment(flags: dict, feats: dict):
+    """Log-odds delta from the mistake memory + the self-validated neural net (see learner_nn.py).  Never raises."""
+    try:
+        import learner_nn
+        return learner_nn.learned_adjustment(flags, feats, ALL_FACTOR_KEYS, _labelled_rows_full())
+    except Exception:
+        logger.exception("learned_adjustment failed (ignored)")
+        return {"delta_logit": 0.0, "note": "", "nn": {}, "memory": {}}
+
+
+def compute_confidence(factor_flags: dict):
+    """Backwards-compatible wrapper: (confidence_pct, used_learning, learned_count).
+
+    The number is now a calibrated win probability (not `50 + 1.8 * factors`).  Uses RR=1.5 only
+    to fill the expectancy field; callers that know the real R:R should call compute_edge().
+    """
+    e = compute_edge(factor_flags, rr=1.5)
+    conf = max(CONFIDENCE_FLOOR, min(CONFIDENCE_CEILING, e["confidence_pct"]))
+    return conf, e["learned_count"] > 0, e["learned_count"]
+
+
+# =====================================================================
+# SEGMENT LEARNING -- the engine learns WHICH kind of trade works.
+# ---------------------------------------------------------------------
+# Factor-level learning (above) says "is factor X predictive".  This adds a second
+# layer: every trade is stored with an `_entry_meta` (playbook, level grade, time-of-day
+# bucket, side, probe or not).  Once a segment has enough resolved trades and keeps
+# losing, the engine stops taking that segment by itself; segments that win stay open.
+# It only ever BLOCKS proven losers -- it never lowers a safety gate.
+# =====================================================================
+import time as _time
+
+SEGMENT_MIN_SAMPLES = 8          # resolved trades before a single segment can be judged
+SEGMENT_COMBO_MIN_SAMPLES = 6    # playbook+grade combo needs fewer (it is more specific)
+SEGMENT_BLOCK_WINRATE = 30.0     # below this win-rate (with enough samples) the segment is paused
+PROBE_MIN_SAMPLES = 6
+PROBE_PAUSE_WINRATE = 35.0       # probes pause themselves below this win-rate
+RECENT_WINDOW = 10               # last N resolved non-probe trades define "current form"
+RECENT_BAD_WINRATE = 35.0
+FORM_STALE_HOURS = 30            # v17: a 'bad form' streak older than this (wall-clock) stops penalising new entries
+# v18: bump this any time the entry-gating logic changes materially. recent_performance() only
+# counts trades tagged with the CURRENT version -- an old logic's loss streak must never keep
+# tightening/penalising a logic that has since been rewritten (that was making the bar go up
+# and stay up on stale, no-longer-relevant history).
+LOGIC_VERSION = "v36_calibrated_edge"
+MIN_NEW_LOGIC_SAMPLES = 6        # need at least this many CURRENT-logic resolved trades before 'bad form' can fire
+_SEG_CACHE = {"ts": 0.0, "stats": None}
+_SEG_CACHE_SECONDS = 60
+
+
+def _entry_meta_rows():
+    out = []
+    for factors_json, status in _resolved_learning_rows():
+        if status not in ("WIN", "LOSS"):
+            continue
+        try:
+            f = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+        except Exception:
+            continue
+        meta = f.get("_entry_meta")
+        # v43: only trades made by the CURRENT decision logic describe the current engine (same rule as recent_performance)
+        if isinstance(meta, dict) and meta.get("logic_version") == LOGIC_VERSION:
+            out.append((meta, status))
+    return out
+
+
+def get_segment_stats(force=False):
+    """{'playbook=BOUNCE_BUY': {n,wins,losses,win_rate}, 'grade=A': ..., 'combo=BOUNCE_BUY|A': ...}"""
+    now = _time.time()
+    if not force and _SEG_CACHE["stats"] is not None and now - _SEG_CACHE["ts"] < _SEG_CACHE_SECONDS:
+        return _SEG_CACHE["stats"]
+    stats = {}
+
+    def bump(k, win):
+        d = stats.setdefault(k, {"n": 0, "wins": 0, "losses": 0})
+        d["n"] += 1
+        d["wins" if win else "losses"] += 1
+
+    try:
+        for meta, status in _entry_meta_rows():
+            win = status == "WIN"
+            for key in ("playbook", "grade", "hour_bucket", "side"):
+                if meta.get(key):
+                    bump(f"{key}={meta[key]}", win)
+            bump(f"probe={bool(meta.get('probe'))}", win)
+            if meta.get("playbook") and meta.get("grade"):
+                bump(f"combo={meta['playbook']}|{meta['grade']}", win)
+    except Exception:
+        logger.exception("segment stats failed")
+    for d in stats.values():
+        d["win_rate"] = round(100.0 * d["wins"] / d["n"], 1) if d["n"] else None
+    _SEG_CACHE["ts"], _SEG_CACHE["stats"] = now, stats
+    return stats
+
+
+COARSE_SEGMENTS = ("grade", "hour_bucket", "side")   # v43: too broad to HARD-block (a whole grade / side / hour-of-day) -> soft penalty
+COARSE_SEGMENT_PENALTY = 0.12
+
+
+def segment_soft_penalty(meta):
+    """(penalty_logit, note).  A whole grade / side / hour bucket with a losing record costs a little probability instead of blocking
+    every trade of that kind (that was the 'every setup blocked, again and again' effect).  Never raises."""
+    try:
+        stats = get_segment_stats()
+        pen, notes = 0.0, []
+        for key in COARSE_SEGMENTS:
+            if not meta.get(key):
+                continue
+            d = stats.get(f"{key}={meta[key]}")
+            if d and d["n"] >= SEGMENT_MIN_SAMPLES and d["win_rate"] is not None and d["win_rate"] < SEGMENT_BLOCK_WINRATE:
+                pen += COARSE_SEGMENT_PENALTY
+                notes.append(f"{key}={meta[key]} {d['wins']}W/{d['losses']}L")
+        return round(min(pen, 0.30), 3), ("weak segment(s): " + ", ".join(notes)) if notes else ""
+    except Exception:
+        return 0.0, ""
+
+
+def segment_gate(meta):
+    """(blocked, reason).  Blocks a trade only when its (specific) segment has ENOUGH resolved trades
+    and a clearly losing record.  Not enough history => allowed (that is how it learns).
+    v43: only the specific segments hard-block (playbook, playbook|grade combo, probe); the coarse ones
+    (grade / side / hour) are a soft probability penalty -- see segment_soft_penalty()."""
+    try:
+        stats = get_segment_stats()
+    except Exception:
+        return False, ""
+    checks = []
+    for key in ("playbook",):
+        if meta.get(key):
+            checks.append((f"{key}={meta[key]}", SEGMENT_MIN_SAMPLES, SEGMENT_BLOCK_WINRATE))
+    if meta.get("playbook") and meta.get("grade"):
+        checks.append((f"combo={meta['playbook']}|{meta['grade']}", SEGMENT_COMBO_MIN_SAMPLES, SEGMENT_BLOCK_WINRATE))
+    if meta.get("probe"):
+        checks.append(("probe=True", PROBE_MIN_SAMPLES, PROBE_PAUSE_WINRATE))
+    for key, min_n, floor in checks:
+        d = stats.get(key)
+        if d and d["n"] >= min_n and d["win_rate"] is not None and d["win_rate"] < floor:
+            return True, (f"segment '{key}' ka apna record kharab hai ({d['wins']}W/{d['losses']}L = "
+                          f"{d['win_rate']}% < {floor:.0f}%) -- engine ne khud is tarah ke trade rok diye hain "
+                          f"jab tak record sudhar na jaye")
+    return False, ""
+
+
+def recent_performance(window=RECENT_WINDOW):
+    """Current form over the last resolved NON-probe trades: {'n', 'wins', 'win_rate', 'bad'}.
+    v18: only trades tagged with the CURRENT logic_version are counted -- older trades (produced
+    by since-changed gating logic) are skipped entirely so they can never be blamed on today's logic."""
+    try:
+        rows = get_recent_setups(limit=window * 8)
+    except Exception:
+        return {"n": 0, "wins": 0, "win_rate": None, "bad": False}
+    all_resolved = [r for r in rows if r.get("status") in ("WIN", "LOSS") and not r.get("probe")]
+    legacy_skipped = sum(1 for r in all_resolved if r.get("logic_version") != LOGIC_VERSION)
+    res = [r for r in all_resolved if r.get("logic_version") == LOGIC_VERSION][:window]
+    n = len(res)
+    wins = sum(1 for r in res if r.get("status") == "WIN")
+    wr = round(100.0 * wins / n, 1) if n else None
+    # limit: not enough CURRENT-logic samples yet -> can't judge form, never mark bad off stale data
+    bad = bool(n >= MIN_NEW_LOGIC_SAMPLES and wr is not None and wr < RECENT_BAD_WINRATE)
+    # v17: the penalty must EXPIRE. Bad form -> higher bar -> fewer trades -> no new results -> form never updates
+    # = the engine stays tight for days. If the newest counted trade is older than FORM_STALE_HOURS the old streak
+    # no longer describes today's market, so the extra bar is dropped until fresh results say otherwise.
+    stale = False
+    if bad and res:
+        try:
+            from datetime import datetime as _dt
+            ts = res[0].get("exit_timestamp") or res[0].get("timestamp")
+            # timestamps are stored in IST; compare with IST "now" (server clock is UTC on Streamlit Cloud)
+            age_h = (_now_ist() - _dt.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600.0
+            if age_h > FORM_STALE_HOURS:
+                bad, stale = False, True
+        except Exception:
+            pass
+    return {"n": n, "wins": wins, "win_rate": wr, "bad": bad, "stale_bad": stale, "legacy_skipped": legacy_skipped}
+
+
+
+# =====================================================================
+# ENTRY COOLDOWN -- stops "stopped out, re-entered the same idea 2 candles later, stopped out again"
+# =====================================================================
+ZONE_GUARD = True            # v49: after a stop-out, no same-side re-entry in the SAME price zone unless price has made real progress
+ZONE_GUARD_MIN = 60          # ... for this many minutes after the stop-out
+ZONE_PROGRESS_R = 0.5        # ... "real progress" = price beyond the stopped trade's entry by this many R (of that trade's risk) in our direction
+
+
+def entry_cooldown(direction, now=None, price=None):
+    """(blocked, reason).  Two cheap, well-understood protections:
+
+    1. After a LOSS in the SAME direction, wait COOLDOWN_AFTER_LOSS_MIN minutes.  A stop-out means
+       the level just failed; the very next candle is the most likely place for a repeat loss.
+    2. LOSS_STREAK_PAUSE consecutive losses today -> pause new entries LOSS_STREAK_PAUSE_MIN minutes
+       (the market is clearly not behaving like the playbooks expect right now).
+    Both expire by themselves, so they cannot freeze the engine for days.
+    """
+    now = now or _now_ist()
+    try:
+        rows = get_recent_setups(limit=12)
+    except Exception:
+        return False, ""
+
+    def _t(r):
+        try:
+            return datetime.strptime(str(r.get("exit_timestamp") or r.get("timestamp"))[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+    closed = [r for r in rows if r.get("status") in ("WIN", "LOSS", "EXPIRED")]
+    # 1) same-direction cooldown after the latest closed trade of that direction
+    for r in closed:
+        if r.get("direction") != direction:
+            continue
+        t = _t(r)
+        if r.get("status") == "LOSS" and t is not None and (now - t) < timedelta(minutes=COOLDOWN_AFTER_LOSS_MIN):
+            left = COOLDOWN_AFTER_LOSS_MIN - int((now - t).total_seconds() // 60)
+            return True, (f"Cooldown: last {direction} trade was stopped out {int((now - t).total_seconds() // 60)} min ago; "
+                          f"waiting ~{left} more min so the engine does not re-enter the same failed idea.")
+        break
+    # 1b) v49 same-zone guard.  Two of the last five straight losses were exactly this: stopped out, then the SAME side re-entered
+    #     within a few points of the failed entry (10-21 SELL 22683.8 -> 22687.1; 10-22 SELL 22636.1 -> 22629.1) and was stopped again.
+    #     A re-entry is allowed only after price has moved clearly past the failed entry (the stop-out was then just a shake-out).
+    try:
+        if ZONE_GUARD and price is not None:
+            px = float(price)
+            for r in closed:
+                if r.get("direction") != direction:
+                    continue
+                t = _t(r)
+                if r.get("status") == "LOSS" and t is not None and timedelta(0) <= (now - t) < timedelta(minutes=ZONE_GUARD_MIN):
+                    e, sl = float(r.get("entry")), float(r.get("stop_loss"))
+                    risk = abs(e - sl)
+                    need = ZONE_PROGRESS_R * risk
+                    progress = (e - px) if direction == "SELL" else (px - e)
+                    if risk > 0 and progress < need:
+                        return True, (f"Cooldown (same-zone re-entry): the last {direction} from {e:,.0f} was stopped out "
+                                      f"{int((now - t).total_seconds() // 60)} min ago and price ({px:,.0f}) has not moved {need:.0f} pts beyond that entry "
+                                      f"in our direction yet -- waiting for a real new low/high instead of re-entering the same failed zone.")
+                break
+    except Exception:
+        logger.exception("same-zone guard failed (ignored)")
+    # 2) loss streak today
+    streak = 0
+    last_loss_t = None
+    for r in closed:
+        t = _t(r)
+        if t is None or t.date() != now.date():
+            break
+        if r.get("status") == "LOSS":
+            streak += 1
+            last_loss_t = last_loss_t or t
+        else:
+            break
+    if LOSS_STREAK_PAUSE and streak >= LOSS_STREAK_PAUSE and last_loss_t is not None and (now - last_loss_t) < timedelta(minutes=LOSS_STREAK_PAUSE_MIN):
+        left = LOSS_STREAK_PAUSE_MIN - int((now - last_loss_t).total_seconds() // 60)
+        return True, (f"Loss-streak pause: {streak} consecutive losses today; new entries resume in ~{left} min "
+                      f"(market is not behaving like the playbooks expect).")
+    return False, ""
+
+
+# =====================================================================
+# ONE SETUP, ONE TRADE -- never re-enter on a signal that has already been traded
+# =====================================================================
+def _parse_naive_ist(x):
+    """Timestamp string / Timestamp (maybe tz-aware) -> naive IST datetime, or None."""
+    if x is None:
+        return None
+    try:
+        import pandas as _pd
+        t = _pd.Timestamp(x)
+        if t.tzinfo is not None:
+            t = t.tz_convert("Asia/Kolkata").tz_localize(None)
+        return t.to_pydatetime()
+    except Exception:
+        return None
+
+
+def signal_already_traded(direction, formed_at):
+    """(used, reason).  A strategy signal stays 'alive' for ~6 candles (30 min).  After a trade from it hit its target
+    (or was stopped), the very next refresh used to see the SAME still-alive signal and open another trade on it --
+    i.e. buy again at the top of the move that just paid out.  A new trade in the same direction now needs a signal
+    that formed AFTER the previous same-direction trade was opened (a genuinely new setup + a fresh full research pass)."""
+    ft = _parse_naive_ist(formed_at)
+    if ft is None:
+        return False, ""
+    # `formed_at` is the OPEN time of the 5-min candle that completed the signal, i.e. the signal really exists
+    # from the candle's close.  Without this shift a trade logged 30 s after that close would wrongly mark the very
+    # NEXT candle's fresh signal as "already used".
+    ft = ft + timedelta(minutes=5)
+    try:
+        rows = get_recent_setups(limit=12)
+    except Exception:
+        return False, ""
+    for r in rows:                                     # newest first
+        if r.get("direction") != direction:
+            continue
+        et = _parse_naive_ist(r.get("timestamp"))
+        if et is not None and ft <= et:
+            return True, (f"Same setup already traded: the {direction} strategy signal formed at {ft.strftime('%H:%M')} "
+                          f"was already used by the trade opened {et.strftime('%H:%M')} ({r.get('status')}). "
+                          f"Waiting for a NEW setup instead of re-entering after the move.")
+        break
+    return False, ""
+
+
+# ---------------------------------------------------------------------
+# v48: full resolved-trade reader for the post-trade review (read-only, additive)
+# ---------------------------------------------------------------------
+def get_resolved_full(limit=150):
+    """Closed trades (WIN / LOSS / EXPIRED), NEWEST first, each with its parsed `factors` dict (entry flags, _features,
+    _entry_meta, _learning_meta ...).  Used only by trade_postmortem.  Never raises -> [] on any problem."""
+    cols = "timestamp,direction,underlying_entry,stop_loss,target,status,exit_price,exit_timestamp,factors_json,confidence_pct"
+    out = []
+    try:
+        rows = None
+        if _is_supabase_configured():
+            try:
+                url = (f"{_supabase_url}/rest/v1/{TABLE}?status=in.(WIN,LOSS,EXPIRED)&order=id.desc&limit={int(limit)}&select={cols}")
+                resp = requests.get(url, headers=_supabase_headers(), timeout=10)
+                resp.raise_for_status()
+                rows = resp.json()
+            except Exception:
+                logger.exception("get_resolved_full: supabase read failed, using local")
+                rows = None
+        if rows is None:
+            conn = sqlite3.connect(DB_NAME)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = [dict(r) for r in conn.execute(
+                    f"SELECT {cols} FROM ai_trade_setups "
+                    "WHERE status IN ('WIN','LOSS','EXPIRED') ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()]
+            finally:
+                conn.close()
+        for r in rows:
+            try:
+                f = json.loads(r.get("factors_json") or "{}") if isinstance(r.get("factors_json"), str) else (r.get("factors_json") or {})
+            except Exception:
+                f = {}
+            out.append({"timestamp": r.get("timestamp"), "direction": r.get("direction"), "entry": r.get("underlying_entry"),
+                        "stop_loss": r.get("stop_loss"), "target": r.get("target"), "status": r.get("status"),
+                        "exit_price": r.get("exit_price"), "exit_timestamp": r.get("exit_timestamp"),
+                        "confidence_pct": r.get("confidence_pct"), "factors": f if isinstance(f, dict) else {}})
+    except Exception:
+        logger.exception("get_resolved_full failed (ignored)")
+        return []
+    return out
+# @@END trade_learning
+# @@MODULE shadow_trades
+"""
+shadow_trades.py -- learn from setups the engine did NOT take, without risking money.
+
+THE PROBLEM THIS SOLVES
+  Gates (edge bar, entry quality, Gemini ...) protect money, but each blocked setup teaches nothing: no trade -> no result ->
+  no learning -> the engine never finds out whether the block was right, and a bad stretch can freeze it ("no trades -> no data").
+THE FIX
+  Every blocked candidate that has a full entry / SL / target is logged as a SHADOW trade and followed with the same
+  SL / target / time-stop rules as a real one.  Real trades are unchanged (Gemini still the final block -- shadow trades never
+  place or suggest anything).  Resolved shadows are fed to the learners with a smaller weight (SHADOW_WEIGHT) and are summarised
+  per gate, so you can SEE e.g. "Gemini blocked 9 setups, 7 would have lost" (Gemini is right) or "the entry-quality gate blocked
+  8, 6 would have won" (that gate is too strict).
+
+STORAGE  Supabase table `ai_shadow_setups` if it exists (run SUPABASE_SHADOW_MIGRATION.sql once), otherwise the local SQLite file
+         (works, but is lost when the app restarts).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+import time
+from datetime import datetime, timedelta
+
+import requests
+
+import trade_learning as tl
+
+logger = logging.getLogger(__name__)
+
+SHADOW_WEIGHT = 0.5                # a paper trade counts half as much as a real one (no slippage/fill risk in it)
+SHADOW_MAX_PER_DAY = 30            # v55: was 15 -- the S/R gate used it all up, so the biggest gate (edge/EV) was never tracked
+SHADOW_MAX_PER_GATE_PER_DAY = 10   # v55: every blocking gate gets its own share of the day's budget
+SHADOW_MIN_GAP_MIN = 15            # per direction: a new shadow only this long after the previous one (avoid 10 copies of one idea)
+SHADOW_MAX_OPEN_PER_DIRECTION = 1
+SB_TABLE = "ai_shadow_setups"
+_SB_RETRY_S = 600
+_state = {"sb_ok": None, "sb_checked": 0.0}
+
+
+def _local_init():
+    conn = sqlite3.connect(tl.DB_NAME)
+    conn.execute("""CREATE TABLE IF NOT EXISTS ai_shadow_setups
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, direction TEXT, underlying_entry REAL,
+                     stop_loss REAL, target REAL, blocked_by TEXT, factors_json TEXT, status TEXT DEFAULT 'OPEN',
+                     exit_price REAL, exit_timestamp TEXT)""")
+    conn.commit(); conn.close()
+
+
+def _use_supabase():
+    """Supabase only if configured AND the shadow table exists (checked every 10 min, never raises)."""
+    if not tl._is_supabase_configured():
+        return False
+    now = time.time()
+    if _state["sb_ok"] is not None and now - _state["sb_checked"] < _SB_RETRY_S:
+        return _state["sb_ok"]
+    try:
+        r = requests.get(f"{tl._supabase_url}/rest/v1/{SB_TABLE}?select=id&limit=1", headers=tl._supabase_headers(), timeout=8)
+        _state["sb_ok"] = r.status_code == 200
+    except Exception:
+        _state["sb_ok"] = False
+    _state["sb_checked"] = now
+    return _state["sb_ok"]
+
+
+def storage_note():
+    if tl._is_supabase_configured() and _use_supabase():
+        return "Supabase (permanent)"
+    if tl._is_supabase_configured():
+        return "local file ONLY -- run SUPABASE_SHADOW_MIGRATION.sql in Supabase once to make shadow data permanent"
+    return "local file (not permanent)"
+
+
+# ----------------------------------------------------------------- storage primitives
+_CACHE = {}          # where -> (ts, rows); 8 s, cleared on every write (a refresh asks for the rows 3-4 times)
+
+
+def _all_rows(where="", params=()):
+    hit = _CACHE.get(where)
+    if hit and time.time() - hit[0] < 8:
+        return [dict(r) for r in hit[1]]
+    rows = _all_rows_uncached(where)
+    _CACHE[where] = (time.time(), rows)
+    return [dict(r) for r in rows]
+
+
+def _all_rows_uncached(where=""):
+    """List of dict rows (newest first) from whichever backend is active."""
+    if _use_supabase():
+        try:
+            q = f"{tl._supabase_url}/rest/v1/{SB_TABLE}?order=id.desc&limit=400"
+            if where == "OPEN":
+                q += "&status=eq.OPEN"
+            r = requests.get(q, headers=tl._supabase_headers(), timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            logger.exception("shadow read (supabase) failed; using local")
+    _local_init()
+    conn = sqlite3.connect(tl.DB_NAME); conn.row_factory = sqlite3.Row
+    sql = "SELECT * FROM ai_shadow_setups" + (" WHERE status='OPEN'" if where == "OPEN" else "") + " ORDER BY id DESC LIMIT 400"
+    rows = [dict(x) for x in conn.execute(sql).fetchall()]
+    conn.close()
+    return rows
+
+
+def _insert(row):
+    _CACHE.clear()
+    if _use_supabase():
+        try:
+            r = requests.post(f"{tl._supabase_url}/rest/v1/{SB_TABLE}",
+                              headers={**tl._supabase_headers(), "Prefer": "return=representation"}, json=row, timeout=10)
+            r.raise_for_status()
+            d = r.json()
+            return d[0]["id"] if d else None
+        except Exception:
+            logger.exception("shadow insert (supabase) failed; using local")
+    _local_init()
+    conn = sqlite3.connect(tl.DB_NAME)
+    cur = conn.execute("""INSERT INTO ai_shadow_setups (timestamp,direction,underlying_entry,stop_loss,target,blocked_by,factors_json,status)
+                          VALUES (?,?,?,?,?,?,?,'OPEN')""",
+                       (row["timestamp"], row["direction"], row["underlying_entry"], row["stop_loss"], row["target"],
+                        row["blocked_by"], row["factors_json"]))
+    sid = cur.lastrowid
+    conn.commit(); conn.close()
+    return sid
+
+
+def _update(sid, fields):
+    _CACHE.clear()
+    if _use_supabase():
+        try:
+            r = requests.patch(f"{tl._supabase_url}/rest/v1/{SB_TABLE}?id=eq.{sid}", headers=tl._supabase_headers(), json=fields, timeout=10)
+            r.raise_for_status()
+            return
+        except Exception:
+            logger.exception("shadow update (supabase) failed; trying local")
+    _local_init()
+    sets = ",".join(f"{k}=?" for k in fields)
+    conn = sqlite3.connect(tl.DB_NAME)
+    conn.execute(f"UPDATE ai_shadow_setups SET {sets} WHERE id=?", (*fields.values(), sid))
+    conn.commit(); conn.close()
+
+
+# ----------------------------------------------------------------- public API
+def log(candidate, blocked_by, now=None):
+    """Record a blocked candidate as a shadow trade.  candidate needs direction, underlying_entry, stop_loss, target (+ optional
+    factor_flags).  Returns the id, or None when skipped (cap / gap / already tracking one in that direction / bad data)."""
+    try:
+        d = candidate.get("direction")
+        entry, sl, tp = float(candidate["underlying_entry"]), float(candidate["stop_loss"]), float(candidate["target"])
+        if d not in ("BUY", "SELL") or abs(entry - sl) <= 0 or abs(tp - entry) <= 0:
+            return None
+        if (d == "BUY" and not (sl < entry < tp)) or (d == "SELL" and not (tp < entry < sl)):
+            return None
+    except Exception:
+        return None
+    now = now or tl._now_ist()
+    rows = _all_rows()
+    today = now.strftime("%Y-%m-%d")
+    if sum(1 for r in rows if str(r.get("timestamp", ""))[:10] == today) >= SHADOW_MAX_PER_DAY:
+        return None
+    # v55: the gap / open caps are per (direction, blocking gate) -- one frequent gate can no longer starve the others of evidence
+    gate = str(blocked_by)[:60]
+    if sum(1 for r in rows if str(r.get("timestamp", ""))[:10] == today and str(r.get("blocked_by", ""))[:60] == gate) >= SHADOW_MAX_PER_GATE_PER_DAY:
+        return None
+    same_dir = [r for r in rows if r.get("direction") == d and str(r.get("blocked_by", ""))[:60] == gate]
+    if sum(1 for r in same_dir if r.get("status") == "OPEN") >= SHADOW_MAX_OPEN_PER_DIRECTION:
+        return None
+    if same_dir:
+        try:
+            last = datetime.strptime(str(same_dir[0]["timestamp"])[:19], "%Y-%m-%d %H:%M:%S")
+            if (now - last) < timedelta(minutes=SHADOW_MIN_GAP_MIN):
+                return None
+        except Exception:
+            pass
+    flags = dict(candidate.get("factor_flags") or {})
+    flags["_shadow"] = {"blocked_by": str(blocked_by)}
+    return _insert({"timestamp": now.strftime("%Y-%m-%d %H:%M:%S"), "direction": d, "underlying_entry": entry,
+                    "stop_loss": sl, "target": tp, "blocked_by": str(blocked_by)[:60], "factors_json": json.dumps(flags, default=str)})
+
+
+def resolve(live_price, df=None):
+    """Follow open shadows with the SAME rules as real trades: candle-scanned SL/target (both-in-one-candle = LOSS), time stop,
+    max hold, end-of-day square-off, overnight carry -> EXPIRED."""
+    try:
+        opens = _all_rows("OPEN")
+    except Exception:
+        return
+    now = tl._now_ist()
+    for row in opens:
+        try:
+            sid, d = row["id"], row["direction"]
+            entry, sl, tp = float(row["underlying_entry"]), float(row["stop_loss"]), float(row["target"])
+            is_buy = d == "BUY"
+            risk = max(abs(entry - sl), 1e-9)
+            opened = datetime.strptime(str(row["timestamp"])[:19], "%Y-%m-%d %H:%M:%S")
+            try:
+                flags = json.loads(row.get("factors_json") or "{}")
+            except Exception:
+                flags = {}
+            meta = flags.get("_shadow_meta") if isinstance(flags.get("_shadow_meta"), dict) else {}
+            bars = tl._bars_since(df, opened)
+            fav = max([((float(h) - entry) if is_buy else (entry - float(l))) for h, l in bars] + [((live_price - entry) if is_buy else (entry - live_price)), float(meta.get("fav", 0.0))])
+            meta["fav"] = round(fav, 2)
+            outcome, px = tl._scan_bars(is_buy, sl, tp, bars)
+            if outcome is None:
+                if opened.date() != now.date():
+                    outcome, px = "EXPIRED", float(meta.get("last", entry))
+                elif (is_buy and live_price >= tp) or ((not is_buy) and live_price <= tp):
+                    outcome, px = "WIN", live_price
+                elif (is_buy and live_price <= sl) or ((not is_buy) and live_price >= sl):
+                    outcome, px = "LOSS", live_price
+                else:
+                    age = now - opened
+                    stagnant = age >= timedelta(minutes=tl.TIME_STOP_MIN) and fav < tl.TIME_STOP_MIN_FAV_R * risk
+                    if now.time() >= tl.EOD_SQUAREOFF or age > timedelta(minutes=tl.MAX_HOLD_MINUTES) or stagnant:
+                        outcome, px = "EXPIRED", live_price
+            if outcome is None:
+                meta["last"] = round(float(live_price), 2)
+            if outcome == "EXPIRED":
+                pnl = (px - entry) if is_buy else (entry - px)
+                meta["expired_r"] = round(pnl / risk, 3)
+            flags["_shadow_meta"] = meta
+            fields = {"factors_json": json.dumps(flags, default=str)}
+            if outcome:
+                fields.update({"status": outcome, "exit_price": px, "exit_timestamp": tl._now_str()})
+            _update(sid, fields)
+        except Exception:
+            logger.exception("shadow resolve failed for one row")
+
+
+def _label(row):
+    """1 win / 0 loss / None (inconclusive) -- expired shadows are labelled by marked-to-market R like real ones."""
+    st = row.get("status")
+    if st == "WIN":
+        return 1
+    if st == "LOSS":
+        return 0
+    if st == "EXPIRED":
+        try:
+            r = (json.loads(row.get("factors_json") or "{}").get("_shadow_meta") or {}).get("expired_r")
+        except Exception:
+            r = None
+        if r is None:
+            return None
+        if r >= tl.EXPIRED_LEARN_MIN_R:
+            return 1
+        if r <= -tl.EXPIRED_LEARN_MIN_R:
+            return 0
+    return None
+
+
+def labelled_rows():
+    """[(flags, label, features|None, blocked_by)] oldest first, for the learners."""
+    out = []
+    for r in reversed(_all_rows()):
+        y = _label(r)
+        if y is None:
+            continue
+        try:
+            f = json.loads(r.get("factors_json") or "{}")
+        except Exception:
+            continue
+        flags = {k: v for k, v in f.items() if not str(k).startswith("_")}
+        out.append((flags, y, f.get("_features") if isinstance(f.get("_features"), dict) else None, r.get("blocked_by")))
+    return out
+
+
+def summary():
+    """{blocked_by: {"n","wins","losses","win_rate"}} + open count -- 'was the block right?'"""
+    rows = _all_rows()
+    by = {}
+    for r in rows:
+        y = _label(r)
+        b = r.get("blocked_by") or "Other"
+        e = by.setdefault(b, {"n": 0, "wins": 0, "losses": 0, "win_rate": None})
+        if y is None:
+            continue
+        e["n"] += 1
+        e["wins" if y == 1 else "losses"] += 1
+    for e in by.values():
+        e["win_rate"] = round(100.0 * e["wins"] / e["n"], 1) if e["n"] else None
+    return {"by_gate": by, "open": sum(1 for r in rows if r.get("status") == "OPEN"), "total": len(rows)}
+
+
+EDGE_FAMILY_GATES = ("No positive edge (EV)", "Win-chance floor", "S/R location / confirmation")
+# "S/R location / confirmation" is included on purpose: before v54 classify_block filed every "No positive edge ... break-even needs 34%"
+# refusal under that label (the word "needs"), and a hard S/R refusal never produces a shadow candidate, so those rows ARE edge-gate blocks.
+
+
+def edge_gate_record(z=1.645):
+    """v55: how did the setups the calibrated-edge / win-chance gate REFUSED actually turn out?  -> {n, wins, win_rate, wilson_low}
+    (resolved shadow trades only; win_rate / wilson_low are fractions).  Never raises."""
+    out = {"n": 0, "wins": 0, "win_rate": None, "wilson_low": None}
+    try:
+        by = summary()["by_gate"]
+        n = sum(int(by.get(g, {}).get("n", 0)) for g in EDGE_FAMILY_GATES)
+        w = sum(int(by.get(g, {}).get("wins", 0)) for g in EDGE_FAMILY_GATES)
+        out["n"], out["wins"] = n, w
+        if n > 0:
+            p = w / n
+            out["win_rate"] = p
+            d = 1 + z * z / n
+            c = p + z * z / (2 * n)
+            m = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
+            out["wilson_low"] = max(0.0, (c - m) / d)
+    except Exception:
+        logger.exception("edge_gate_record failed (ignored)")
+    return out
+# @@END shadow_trades
+# @@MODULE trade_notify
+"""
+trade_notify.py -- v56: Telegram message for EVERY trade the AI Trade Decision Engine takes, and another one when it exits.
+
+  * entry : the moment the engine logs a trade (direction, strike, entry, SL, target, R:R, win chance, strategies, Gemini's reason ...)
+  * exit  : the moment the trade is closed by target / stop-loss (live tick) or by a time/EOD exit (result, exit price, points, R, time held)
+
+Design rules
+  * never raises into the dashboard, never blocks it (sent from a daemon thread, 2 tries);
+  * one message per (kind, trade id): the sent-keys are kept in the trade DB (and in memory), so a 30 s refresh, a page reload or a restart
+    can not send the same message twice;
+  * no cooldown -- unlike the confluence alerts, a real trade must never be skipped;
+  * plain HTML parse mode (Markdown breaks on '_' and '*' inside strategy names).
+"""
+from __future__ import annotations
+
+import html
+import json
+import sqlite3
+import threading
+import time
+from datetime import datetime
+
+import requests
+
+import trade_learning as tl
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+ENABLED = True
+_CFG = {"token": None, "chat": None}
+_SENT = set()
+_LOCK = threading.Lock()
+LAST = {"ok": None, "err": "", "ts": 0.0, "sent": 0}      # shown on the dashboard so a silent failure is visible
+
+
+def configure(bot_token, chat_id):
+    _CFG["token"], _CFG["chat"] = (str(bot_token) if bot_token else None), (str(chat_id) if chat_id else None)
+
+
+def is_configured():
+    return bool(ENABLED and _CFG["token"] and _CFG["chat"])
+
+
+# ---------------------------------------------------------------- dedupe store
+def _db():
+    c = sqlite3.connect(tl.DB_NAME, timeout=5)
+    c.execute("CREATE TABLE IF NOT EXISTS telegram_sent (k TEXT PRIMARY KEY, ts TEXT)")
+    return c
+
+
+def _claim(key):
+    """True when this (kind, id) was not sent before -- and marks it as sent."""
+    with _LOCK:
+        if key in _SENT:
+            return False
+        try:
+            c = _db()
+            try:
+                if c.execute("SELECT 1 FROM telegram_sent WHERE k=?", (key,)).fetchone():
+                    _SENT.add(key)
+                    return False
+                c.execute("INSERT INTO telegram_sent(k, ts) VALUES (?,?)", (key, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                c.commit()
+            finally:
+                c.close()
+        except Exception:
+            logger.exception("telegram dedupe store failed (memory only)")
+        _SENT.add(key)
+        return True
+
+
+def _release(key):
+    """A failed send must be retried on the next refresh -> forget the claim."""
+    with _LOCK:
+        _SENT.discard(key)
+        try:
+            c = _db()
+            try:
+                c.execute("DELETE FROM telegram_sent WHERE k=?", (key,)); c.commit()
+            finally:
+                c.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- sending
+def _post(text):
+    url = f"https://api.telegram.org/bot{_CFG['token']}/sendMessage"
+    last = ""
+    for attempt in range(2):
+        try:
+            r = requests.post(url, data={"chat_id": _CFG["chat"], "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}, timeout=10)
+            if r.status_code == 200:
+                LAST.update({"ok": True, "err": "", "ts": time.time(), "sent": LAST["sent"] + 1})
+                return True
+            last = f"HTTP {r.status_code}: {r.text[:120]}"
+        except Exception as exc:
+            last = f"{type(exc).__name__}: {str(exc)[:100]}"
+        time.sleep(1.5)
+    LAST.update({"ok": False, "err": last, "ts": time.time()})
+    return False
+
+
+def _send_async(key, text):
+    def _w():
+        if not _post(text):
+            _release(key)                       # try again on the next refresh / next resolve pass
+    threading.Thread(target=_w, daemon=True, name="telegram-trade").start()
+
+
+# ---------------------------------------------------------------- formatting
+def _e(x):
+    return html.escape(str(x if x is not None else "-"))
+
+
+def _f(x, nd=2):
+    try:
+        return f"{float(x):,.{nd}f}"
+    except Exception:
+        return "-"
+
+
+def format_entry(decision, setup_id=None):
+    d = decision or {}
+    direction = str(d.get("direction") or "?")
+    entry, sl, tp = d.get("underlying_entry"), d.get("stop_loss"), d.get("target")
+    try:
+        risk, reward = abs(float(entry) - float(sl)), abs(float(tp) - float(entry))
+    except Exception:
+        risk = reward = None
+    lanes = [n for n, k in (("Turning-point reaction", "reaction_entry"), ("Live-dominant trend", "live_dom_entry"),
+                            ("Momentum lane", "momentum_lane")) if d.get(k)]
+    ff = d.get("factor_flags") or {}
+    if isinstance(ff, dict) and ff.get("evidence_relief"):
+        lanes.append("Evidence relief")
+    strategies = d.get("strategy_names") or d.get("selected_strategies") or []
+    if isinstance(strategies, str):
+        strategies = [strategies]
+    gr = d.get("gemini_review") or {}
+    icon = "🟢" if direction == "BUY" else "🔴"
+    lines = [
+        f"{icon} <b>AI TRADE LIYA: {_e(direction)}</b>" + (f"  <i>(id {_e(setup_id)})</i>" if setup_id else ""),
+        "",
+        f"🕒 <b>Time:</b> {_e(datetime.now().strftime('%d-%b %H:%M:%S'))}",
+        f"📍 <b>Nifty entry:</b> {_f(entry)}",
+        f"🛑 <b>Stop-loss:</b> {_f(sl)}" + (f"  ({risk:.1f} pts)" if risk is not None else ""),
+        f"🎯 <b>Target:</b> {_f(tp)}" + (f"  ({reward:.1f} pts)" if reward is not None else ""),
+        f"⚖️ <b>R:R:</b> {_e(d.get('risk_reward'))}",
+    ]
+    if d.get("strike"):
+        lines.append(f"📄 <b>Option:</b> {_e(d.get('strike'))} {_e(d.get('option_type'))}")
+    if d.get("confidence_pct") is not None:
+        lines.append(f"📊 <b>Engine win chance:</b> {_e(d.get('confidence_pct'))}%" + (f" | EV {float(d['expectancy_r']):+.2f}R" if d.get("expectancy_r") is not None else ""))
+    if strategies:
+        lines.append(f"🧩 <b>Strategy:</b> {_e(', '.join(map(str, strategies))[:160])}")
+    if lanes:
+        lines.append(f"🏷️ <b>Type:</b> {_e(' + '.join(lanes))}")
+    if gr.get("reason"):
+        lines.append(f"🧠 <b>Gemini:</b> {_e(str(gr.get('reason'))[:220])}")
+    lines += ["", "⏱️ <b>Exit:</b> sirf target / original SL / time-stop par (trailing nahi). Exit hote hi alag message aayega.",
+              "<i>Analytical signal hai, guarantee nahi.</i>"]
+    return "\n".join(lines)
+
+
+def format_exit(row, outcome, exit_price):
+    r = row or {}
+    direction = str(r.get("direction") or "?")
+    try:
+        entry, sl = float(r.get("underlying_entry")), float(r.get("stop_loss"))
+        px = float(exit_price)
+        pts = (px - entry) if direction == "BUY" else (entry - px)
+        risk = max(abs(entry - sl), 1e-9)
+        pnl = f"{pts:+.1f} pts ({pts / risk:+.2f}R)"
+    except Exception:
+        entry, px, pnl = r.get("underlying_entry"), exit_price, "-"
+    held = ""
+    try:
+        t0 = datetime.strptime(str(r.get("timestamp"))[:19], "%Y-%m-%d %H:%M:%S")
+        held = f"{int((tl._now_ist().replace(tzinfo=None) - t0).total_seconds() // 60)} min"
+    except Exception:
+        pass
+    head = {"WIN": "✅ TARGET HIT (WIN)", "LOSS": "❌ STOP-LOSS HIT (LOSS)", "EXPIRED": "⏹️ TIME EXIT"}.get(str(outcome), str(outcome))
+    lines = [f"{head}: <b>{_e(direction)}</b>" + (f"  <i>(id {_e(r.get('id'))})</i>" if r.get("id") else ""), "",
+             f"📍 <b>Entry:</b> {_f(entry)}  →  <b>Exit:</b> {_f(px)}",
+             f"💹 <b>Result:</b> {_e(pnl)}",
+             f"🛑 SL {_f(r.get('stop_loss'))} | 🎯 Target {_f(r.get('target'))}"]
+    if held:
+        lines.append(f"⏳ <b>Held:</b> {_e(held)}")
+    try:   # v56d: how close did it come?  tells "wrong at the very first tick" apart from "worked, then reversed"
+        fj = r.get("factors_json")
+        meta = (json.loads(fj) if isinstance(fj, str) else (fj or {})).get("_learning_meta") or {}
+        fav, adv = float(meta.get("max_favorable_pts", 0.0)), float(meta.get("max_adverse_pts", 0.0))
+        tgt_pts = abs(float(r.get("target")) - float(r.get("underlying_entry")))
+        if fav or adv:
+            lines.append(f"🔎 <b>Trade ke dauran:</b> sabse achha +{fav:.0f} pts" + (f" (target ka {100 * fav / tgt_pts:.0f}%)" if tgt_pts else "") + f", sabse bura -{adv:.0f} pts")
+    except Exception:
+        pass
+    if r.get("strike"):
+        lines.append(f"📄 {_e(r.get('strike'))} {_e(r.get('option_type'))}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- public hooks
+def notify_entry(setup_id, decision):
+    """Call right after the engine logged a trade.  Safe to call on every refresh (deduped)."""
+    try:
+        if not is_configured() or not setup_id:
+            return False
+        key = f"entry:{setup_id}"
+        if not _claim(key):
+            return False
+        _send_async(key, format_entry(decision, setup_id))
+        return True
+    except Exception:
+        logger.exception("notify_entry failed (ignored)")
+        return False
+
+
+def notify_exit(row, outcome, exit_price):
+    """Hook for trade_learning (called after a trade is closed)."""
+    try:
+        if not is_configured() or not row or not outcome:
+            return False
+        sid = row.get("id") if isinstance(row, dict) else None
+        key = f"exit:{sid}" if sid else f"exit:{row.get('timestamp')}:{row.get('direction')}"
+        if not _claim(key):
+            return False
+        _send_async(key, format_exit(row, outcome, exit_price))
+        return True
+    except Exception:
+        logger.exception("notify_exit failed (ignored)")
+        return False
+# @@END trade_notify
+# @@MODULE trade_postmortem
+"""
+trade_postmortem.py -- v48: har band trade ka "post-mortem" (kyon jeeta / kyon hara) aur usse roz seekhna.  Purely additive.
+
+For every CLOSED trade (WIN / LOSS / EXPIRED) it builds a review from data the tool already stored plus the candles after the exit:
+  * HOW the trade moved      best move (MFE) and worst move (MAE) in R, minutes held, SL size vs ATR
+  * WHAT happened after exit for a LOSS: did price still reach the target within 90 min (stop hunted / timing), keep going against
+                              us (wrong direction), or just chop (whipsaw)?
+  * WHICH entry factors were right / wrong  global, news, Nifty-50 news, fundamentals, strategy / structure, flow, entry quality ...
+  * a plain-Hinglish story of the trade.
+Across trades it keeps a factor / factor-group scoreboard and a failure-mode table (Wilson bounds, "data kam" when n is small),
+plus plain-language suggestions.
+
+SAFETY  It never opens, blocks, resizes or edits a trade, never touches SL / target rules, and nothing here changes the engine
+        probability.  Its only outputs are (1) dashboard tables, (2) a short advisory note for Gemini's review prompt, (3) one
+        stored row per day.  `ENABLED = False` switches the whole module off.
+HONESTY The reasons are what the stored data shows.  What news or big players actually did is not in the data; the story says so.
+"""
+from __future__ import annotations
+
+import logging
+import math
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+ENABLED = True
+LOOKAHEAD_MIN = 90          # minutes after the exit that are inspected to judge a LOSS
+MIN_GROUP_N = 8             # a factor / group needs this many trades on EACH side before it gets a verdict
+MIN_MODE_N = 5              # failure-mode suggestions need at least this many losses
+GEMINI_NOTE_MAX = 440
+
+GROUPS = {
+    "Global market": ["global_aligned", "global_research_aligned"],
+    "News (India + Nifty50)": ["news_sentiment_aligned", "nifty50_news_aligned", "external_ai_aligned"],
+    "Nifty50 fundamentals": ["nifty50_fundamentals_aligned"],
+    "Strategy / structure": ["main_signal_aligned", "sniper_setup_aligned", "mtf_stack_aligned", "regime_aligned",
+                             "htf_1h_aligned", "htf_15min_aligned", "vwap_aligned", "ml_agrees", "level_pct_ge_65"],
+    "Option chain / flow": ["oi_aligned", "order_flow_aligned", "pcr_velocity_aligned", "breadth_aligned", "banknifty_no_divergence"],
+    "Extra data": ["sector_breadth_aligned", "poc_aligned", "fii_footprint_aligned", "iv_skew_aligned",
+                                       "model_not_drifting", "risk_of_ruin_low", "iv_not_extreme"],
+    "Entry quality / timing": ["entry_not_extended", "entry_confirmed_bounce", "entry_timing_safe", "no_opposite_transition",
+                               "immediate_reversal_risk_low", "data_quality_pass"],
+}
+FACTOR_GROUP = {f: g for g, fs in GROUPS.items() for f in fs}
+
+MODE_TEXT = {
+    "STOP_HUNT_THEN_WORKED": "SL chhua, phir 90 min me target bhi chhu liya (disha sahi thi, SL/timing ne maara)",
+    "SOLD_THE_BOTTOM": "Girawat ke bilkul neeche SELL liya (support par bounce aaya) - ab guard sakht hoga",
+    "BOUGHT_THE_TOP": "Tezi ke bilkul upar BUY liya (resistance se palta) - ab guard sakht hoga",
+    "WRONG_DIRECTION": "SL ke baad bhi price ulti disha me chalta raha (disha hi galat thi)",
+    "NEVER_WORKED": "Entry ke turant baad hi ulta gaya, kabhi 0.25R bhi favour me nahi gaya",
+    "WORKED_THEN_FAILED": "Target ke kareeb (60%+) pahunch kar palta aur SL laga",
+    "WHIPSAW": "Choppy market: SL laga, phir na target aaya na wapas bada move",
+    "LOSS_PATH_PENDING": "SL laga; baad ka price-path abhi poora nahi (90 min baad pata chalega)",
+    "CLEAN_WIN": "Saaf jeet: SL ke paas gaya hi nahi",
+    "SURVIVED_SCARE": "Jeet, par SL ke bahut kareeb jaakar bachi (kismat ka hissa)",
+    "NORMAL_WIN": "Jeet",
+    "EXPIRED_STALLED": "Time-stop: trade chala hi nahi",
+    "EXPIRED_DRIFT": "Time/EOD par band: chhota drift",
+    "EXPIRED_OTHER": "Time/EOD par band",
+}
+
+
+def wilson(wins, n, z=1.96):
+    if n <= 0:
+        return 0.0, 1.0
+    p = wins / n
+    d = 1 + z * z / n
+    c = p + z * z / (2 * n)
+    r = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return (c - r) / d, (c + r) / d
+
+
+def _f(x, default=None):
+    try:
+        v = float(x)
+        return v if v == v else default
+    except Exception:
+        return default
+
+
+def _ts(x):
+    try:
+        t = pd.Timestamp(str(x)[:19])
+        return None if pd.isna(t) else t
+    except Exception:
+        return None
+
+
+def _naive_index(df):
+    idx = df.index
+    try:
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+    except Exception:
+        pass
+    return idx
+
+
+def _candles_after(df, t_from, minutes):
+    """[(high, low)] of candles that OPENED after t_from within `minutes`, plus whether the window is fully in the data."""
+    try:
+        if df is None or len(df) < 2 or "High" not in df.columns or "Low" not in df.columns or t_from is None:
+            return [], False
+        idx = _naive_index(df)
+        t_to = t_from + pd.Timedelta(minutes=minutes)
+        out = []
+        for t, hi, lo in list(zip(idx, df["High"], df["Low"]))[:-1]:        # last row is the still-forming candle
+            if t_from < t <= t_to and t.date() == t_from.date():
+                out.append((float(hi), float(lo)))
+        complete = bool(len(idx) and idx[-1] >= t_to) or t_to.time() >= pd.Timestamp("15:30").time()
+        # a window that runs past the close is complete once the session is over (a later day exists in the frame)
+        if not complete:
+            try:
+                complete = bool(idx[-1].date() > t_from.date())
+            except Exception:
+                pass
+        return out, complete
+    except Exception:
+        logger.exception("candles_after failed (ignored)")
+        return [], False
+
+
+LOC_LOOKBACK_BARS = 24
+LOC_MIN_MOVE_ATR = 2.0
+LOC_NEAR_EXTREME_ATR = 0.7
+
+
+def location_mistake(df, t0, side, entry, atr):
+    """v52: was this trade opened at the far END of an already-extended move (SELL at the low of a fall / BUY at the high of a rally)?
+    -> 'SOLD_THE_BOTTOM' | 'BOUGHT_THE_TOP' | None.  Uses only candles BEFORE the entry."""
+    try:
+        if df is None or t0 is None or not atr or atr <= 0 or "High" not in df.columns:
+            return None
+        idx = _naive_index(df)
+        pos = [i for i, t in enumerate(idx) if t < t0]
+        if len(pos) < 10:
+            return None
+        w = df.iloc[max(0, pos[-1] - LOC_LOOKBACK_BARS + 1): pos[-1] + 1]
+        hi, lo = float(w["High"].max()), float(w["Low"].min())
+        if side == "SELL" and (hi - entry) / atr >= LOC_MIN_MOVE_ATR and (entry - lo) / atr <= LOC_NEAR_EXTREME_ATR:
+            return "SOLD_THE_BOTTOM"
+        if side == "BUY" and (entry - lo) / atr >= LOC_MIN_MOVE_ATR and (hi - entry) / atr <= LOC_NEAR_EXTREME_ATR:
+            return "BOUGHT_THE_TOP"
+    except Exception:
+        logger.exception("location_mistake failed (ignored)")
+    return None
+
+
+def location_stats(pms, last_n=12):
+    """Among the last `last_n` decided trades: how many LOSSES were location mistakes (sold the bottom / bought the top)?"""
+    rows = [p for p in decided(pms)][-last_n:]
+    bad = [p for p in rows if p.get("loc_mistake") and p.get("status") == "LOSS"]
+    return {"n": len(rows), "bad": len(bad), "keys": [p["key"] for p in bad]}
+
+
+def exhaustion_threshold(pms, base=2.5, floor=1.8, step=0.35):
+    """v52 AMPLIFIER: every repeated location mistake makes the exhaustion guard STRICTER (it triggers after a smaller move).
+    0-1 mistake -> base; 2 -> base-step; 3+ -> floor.  Never below `floor`, never above `base`."""
+    try:
+        b = location_stats(pms)["bad"]
+        return max(floor, base - step * max(0, b - 1)) if b >= 2 else base
+    except Exception:
+        return base
+
+
+def review_trade(t, df=None):
+    """One closed trade -> post-mortem dict.  `t` comes from trade_learning.get_resolved_full()."""
+    fx = t.get("factors") or {}
+    meta = fx.get("_learning_meta") if isinstance(fx.get("_learning_meta"), dict) else {}
+    feats = fx.get("_features") if isinstance(fx.get("_features"), dict) else {}
+    entry_meta = fx.get("_entry_meta") if isinstance(fx.get("_entry_meta"), dict) else {}
+    side = str(t.get("direction") or "").upper()
+    is_buy = side == "BUY"
+    entry, sl, tp = _f(t.get("entry")), _f(t.get("stop_loss")), _f(t.get("target"))
+    status = str(t.get("status") or "")
+    if entry is None or sl is None or tp is None or side not in ("BUY", "SELL"):
+        return None
+    risk = max(abs(entry - sl), 1e-9)
+    reward = abs(tp - entry)
+    mfe = _f(meta.get("max_favorable_pts"), 0.0) or 0.0
+    mae = _f(meta.get("max_adverse_pts"), 0.0) or 0.0
+    t0, t1 = _ts(t.get("timestamp")), _ts(t.get("exit_timestamp"))
+    held = round((t1 - t0).total_seconds() / 60.0, 1) if t0 is not None and t1 is not None else None
+    atr = _f(feats.get("atr"))
+    flags = {k: v for k, v in fx.items() if not str(k).startswith("_") and isinstance(v, bool)}
+
+    mode, after = None, {}
+    if status == "LOSS":
+        bars, complete = _candles_after(df, t1, LOOKAHEAD_MIN)
+        hit_tp = any((hi >= tp) if is_buy else (lo <= tp) for hi, lo in bars)
+        further = max([((sl - lo) if is_buy else (hi - sl)) for hi, lo in bars] or [0.0])
+        after = {"bars": len(bars), "complete": bool(complete), "reached_target_after": bool(hit_tp), "extra_adverse_pts": round(further, 1)}
+        if hit_tp:
+            mode = "STOP_HUNT_THEN_WORKED"
+        elif mfe >= 0.6 * reward and reward > 0:
+            mode = "WORKED_THEN_FAILED"
+        elif mfe < 0.25 * risk:
+            mode = "NEVER_WORKED"
+        elif not complete:
+            mode = "LOSS_PATH_PENDING"
+        elif further >= 1.0 * risk:
+            mode = "WRONG_DIRECTION"
+        else:
+            mode = "WHIPSAW"
+    elif status == "WIN":
+        mode = "CLEAN_WIN" if mae < 0.35 * risk else "SURVIVED_SCARE" if mae >= 0.7 * risk else "NORMAL_WIN"
+    else:
+        er = _f(meta.get("expired_r"))
+        mode = "EXPIRED_STALLED" if (mfe < 0.35 * risk) else "EXPIRED_DRIFT" if er is not None and abs(er) < 0.5 else "EXPIRED_OTHER"
+
+    won = status == "WIN" or (status == "EXPIRED" and (_f(meta.get("expired_r"), 0.0) or 0.0) >= 0.5)
+    lost = status == "LOSS" or (status == "EXPIRED" and (_f(meta.get("expired_r"), 0.0) or 0.0) <= -0.5)
+    # which stored factors pointed the right / wrong way for THIS trade
+    misled = sorted(k for k, v in flags.items() if v and lost)          # said "yes" but the trade lost
+    warned = sorted(k for k, v in flags.items() if (not v) and lost)    # said "no / not aligned" and the trade did lose (warning was right)
+    confirmed = sorted(k for k, v in flags.items() if v and won)
+    missed = sorted(k for k, v in flags.items() if (not v) and won)     # said "not aligned" but the trade won (warning was wrong)
+
+    loc_mistake = location_mistake(df, t0, side, entry, atr) if status == "LOSS" else None
+    if loc_mistake and mode in ("NEVER_WORKED", "WRONG_DIRECTION", "WHIPSAW", "LOSS_PATH_PENDING"):
+        mode = loc_mistake
+    pm = {"key": f"{str(t.get('timestamp'))[:19]}|{side}", "loc_mistake": loc_mistake, "day": str(t.get("timestamp") or "")[:10], "time": str(t.get("timestamp") or "")[11:16],
+          "side": side, "status": status, "mode": mode, "entry": entry, "sl": sl, "target": tp, "exit": _f(t.get("exit_price")),
+          "risk_pts": round(risk, 1), "reward_pts": round(reward, 1), "mfe_r": round(mfe / risk, 2), "mae_r": round(mae / risk, 2),
+          "held_min": held, "sl_atr": round(risk / atr, 2) if atr else None, "after": after,
+          "playbook": str(fx.get("_playbook_label") or entry_meta.get("playbook") or "-"), "grade": entry_meta.get("grade"),
+          "hour": _f(feats.get("hour")), "vix": _f(feats.get("vix")), "flags": flags,
+          "misled": misled, "warned": warned, "confirmed": confirmed, "missed": missed,
+          "final": bool(mode != "LOSS_PATH_PENDING")}
+    pm["story"] = story(pm)
+    return pm
+
+
+def story(pm):
+    """Plain Hinglish explanation (what the stored data shows)."""
+    try:
+        bits = [f"{pm['side']} {pm['entry']:,.0f}, SL {pm['risk_pts']:.0f} pt, target {pm['reward_pts']:.0f} pt"
+                + (f", {pm['held_min']:.0f} min chala" if pm.get("held_min") is not None else "") + "."]
+        bits.append(MODE_TEXT.get(pm["mode"], pm["mode"]) + f" (sabse accha {pm['mfe_r']:.2f}R, sabse bura {pm['mae_r']:.2f}R).")
+        if pm.get("sl_atr") is not None and pm["status"] == "LOSS":
+            bits.append(f"SL = {pm['sl_atr']:.1f}x ATR" + (" (ATR ke hisaab se tang)" if pm["sl_atr"] < 0.8 else "") + ".")
+
+        def grp(names):
+            g = {}
+            for n in names:
+                g.setdefault(FACTOR_GROUP.get(n, "Anya"), []).append(n)
+            return [k for k in g if k != "Anya"]
+        if pm["status"] == "LOSS":
+            if pm["warned"]:
+                w = grp(pm["warned"])
+                if w:
+                    bits.append("Pehle se chetawani thi (aligned nahi the): " + ", ".join(w[:4]) + ".")
+            if pm["misled"]:
+                m = grp(pm["misled"])
+                if m:
+                    bits.append("Ye 'haan' bolkar bhi galat nikle: " + ", ".join(m[:4]) + ".")
+            bits.append("News / bade players ka asli asar data me nahi hota, isliye wo yahan confirm nahi hota.")
+        elif pm["status"] == "WIN" and pm["confirmed"]:
+            c = grp(pm["confirmed"])
+            if c:
+                bits.append("Jinhone saath diya: " + ", ".join(c[:4]) + ".")
+        return " ".join(bits)
+    except Exception:
+        return ""
+
+
+def build(df=None, limit=120):
+    """Review every closed trade.  Returns a list newest first.  Never raises."""
+    if not ENABLED:
+        return []
+    try:
+        import trade_learning as tl
+        rows = tl.get_resolved_full(limit=limit)
+    except Exception:
+        logger.exception("postmortem: trades unavailable (ignored)")
+        return []
+    out = []
+    for t in rows:
+        try:
+            pm = review_trade(t, df)
+            if pm:
+                out.append(pm)
+        except Exception:
+            logger.exception("postmortem: one trade failed (ignored)")
+    return out
+
+
+# ----------------------------------------------------------------------------- aggregation
+
+def decided(pms):
+    """Only WIN / LOSS are used for factor statistics (EXPIRED is mixed)."""
+    return [p for p in pms if p["status"] in ("WIN", "LOSS")]
+
+
+def factor_board(pms):
+    """-> (factor_rows, group_rows).  For every factor: win rate when aligned vs not aligned, with Wilson bounds."""
+    rows = decided(pms)
+    keys = sorted({k for p in rows for k in p["flags"]})
+    out = []
+    for k in keys:
+        a = [p for p in rows if p["flags"].get(k) is True]
+        b = [p for p in rows if p["flags"].get(k) is False]
+        aw, bw = sum(p["status"] == "WIN" for p in a), sum(p["status"] == "WIN" for p in b)
+        out.append(_row(k, FACTOR_GROUP.get(k, "-"), len(a), aw, len(b), bw))
+    return out, _group_rows(rows)
+
+
+def _row(name, group, na, aw, nb, bw):
+    wa = aw / na if na else None
+    wb = bw / nb if nb else None
+    lo_a, hi_a = wilson(aw, na)
+    lo_b, hi_b = wilson(bw, nb)
+    verdict = "data kam"
+    if na >= MIN_GROUP_N and nb >= MIN_GROUP_N:
+        if lo_a > hi_b:
+            verdict = "bharosemand (aligned hone par sach me behtar)"
+        elif hi_a < lo_b:
+            verdict = "bhatkane wala (aligned hone par bhi zyada haara)"
+        else:
+            verdict = "farq saabit nahi"
+    return {"factor": name, "group": group, "aligned_n": na, "aligned_wr": wa, "not_n": nb, "not_wr": wb, "verdict": verdict}
+
+
+def _group_rows(rows):
+    out = []
+    for g, fs in GROUPS.items():
+        # a trade counts as "group aligned" when most of the group's recorded flags say yes
+        a, b = [], []
+        for p in rows:
+            vals = [p["flags"][f] for f in fs if f in p["flags"]]
+            if not vals:
+                continue
+            (a if sum(vals) * 2 >= len(vals) else b).append(p)
+        aw, bw = sum(p["status"] == "WIN" for p in a), sum(p["status"] == "WIN" for p in b)
+        out.append(_row(g, "-", len(a), aw, len(b), bw))
+    return out
+
+
+def mode_table(pms):
+    losses = [p for p in pms if p["status"] == "LOSS"]
+    cnt = {}
+    for p in losses:
+        cnt[p["mode"]] = cnt.get(p["mode"], 0) + 1
+    n = len(losses)
+    return [{"mode": k, "text": MODE_TEXT.get(k, k), "n": v, "share": v / n} for k, v in sorted(cnt.items(), key=lambda z: -z[1])] if n else []
+
+
+def suggestions(pms):
+    """Plain-language, never auto-applied."""
+    out = []
+    try:
+        losses = [p for p in pms if p["status"] == "LOSS" and p.get("final")]
+        n = len(losses)
+        share = {m["mode"]: m["share"] for m in mode_table(pms)}
+        if n >= MIN_MODE_N:
+            if share.get("STOP_HUNT_THEN_WORKED", 0) >= 0.35:
+                out.append(f"{n} losses me se {100 * share['STOP_HUNT_THEN_WORKED']:.0f}% me SL ke baad target bhi chhua: disha sahi, SL/timing tang ho sakta hai. "
+                           "Sirf jaankari -- SL rules aap khud tay karein (apne aap nahi badlenge).")
+            if share.get("WRONG_DIRECTION", 0) + share.get("NEVER_WORKED", 0) >= 0.5:
+                out.append("Zyada losses turant ulte gaye ya SL ke baad bhi ulte chalte rahe: entry confirmation aur chase-filters par dhyan do.")
+            if share.get("WHIPSAW", 0) >= 0.35:
+                out.append("Losses me choppy/whipsaw zyada: range-bound ghanton me trade kam lena behtar ho sakta hai.")
+        fr, gr = factor_board(pms)
+        for g in gr:
+            if g["verdict"].startswith("bhatkane"):
+                out.append(f"'{g['group']}' aligned hone par bhi {100 * (g['aligned_wr'] or 0):.0f}% jeete ({g['aligned_n']} trades) vs na-aligned {100 * (g['not_wr'] or 0):.0f}% -- ye signal abhi bhatka raha hai.")
+            elif g["verdict"].startswith("bharosemand"):
+                out.append(f"'{g['group']}' sach me kaam kar raha hai: aligned {100 * (g['aligned_wr'] or 0):.0f}% vs na-aligned {100 * (g['not_wr'] or 0):.0f}% jeet.")
+        for f in fr:
+            if f["verdict"].startswith("bhatkane"):
+                out.append(f"Factor '{f['factor']}' bhatka raha hai ({100 * (f['aligned_wr'] or 0):.0f}% vs {100 * (f['not_wr'] or 0):.0f}%).")
+    except Exception:
+        logger.exception("postmortem suggestions failed (ignored)")
+    return out[:10]
+
+
+def gemini_note(pms):
+    """<= GEMINI_NOTE_MAX chars of advisory text about the last losses and the factor verdicts."""
+    try:
+        done = [p for p in pms if p.get("final")]
+        if not done:
+            return ""
+        lines = []
+        last_losses = [p for p in done if p["status"] == "LOSS"][:3]
+        if last_losses:
+            lines.append("- Recent losses (why): " + "; ".join(f"{p['side']} {p['time']} {p['mode'].lower().replace('_', ' ')}"
+                                                                 + (f" [{', '.join(grp_names(p['misled'])[:2])} misled]" if grp_names(p["misled"]) else "") for p in last_losses) + ".")
+        _, gr = factor_board(pms)
+        bad = [g["group"] for g in gr if g["verdict"].startswith("bhatkane")]
+        good = [g["group"] for g in gr if g["verdict"].startswith("bharosemand")]
+        if good or bad:
+            lines.append("- Signal groups proven on own trades: " + ("reliable: " + ", ".join(good) + ". " if good else "") + ("misleading: " + ", ".join(bad) + "." if bad else ""))
+        return "\n".join(lines)[:GEMINI_NOTE_MAX]
+    except Exception:
+        logger.exception("postmortem gemini_note failed (ignored)")
+        return ""
+
+
+def grp_names(names):
+    seen = []
+    for n in names:
+        g = FACTOR_GROUP.get(n)
+        if g and g not in seen:
+            seen.append(g)
+    return seen
+
+
+def daily_summary(pms, day):
+    todays = [p for p in pms if p["day"] == day]
+    w = sum(p["status"] == "WIN" for p in todays)
+    l = sum(p["status"] == "LOSS" for p in todays)
+    modes = {}
+    for p in todays:
+        modes[p["mode"]] = modes.get(p["mode"], 0) + 1
+    return {"day": day, "n": len(todays), "w": w, "l": l, "modes": modes, "stories": [f"{p['time']} {p['status']}: {p['story']}" for p in todays][:12]}
+
+
+def save_day_reviews(pms, day):
+    """One stored row per day ('pm-YYYY-MM-DD'); only finished reviews.  Guarded."""
+    try:
+        import market_memory as mm
+        todays = [p for p in pms if p["day"] == day and p.get("final")]
+        if todays:
+            mm.save_day("pm-" + day, daily_summary(todays, day))
+    except Exception:
+        logger.exception("save_day_reviews failed (ignored)")
+
+
+# ----------------------------------------------------------------------------- v48b: warning-count loss filter (earned, bounded)
+WARN_GATE = "auto"          # "off" = never touch the engine; "auto" = only when the trade history PROVES it (see warn_stats)
+WARN_PENALTY = 0.10         # max logit penalty (~2.5 pct points).  Penalty only -- this filter never ADDS probability.
+WARN_MIN_N = 10             # trades needed in BOTH the "many warnings" and "few warnings" buckets
+_WARN_STATE = {"stats": None, "ts": 0.0}
+
+
+def warn_count(flags):
+    """How many signal GROUPS (of those recorded) were mostly NOT aligned with the trade at entry."""
+    n = tot = 0
+    for fs in GROUPS.values():
+        vals = [flags[f] for f in fs if f in flags and isinstance(flags[f], bool)]
+        if not vals:
+            continue
+        tot += 1
+        if sum(vals) * 2 < len(vals):
+            n += 1
+    return n, tot
+
+
+def warn_stats(pms):
+    """Does 'many groups warned against the trade' really lose more on THIS user's own closed trades?"""
+    rows = decided(pms)
+    hi, lo = [], []
+    for p in rows:
+        n, tot = warn_count(p["flags"])
+        if tot < 3:
+            continue
+        (hi if n * 2 >= tot else lo).append(p)       # half or more of the groups warned
+    hw, lw = sum(p["status"] == "WIN" for p in hi), sum(p["status"] == "WIN" for p in lo)
+    out = {"hi_n": len(hi), "hi_w": hw, "lo_n": len(lo), "lo_w": lw,
+           "hi_wr": hw / len(hi) if hi else None, "lo_wr": lw / len(lo) if lo else None, "earned": False}
+    if len(hi) >= WARN_MIN_N and len(lo) >= WARN_MIN_N:
+        out["earned"] = bool(wilson(hw, len(hi))[1] < wilson(lw, len(lo))[0])
+    return out
+
+
+def update_state(stats):
+    import time
+    _WARN_STATE.update({"stats": stats, "ts": time.time()})
+
+
+def entry_adjustment(flags):
+    """-> {'penalty_logit': >= 0, 'note': str}.  Inert (0.0) unless the history proved that trades taken with many warning groups lose."""
+    import time
+    out = {"penalty_logit": 0.0, "note": ""}
+    try:
+        st = _WARN_STATE.get("stats")
+        if not ENABLED or WARN_GATE != "auto" or not st or not st.get("earned") or time.time() - float(_WARN_STATE.get("ts") or 0) > 900:
+            return out
+        n, tot = warn_count({k: v for k, v in (flags or {}).items() if not str(k).startswith("_")})
+        if tot >= 3 and n * 2 >= tot:
+            out["penalty_logit"] = WARN_PENALTY
+            out["note"] = (f"post-mortem: {n}/{tot} signal groups against this trade; such trades won {100 * st['hi_wr']:.0f}% "
+                           f"({st['hi_n']}) vs {100 * st['lo_wr']:.0f}% ({st['lo_n']}) otherwise")
+    except Exception:
+        logger.exception("warn entry_adjustment failed (ignored)")
+        return {"penalty_logit": 0.0, "note": ""}
+    return out
+
+
+# ----------------------------------------------------------------------------- v48b: missed-move review ("kahan trade lena chahiye tha")
+def missed_review(days, window_min=20):
+    """days = {day: autopsy summary}.  For every BIG (50+ pt) move the engine did not trade, the gate that was answering during the
+    first minutes of that move (from gate_log).  -> (rows, by_gate)."""
+    rows, by_gate = [], {}
+    try:
+        import gate_log
+        for day, s in sorted((days or {}).items())[-10:]:
+            if not isinstance(s, dict) or "legs" not in s:
+                continue
+            gl = None
+            for lg in s["legs"]:
+                if not lg.get("major") or lg.get("engine"):
+                    continue
+                if gl is None:
+                    gl = gate_log.rows_for_day(day) or []
+                t0 = pd.Timestamp(lg["start_ts"])
+                near = [r for r in gl if r.get("candle") and t0 <= pd.Timestamp(r["candle"]) <= t0 + pd.Timedelta(minutes=window_min)]
+                cnt = {}
+                for r in near:
+                    cnt[r["gate"]] = cnt.get(r["gate"], 0) + 1
+                if cnt:
+                    g = max(cnt, key=cnt.get)
+                    reason = next((r["reason"] for r in near if r["gate"] == g and r.get("reason")), "")
+                else:
+                    g, reason = "engine log nahi mila", ""
+                by_gate[g] = by_gate.get(g, 0) + 1
+                rows.append({"day": day, "start": lg["start"], "dir": lg["dir"], "pts": lg["pts"], "gate": g, "reason": str(reason)[:140]})
+    except Exception:
+        logger.exception("missed_review failed (ignored)")
+    return rows[-20:], by_gate
+# @@END trade_postmortem
+# @@MODULE trade_diagnostics
+"""
+trade_diagnostics.py -- WHY did trades lose, and don't repeat it.
+
+1) risk_tags(...)   : labels describing the CONDITIONS of an entry (extended entry, no confirmation, after a huge day move,
+                      late session, expiry day, event day, OI flow against, high VIX ...).  Deterministic: the same function is
+                      used when the trade is taken and again on old trades, so history can be grouped by tag.
+2) tag_performance(): win rate of every tag over all resolved real + shadow (paper) trades.
+3) tag_penalty()    : if a tag has lost often enough (enough samples, smoothed win rate low) a new candidate that carries the
+                      same tag gets a small probability penalty.  This is the "it lost for THIS reason before -> be careful" rule.
+4) loss_reason_summary(): table for the dashboard: which reasons appear most among LOST real trades.
+
+Small and statistical on purpose: needs MIN_TAG_N samples before it acts, the penalty is capped, and nothing here can open a trade.
+"""
+from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+MIN_TAG_N = 6.0             # weighted samples before a tag may penalise anything
+BAD_WR = 0.30               # smoothed win rate below this -> penalty
+VERY_BAD_WR = 0.22
+TAG_PENALTY = 0.12
+TAG_PENALTY_BAD = 0.20
+MAX_TAG_PENALTY = 0.35
+
+TAG_TEXT = {
+    "extended_entry": "Entry was chasing an extended move",
+    "no_confirmation": "No sweep / rejection / pullback confirmation at entry",
+    "day_move_exhausted": "Entered after a very big move already happened today",
+    "at_day_extreme": "Entered right at the day's low/high (little room left)",
+    "late_session": "Entered late in the session (after 14:00)",
+    "opening_15min": "Entered in the first 15 minutes (noise)",
+    "opening_whipsaw": "Entered 09:30-10:00 (opening whipsaw zone, often reverses both ways)",
+    "midday_lull": "Entered in the midday lull (11:45-13:30)",
+    "expiry_day": "Expiry day (erratic moves)",
+    "event_day": "Event-risk window (RBI / Fed / Budget ...)",
+    "oi_flow_against": "OI flow today was against the trade",
+    "high_vix": "High VIX (wild swings)",
+    "low_confidence": "Win probability was low when taken",
+}
+
+
+def _num(x):
+    try:
+        v = float(x)
+        return v if v == v else None
+    except Exception:
+        return None
+
+
+def risk_tags(flags, feats, hour=None):
+    """flags: dict of factor booleans; feats: dict of numbers (may be None for old trades); hour: decimal hour (14.5 = 14:30)."""
+    tags = []
+    try:
+        flags = flags or {}
+        f = feats or {}
+        if flags.get("entry_not_extended") is False:
+            tags.append("extended_entry")
+        if flags.get("entry_confirmed_bounce") is False and "entry_confirmed_bounce" in flags:
+            tags.append("no_confirmation")
+        dm = _num(f.get("day_move_pct"))
+        if dm is not None and dm >= 1.0:
+            tags.append("day_move_exhausted")
+        dp = _num(f.get("day_pos"))
+        if dp is not None and dp <= 0.15 and (dm is None or dm >= 0.6):
+            tags.append("at_day_extreme")
+        h = _num(hour if hour is not None else f.get("hour"))
+        if h is not None:
+            if h >= 14.0:
+                tags.append("late_session")
+            elif h < 9.5:
+                tags.append("opening_15min")
+            elif h < 10.0:
+                tags.append("opening_whipsaw")
+            elif 11.75 <= h < 13.5:
+                tags.append("midday_lull")
+        if _num(f.get("expiry_day")) == 1.0:
+            tags.append("expiry_day")
+        if _num(f.get("event_caution")) == 1.0:
+            tags.append("event_day")
+        if _num(f.get("oi_flow")) == -1.0:
+            tags.append("oi_flow_against")
+        vix = _num(f.get("vix"))
+        if vix is not None and vix >= 18.0:
+            tags.append("high_vix")
+        p = _num(f.get("win_prob"))
+        if p is not None and p < 0.38:
+            tags.append("low_confidence")
+    except Exception:
+        logger.exception("risk_tags failed (ignored)")
+    return tags
+
+
+def tag_performance(rows):
+    """rows = trade_learning._labelled_rows_full() -> {tag: {"n": weighted n, "wins": weighted wins, "wr": smoothed win rate, "real_n", "real_losses"}}"""
+    stats = {}
+    for r in rows or []:
+        try:
+            w = float(r.get("weight", 1.0))
+            win = 1.0 if r.get("label") else 0.0
+            for t in risk_tags(r.get("flags"), r.get("feats")):
+                s = stats.setdefault(t, {"n": 0.0, "wins": 0.0, "real_n": 0, "real_losses": 0})
+                s["n"] += w
+                s["wins"] += w * win
+                if r.get("source") == "real":
+                    s["real_n"] += 1
+                    s["real_losses"] += int(not win)
+        except Exception:
+            continue
+    for s in stats.values():
+        s["wr"] = (s["wins"] + 1.0) / (s["n"] + 2.0)
+    return stats
+
+
+def tag_penalty(tags, rows):
+    """-> (penalty_logit >= 0, note).  Only tags that have PROVEN bad with enough samples count."""
+    try:
+        stats = tag_performance(rows)
+        pen, bad = 0.0, []
+        for t in tags or []:
+            s = stats.get(t)
+            if not s or s["n"] < MIN_TAG_N:
+                continue
+            if s["wr"] < VERY_BAD_WR:
+                pen += TAG_PENALTY_BAD; bad.append(f"{TAG_TEXT.get(t, t)} ({100 * s['wr']:.0f}% win over {s['n']:.0f} trades)")
+            elif s["wr"] < BAD_WR:
+                pen += TAG_PENALTY; bad.append(f"{TAG_TEXT.get(t, t)} ({100 * s['wr']:.0f}% win over {s['n']:.0f} trades)")
+        pen = min(MAX_TAG_PENALTY, pen)
+        return round(pen, 3), ("repeat-mistake check: " + "; ".join(bad)) if bad else ""
+    except Exception:
+        logger.exception("tag_penalty failed (ignored)")
+        return 0.0, ""
+
+
+def loss_reason_summary(rows):
+    """Real LOST trades only -> [{"tag", "reason", "losses", "trades_with_tag", "win_rate"}] most frequent first."""
+    stats = tag_performance(rows)
+    out = []
+    for t, s in stats.items():
+        if s["real_losses"] > 0:
+            out.append({"tag": t, "reason": TAG_TEXT.get(t, t), "losses": s["real_losses"], "trades_with_tag": s["real_n"],
+                        "win_rate": round(100.0 * (s["real_n"] - s["real_losses"]) / max(s["real_n"], 1), 1)})
+    out.sort(key=lambda z: (-z["losses"], z["win_rate"]))
+    return out
+# @@END trade_diagnostics
+# @@MODULE gate_log
+"""
+gate_log.py -- a PERSISTENT, per-candle record of what the trade engine decided (and WHY it did not trade).
+
+Why: the old "Kaun sa gate kitni baar roka" table lives in st.session_state, so it starts from zero every time the page is
+opened/reloaded (the keeper robot reloads the page every 30 min).  When you open the app at 12:24 and ask "why no trade in
+the morning rally?", the table could only describe the last few minutes.  This log is written to disk on every candle, so
+the morning is still there at noon, and it also shows the gaps when the engine was NOT running at all (tab closed, app
+asleep, Upstox not logged in) -- which is the one reason no gate can explain.
+
+Pure bookkeeping: it never changes a trade decision, never raises into the dashboard.
+"""
+from __future__ import annotations
+
+import os
+import sqlite3
+import threading
+from datetime import datetime, timedelta
+
+try:
+    from app_logging import get_logger
+    logger = get_logger(__name__)
+except Exception:                       # tests / stand-alone use
+    import logging
+    logger = logging.getLogger(__name__)
+
+DB_PATH = os.environ.get("GATE_LOG_DB", "gate_log.db")
+_LOCK = threading.Lock()
+MARKET_START = (9, 15)
+CANDLE_MIN = 5
+GAP_REPORT_MIN = 15          # a hole in the log longer than this is reported as "engine was not running"
+
+
+def _conn():
+    c = sqlite3.connect(DB_PATH, timeout=5)
+    c.execute("""CREATE TABLE IF NOT EXISTS gate_log (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   day TEXT, candle TEXT, seen_at TEXT, price REAL, gate TEXT, direction TEXT,
+                   reason TEXT, source TEXT, detail TEXT)""")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_gate_candle ON gate_log(candle, gate)")
+    return c
+
+
+def record(candle, price, gate, reason="", direction="", source="", detail="", now=None):
+    """One row per (candle, gate).  Safe to call on every 30 s refresh."""
+    try:
+        now = now or datetime.now()
+        candle = str(candle)[:19]
+        with _LOCK:
+            c = _conn()
+            try:
+                c.execute("INSERT OR IGNORE INTO gate_log(day,candle,seen_at,price,gate,direction,reason,source,detail) "
+                          "VALUES (?,?,?,?,?,?,?,?,?)",
+                          (candle[:10], candle, now.strftime("%Y-%m-%d %H:%M:%S"), float(price) if price is not None else None,
+                           str(gate), str(direction or ""), str(reason or "")[:400], str(source or ""), str(detail or "")[:300]))
+                c.commit()
+                c.execute("DELETE FROM gate_log WHERE day < date(?, '-14 day')", (candle[:10],))   # keep two weeks
+                c.commit()
+            finally:
+                c.close()
+    except Exception:
+        logger.exception("gate_log.record failed (ignored)")
+
+
+def rows_for_day(day):
+    try:
+        with _LOCK:
+            c = _conn()
+            try:
+                cur = c.execute("SELECT candle, seen_at, price, gate, direction, reason, source, detail FROM gate_log "
+                                "WHERE day=? ORDER BY candle, id", (str(day),))
+                return [dict(zip(("candle", "seen_at", "price", "gate", "direction", "reason", "source", "detail"), r))
+                        for r in cur.fetchall()]
+            finally:
+                c.close()
+    except Exception:
+        logger.exception("gate_log.rows_for_day failed (ignored)")
+        return []
+
+
+def _parse(ts):
+    try:
+        return datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def coverage(day, now=None, market_end=(15, 30)):
+    """When was the engine actually running on `day`?  -> {first, last, candles, gaps:[(from,to,minutes)], missed_start_min}"""
+    rows = rows_for_day(day)
+    candles = sorted({_parse(r["candle"]) for r in rows if _parse(r["candle"])})
+    out = {"candles": len(candles), "first": None, "last": None, "gaps": [], "missed_start_min": 0}
+    if not candles:
+        return out
+    out["first"], out["last"] = candles[0], candles[-1]
+    d0 = candles[0].replace(hour=MARKET_START[0], minute=MARKET_START[1], second=0)
+    out["missed_start_min"] = max(0, int((candles[0] - d0).total_seconds() // 60))
+    for a, b in zip(candles, candles[1:]):
+        mins = int((b - a).total_seconds() // 60)
+        if mins > GAP_REPORT_MIN:
+            out["gaps"].append((a, b, mins))
+    return out
+
+
+def coverage_note(day, now=None):
+    """Plain-Hinglish sentence about engine uptime today, or '' when there is nothing worth saying."""
+    cov = coverage(day, now)
+    if not cov["candles"]:
+        return ""
+    parts = []
+    if cov["missed_start_min"] >= GAP_REPORT_MIN:
+        parts.append(f"engine ne aaj {cov['first'].strftime('%H:%M')} se dekhna shuru kiya -- 09:15 se {cov['missed_start_min']} min ka "
+                     f"hissa record me hi nahi (us waqt app/tab band tha ya Upstox login nahi tha, to koi trade ban hi nahi sakta tha)")
+    for a, b, mins in cov["gaps"][:3]:
+        parts.append(f"{a.strftime('%H:%M')}-{b.strftime('%H:%M')} ({mins} min) engine chal hi nahi raha tha")
+    return " | ".join(parts)
+
+
+def summary(day):
+    rows = rows_for_day(day)
+    by_gate = {}
+    for r in rows:
+        by_gate[r["gate"]] = by_gate.get(r["gate"], 0) + 1
+    return {"rows": rows, "by_gate": by_gate, "taken": by_gate.get("TRADE TAKEN", 0)}
+
+
+def missed_moves(day, min_pts=70.0, window_min=75, max_report=4):
+    """v55: the moves the engine did NOT trade, and which gate held the matching-direction trade back during each.
+    A move = price travels >= min_pts within window_min minutes (up or down) using the per-candle prices in the log; it counts as missed when no
+    'TRADE TAKEN' row sits inside [start - 10 min, end].  -> [{dir, start, end, pts, gates:[(gate, candles)], taken}]  (largest first).
+    Pure reporting; never raises."""
+    try:
+        rows = rows_for_day(day)
+        px = {}
+        for r in rows:
+            t, p = _parse(r["candle"]), r.get("price")
+            if t is not None and p:
+                px[t] = float(p)
+        ts = sorted(px)
+        found = []
+        for i, a in enumerate(ts):
+            seg = [t for t in ts[i:] if (t - a).total_seconds() <= window_min * 60]
+            if len(seg) < 2:
+                continue
+            lo = min(seg, key=lambda t: px[t]); hi = max(seg, key=lambda t: px[t])
+            if lo == hi:
+                continue
+            pts = px[hi] - px[lo]
+            if pts < min_pts:
+                continue
+            up = lo < hi                                   # low came first -> rally
+            s, e = (lo, hi) if up else (hi, lo)
+            found.append((pts, "BUY" if up else "SELL", s, e))
+        found.sort(key=lambda x: -x[0])
+        out, used = [], []
+        for pts, d, s, e in found:
+            if any(not (e < us or s > ue) for us, ue in used):
+                continue
+            used.append((s, e))
+            lo_t, hi_t = s - timedelta(minutes=10), e
+            taken = any(r["gate"] == "TRADE TAKEN" and lo_t <= (_parse(r["candle"]) or lo_t - timedelta(days=1)) <= hi_t for r in rows)
+            gates = {}
+            for r in rows:
+                t = _parse(r["candle"])
+                if t is None or not (s <= t <= e) or r["gate"] == "TRADE TAKEN":
+                    continue
+                if r.get("direction") in (d, "", None):
+                    gates[r["gate"]] = gates.get(r["gate"], 0) + 1
+            out.append({"dir": d, "start": s, "end": e, "pts": round(pts, 1), "taken": taken,
+                        "gates": sorted(gates.items(), key=lambda kv: -kv[1])[:4]})
+            if len(out) >= max_report:
+                break
+        return out
+    except Exception:
+        logger.exception("gate_log.missed_moves failed (ignored)")
+        return []
+# @@END gate_log
+# @@MODULE stock_learning
+"""Stock-specific learning helpers for the multi-stock dashboard.
+
+Learning is intentionally isolated by symbol. NIFTY option-trade learning is
+not copied into individual equity profiles.
+"""
+from app_logging import get_logger
+logger = get_logger(__name__)
+import json
+from datetime import datetime, timezone
+
+
+def ensure_tables(supabase_url=None, supabase_key=None):
+    """Return additive SQL for the stock-learning tables.
+
+    The dashboard does not execute DDL through Supabase REST. The SQL is also
+    included in supabase_schema.sql for a one-time additive migration.
+    """
+    return True
+
+
+def profile_from_history(rows):
+    wins = losses = 0
+    for row in rows or []:
+        status = str(row.get("status", "")).upper()
+        if status == "WIN": wins += 1
+        elif status == "LOSS": losses += 1
+    total = wins + losses
+    return {
+        "resolved": total,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round((wins / total) * 100, 2) if total else None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+# @@END stock_learning

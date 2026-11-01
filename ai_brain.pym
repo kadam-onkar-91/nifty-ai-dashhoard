@@ -1,3 +1,8 @@
+# ai_brain.pym -- module bundle: AI Trade Decision Engine, Gemini key pool, NVIDIA LLM, AI chat
+# Each section between '# @@MODULE name' and '# @@END name' is the ORIGINAL module source, unchanged.
+# bundle_loader.py imports every section as its own module (same import names as before).
+# Modules in this bundle: ai_trade_decision, gemini_pool, nvidia_llm, ai_chat
+# @@MODULE ai_trade_decision
 """
 ai_trade_decision.py — NEW, purely additive module.
 
@@ -343,10 +348,12 @@ def _early_live_ok(strategy_result, direction, entry_quality):
 
 
 # Cached, Google-Search-grounded news brief (refreshed in the background, never blocks a refresh or a trade).
-NEWS_TTL_S = 600.0
+NEWS_TTL_S = 900.0
 NEWS_RETRY_S = 120.0
 _NEWS = {"ts": 0.0, "text": "", "grounded": False, "model": None, "err": "", "fail_ts": 0.0, "busy": False}
 _NEWS_LOCK = __import__("threading").Lock()
+_SEARCH_COOL = {"until": 0.0}      # v56: after a Search-quota 429 the per-review search call is skipped for a while (saves quota AND time)
+SEARCH_COOL_S = 1200.0
 
 
 def _news_refresh(keys):
@@ -368,7 +375,26 @@ def _news_refresh(keys):
             grounded = bool((cand.get("groundingMetadata") or {}).get("webSearchQueries") or (cand.get("groundingMetadata") or {}).get("groundingChunks"))
             return {"text": txt[:2500], "grounded": grounded}
 
-        parsed, _i, model = gemini_pool.run(keys, gemini_pool.REVIEW_MODELS, _one, max_attempts=10, deadline_s=60.0)
+        parsed, _i, model = None, None, None
+        _gerr = ""
+        try:
+            if time.time() >= _SEARCH_COOL["until"]:
+                parsed, _i, model = gemini_pool.run(keys, gemini_pool.REVIEW_MODELS, _one, max_attempts=10, deadline_s=60.0)
+        except Exception as exc:
+            _gerr = f"{exc}"[:160]
+            if "429" in _gerr or "quota" in _gerr.lower():
+                _SEARCH_COOL["until"] = time.time() + SEARCH_COOL_S
+        if not parsed or not parsed.get("grounded"):
+            # v56 fallback: Google News RSS (no key, no quota) so the review always has a real Google-sourced brief
+            try:
+                import news_rss
+                rss = news_rss.brief()
+            except Exception:
+                rss = ""
+            if rss:
+                parsed, model = {"text": "Google News headlines (RSS):\n" + rss, "grounded": True}, "Google News RSS (free)"
+            elif parsed is None:
+                raise RuntimeError(_gerr or "no news source reachable")
         with _NEWS_LOCK:
             _NEWS.update({"ts": time.time(), "text": parsed["text"], "grounded": parsed["grounded"], "model": model, "err": "", "fail_ts": 0.0})
     except Exception as exc:
@@ -618,13 +644,15 @@ def gemini_trade_review(api_keys, dashboard_context, strategy_result, proposed_d
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         hdr = {"Content-Type": "application/json", "x-goog-api-key": key}
         _serr = ""
-        if use_search:
+        if use_search and time.time() >= _SEARCH_COOL["until"]:
             try:
                 out = _gemini_extract_json(_post(url, hdr, body_search, 40))
                 out["_search_used"] = True
                 return out
             except Exception as exc_s:
                 _serr = f"{type(exc_s).__name__}: {str(exc_s)[:110]}"
+                if "429" in str(exc_s):
+                    _SEARCH_COOL["until"] = time.time() + SEARCH_COOL_S      # v56: Search quota is out -> stop asking for a while (the RSS brief still feeds the review)
                 # ANY problem with the search-grounded call (400 unsupported, 429 search quota, timeout,
                 # non-JSON prose...) -> retry the SAME key/model once WITHOUT search, so a search problem
                 # never burns this key/model or cascades through all 5 keys.
@@ -2066,3 +2094,890 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         "breakeven_probability": edge["breakeven_probability"], "required_ev_r": edge["required_ev_r"],
         "edge": edge,
     }
+# @@END ai_trade_decision
+# @@MODULE gemini_pool
+"""gemini_pool.py -- ONE shared, quota-aware Gemini caller for the whole dashboard.
+
+Why this exists
+---------------
+* Chat said "AI se jawab nahi mila: 503" -- the old rotation only rotated on 429; a 503
+  ("model overloaded") crashed straight to the user instead of trying another model/key.
+* "Saari 5 keys ka quota khatam" -- every call hammered key #1 first, re-sent the *whole*
+  dashboard each time, and the trade-review cache key contained the live price, so the same
+  setup was re-reviewed every 30 s refresh.
+* Trade review was hard-wired to gemini-2.5-flash (being retired -> 404 -> "HTTPError").
+
+What it does
+------------
+* Spreads calls round-robin over all keys and over a MODEL CHAIN (each model has its own quota
+  bucket, so when flash-lite is exhausted, 3.5-flash / flash-latest still work).
+* 429  -> that (key, model) pair rests (until the stated retry time; ~2 h if it is a *daily* limit).
+* 503/5xx -> that MODEL rests ~20 s for every key (it is an overload, not your quota).
+* 404 -> model marked retired for 6 h.   401/403 -> that key rests 6 h.
+* Module-level state => shared by all browser sessions and all call sites (chat + trade review).
+* Short response cache so identical requests never spend quota twice.
+"""
+from app_logging import get_logger
+logger = get_logger(__name__)
+
+import re
+import time
+import hashlib
+import threading
+
+_LOCK = threading.Lock()
+_COOL = {}        # (key_hash|'*', model|'*') -> resume_ts
+_DEAD = {}        # model -> ts when found retired
+_CACHE = {}       # sig -> (ts, value)
+_RR = {"n": 0}
+_STATS = {"calls": 0, "ok": 0, "cache_hits": 0, "errors": 0, "last_model": None, "last_error": ""}
+
+DEAD_TTL = 6 * 3600
+CHAT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-lite-latest", "gemini-flash-latest"]
+REVIEW_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+
+
+class PoolHTTPError(Exception):
+    def __init__(self, status, message=""):
+        super().__init__(f"HTTP {status} {message}")
+        self.status = status
+        self.message = message
+
+
+class GeminiUnavailable(Exception):
+    def __init__(self, last_exc, wait_s=0.0, attempts=None, details=None):
+        super().__init__(str(last_exc))
+        self.last_exc = last_exc
+        self.wait_s = wait_s
+        self.attempts = attempts or []
+        self.details = details or []
+
+
+def _kh(key):
+    return hashlib.sha1(str(key).encode()).hexdigest()[:8]
+
+
+def parse_error(exc):
+    """-> (status:int|None, message:str) for requests-style PoolHTTPError and google-genai errors."""
+    if isinstance(exc, PoolHTTPError):
+        return exc.status, exc.message
+    msg = str(exc)
+    status = None
+    for attr in ("code", "status_code"):
+        v = getattr(exc, attr, None)
+        if isinstance(v, int):
+            status = v
+            break
+    if status is None:
+        m = re.search(r"\b([45]\d\d)\b", msg)
+        if m:
+            status = int(m.group(1))
+    low = msg.lower()
+    if status is None:
+        if "resource_exhausted" in low or "quota" in low:
+            status = 429
+        elif "unavailable" in low or "overloaded" in low or "high demand" in low:
+            status = 503
+    return status, msg
+
+
+def report_error(key, model, status, msg):
+    now = time.time()
+    low = (msg or "").lower()
+    with _LOCK:
+        _STATS["errors"] += 1
+        _STATS["last_error"] = f"{model}: {status} {low[:120]}"
+        if status == 429:
+            m = re.search(r"retry(?: in|delay'?:? ?'?)\s*([\d.]+)\s*s", low)
+            daily = ("perday" in low.replace(" ", "")) or "per day" in low
+            wait = float(m.group(1)) + 2 if m else (7200.0 if daily else 60.0)
+            if daily and m is None:
+                wait = 7200.0
+            _COOL[(_kh(key), model)] = now + max(wait, 20.0)
+        elif status in (500, 502, 503, 504):
+            _COOL[("*", model)] = now + 20.0
+        elif status == 404 or (status == 400 and any(t in low for t in ("no longer available", "not found", "not supported", "deprecated"))):
+            _DEAD[model] = now
+        elif status in (401, 403):
+            _COOL[(_kh(key), "*")] = now + 6 * 3600
+
+
+def _blocked(key, model, now):
+    kh = _kh(key)
+    for k in ((kh, model), ("*", model), (kh, "*")):
+        if _COOL.get(k, 0) > now:
+            return True
+    return False
+
+
+def plan(api_keys, models):
+    """Pass 1: ONE free key for every model (each model has its own quota bucket, so a 429 on
+    model #1 no longer burns all attempts before model #2 is ever tried). Pass 2: remaining combos."""
+    now = time.time()
+    keys = [k for k in (api_keys or []) if k]
+    first, rest = [], []
+    with _LOCK:
+        _RR["n"] += 1
+        start = _RR["n"] % max(len(keys), 1)
+        for model in models:
+            if now - _DEAD.get(model, 0) < DEAD_TTL:
+                continue
+            seen_first = False
+            for i in range(len(keys)):
+                key = keys[(start + i) % len(keys)]
+                if _blocked(key, model, now):
+                    continue
+                if not seen_first:
+                    first.append((key, model)); seen_first = True
+                else:
+                    rest.append((key, model))
+    return first + rest
+
+
+def seconds_until_available(api_keys, models):
+    now = time.time()
+    best = None
+    with _LOCK:
+        for model in models:
+            if now - _DEAD.get(model, 0) < DEAD_TTL:
+                continue
+            for key in api_keys or []:
+                kh = _kh(key)
+                t = max(_COOL.get(k, 0) for k in ((kh, model), ("*", model), (kh, "*")))
+                rem = max(0.0, t - now)
+                best = rem if best is None else min(best, rem)
+    return best or 0.0
+
+
+def cache_get(sig, ttl):
+    with _LOCK:
+        hit = _CACHE.get(sig)
+        if hit and time.time() - hit[0] < ttl:
+            _STATS["cache_hits"] += 1
+            return hit[1]
+    return None
+
+
+def cache_set(sig, value):
+    with _LOCK:
+        _CACHE[sig] = (time.time(), value)
+        if len(_CACHE) > 60:
+            for k in sorted(_CACHE, key=lambda z: _CACHE[z][0])[:20]:
+                _CACHE.pop(k, None)
+
+
+def run(api_keys, models, attempt_fn, max_attempts=30, deadline_s=None):
+    """attempt_fn(key, model) -> value, or raises. Returns (value, key_index, model).
+    deadline_s: stop trying new key/model combos after this many seconds in total (None = no limit)."""
+    _t0 = time.time()
+    keys = [k for k in (api_keys or []) if k]
+    last, attempts, details = None, [], []
+    combos = plan(keys, models)
+    if not combos:
+        raise GeminiUnavailable(RuntimeError("all keys/models are cooling down"),
+                                seconds_until_available(keys, models), attempts)
+    quota_hits = {}
+    tried = 0
+    for key, model in combos:
+        if tried >= max_attempts:
+            break
+        if deadline_s is not None and tried > 0 and (time.time() - _t0) >= deadline_s:
+            break
+        tried += 1
+        with _LOCK:
+            _STATS["calls"] += 1
+        try:
+            val = attempt_fn(key, model)
+            with _LOCK:
+                _STATS["ok"] += 1
+                _STATS["last_model"] = model
+            return val, keys.index(key), model
+        except Exception as exc:
+            status, msg = parse_error(exc)
+            report_error(key, model, status, msg)
+            last = exc
+            attempts.append(f"{model}: {status or type(exc).__name__}")
+            details.append(f"{model} key#{keys.index(key) + 1}: {status or type(exc).__name__} {str(msg).replace(chr(10), ' ')[:90]}")
+            if status == 429:
+                quota_hits[model] = quota_hits.get(model, 0) + 1
+            logger.warning("Gemini attempt failed %s status=%s", model, status)
+            if status == 503:
+                time.sleep(0.6)
+    raise GeminiUnavailable(last, seconds_until_available(keys, models), attempts, details)
+
+
+def stats():
+    with _LOCK:
+        return dict(_STATS)
+
+
+def sdk_generate(api_keys, contents, models, genai, genai_types=None, grounding=False, max_attempts=30):
+    """google-genai SDK call through the pool. Returns (text, key_index, model)."""
+    def _one(key, model):
+        client = genai.Client(api_key=key)
+        kwargs = {"model": model, "contents": contents}
+        if grounding and genai_types is not None:
+            try:
+                kwargs["config"] = genai_types.GenerateContentConfig(
+                    tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())])
+            except Exception:
+                kwargs.pop("config", None)
+        try:
+            resp = client.models.generate_content(**kwargs)
+        except Exception as exc:
+            status, _ = parse_error(exc)
+            # search/grounding problem (400/403/429/5xx) -> same key/model once without it; do NOT burn another key
+            if "config" in kwargs and status != 404:
+                resp = client.models.generate_content(model=model, contents=contents)
+            else:
+                raise
+        text = getattr(resp, "text", None)
+        if not text:
+            raise PoolHTTPError(503, "empty reply")
+        return text
+    return run(api_keys, models, _one, max_attempts=max_attempts)
+# @@END gemini_pool
+# @@MODULE nvidia_llm
+"""
+nvidia_llm.py -- v56: NVIDIA NIM (build.nvidia.com) as a second, free brain for the dashboard's chat box.
+
+OpenAI-compatible endpoint  https://integrate.api.nvidia.com/v1  .  Key: https://build.nvidia.com -> any model -> "Get API Key" (starts with nvapi-).
+Secrets (any of):  NVIDIA_API_KEY   or   NVIDIA_API_KEY_1 .. NVIDIA_API_KEY_5   ;  optional  NVIDIA_MODEL  (force one model id).
+
+* The best available model is picked automatically from the account's live /v1/models list (PREFERRED order, strongest first), so a retired
+  model id never breaks the chat; if a call fails the next model is tried.
+* Rate-limit (429) / overload -> that (key, model) rests briefly, the next key/model is tried.  Reasoning models' <think> text is removed.
+* Free access is rate-limited (about 40 requests / minute per account at the time of writing) -- very generous for a chat box, but not literally
+  unlimited; the chat falls back to Gemini automatically when NVIDIA does not answer.
+"""
+from __future__ import annotations
+
+import re
+import threading
+import time
+
+import requests
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+BASE_URL = "https://integrate.api.nvidia.com/v1"
+PREFERRED = (
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+    "deepseek-ai/deepseek-v3.1",
+    "deepseek-ai/deepseek-r1",
+    "qwen/qwen3-235b-a22b",
+    "openai/gpt-oss-120b",
+    "moonshotai/kimi-k2-instruct",
+    "nvidia/llama-3.3-nemotron-super-49b-v1",
+    "meta/llama-3.3-70b-instruct",
+    "meta/llama-3.1-405b-instruct",
+)
+_SKIP_WORDS = ("embed", "rerank", "guard", "safety", "vision", "-vl", "vl-", "clip", "parse", "retriev", "nv-", "tts", "asr", "image", "diffusion")
+MODELS_TTL_S = 6 * 3600
+_LOCK = threading.Lock()
+_STATE = {"models": None, "ts": 0.0, "cool": {}, "dead": {}, "last_model": None, "last_error": ""}
+
+
+class NvidiaUnavailable(Exception):
+    pass
+
+
+def keys_from_secrets(secrets):
+    """Collect NVIDIA keys from a dict-like (st.secrets)."""
+    out = []
+    for name in ("NVIDIA_API_KEY", "NVIDIA_API_KEY_1", "NVIDIA_API_KEY_2", "NVIDIA_API_KEY_3", "NVIDIA_API_KEY_4", "NVIDIA_API_KEY_5"):
+        try:
+            v = str(secrets[name]).strip()
+        except Exception:
+            v = ""
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def forced_model(secrets):
+    try:
+        return str(secrets["NVIDIA_MODEL"]).strip() or None
+    except Exception:
+        return None
+
+
+def _hdr(key):
+    return {"Authorization": f"Bearer {key}", "Accept": "application/json", "Content-Type": "application/json"}
+
+
+def list_models(keys, force=False):
+    """Model ids available to this account (cached 6 h); [] when the list could not be fetched."""
+    now = time.time()
+    with _LOCK:
+        if not force and _STATE["models"] is not None and now - _STATE["ts"] < MODELS_TTL_S:
+            return list(_STATE["models"])
+    for k in keys:
+        try:
+            r = requests.get(f"{BASE_URL}/models", headers=_hdr(k), timeout=12)
+            if r.status_code == 200:
+                ids = [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
+                with _LOCK:
+                    _STATE["models"], _STATE["ts"] = ids, now
+                return ids
+        except Exception:
+            continue
+    with _LOCK:
+        _STATE["ts"] = now - MODELS_TTL_S + 300            # retry the listing in 5 min, meanwhile use PREFERRED blindly
+        if _STATE["models"] is None:
+            _STATE["models"] = []
+    return []
+
+
+def candidate_models(available, forced=None):
+    """Strongest-first list of models to try."""
+    out = []
+    if forced:
+        out.append(forced)
+    avail = set(available or [])
+    for m in PREFERRED:
+        if (not avail or m in avail) and m not in out:
+            out.append(m)
+    if avail:
+        extra = [m for m in sorted(avail) if m not in out and not any(w in m.lower() for w in _SKIP_WORDS)
+                 and re.search(r"(instruct|chat|r1|v3|nemotron|gpt-oss|kimi|qwen3|llama)", m.lower())]
+        out += extra[:4]
+    return out[:8]
+
+
+_THINK = re.compile(r"<think>.*?</think>", re.S | re.I)
+
+
+def clean_reply(text):
+    t = _THINK.sub("", text or "")
+    t = re.sub(r"^.*?</think>", "", t, flags=re.S | re.I) if "</think>" in t else t      # a reply that lost its opening tag
+    return t.strip()
+
+
+def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadline_s=110.0, post=requests.post, thinking=False):
+    """-> (text, model).  Raises NvidiaUnavailable when no key/model answered."""
+    keys = [k for k in (keys or []) if k]
+    if not keys:
+        raise NvidiaUnavailable("NVIDIA_API_KEY not configured")
+    t_end = time.time() + deadline_s
+    models = candidate_models(list_models(keys), forced_model(secrets) if secrets is not None else None)
+    errs = []
+    n = 0
+    for model in models:
+        with _LOCK:
+            if _STATE["dead"].get(model, 0) > time.time():
+                continue
+        for i in range(len(keys)):
+            if time.time() > t_end:
+                raise NvidiaUnavailable("deadline: " + "; ".join(errs[-3:]))
+            key = keys[(n + i) % len(keys)]
+            ck = (key[-6:], model)
+            with _LOCK:
+                if _STATE["cool"].get(ck, 0) > time.time():
+                    continue
+            try:
+                body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False}
+                if "nemotron-3" in model:
+                    # v56c: Nemotron 3 is a reasoning model: sampling NVIDIA recommends, and thinking mode on for trade questions
+                    body.update({"temperature": 0.6 if thinking else temperature, "top_p": 0.95,
+                                 "chat_template_kwargs": {"enable_thinking": bool(thinking)}})
+                r = post(f"{BASE_URL}/chat/completions", headers=_hdr(key), timeout=max(10.0, min(115.0, t_end - time.time())),
+                         json=body)
+            except Exception as exc:
+                errs.append(f"{model}: {type(exc).__name__}")
+                with _LOCK:
+                    _STATE["cool"][ck] = time.time() + 20
+                continue
+            if r.status_code == 200:
+                try:
+                    txt = clean_reply(((r.json().get("choices") or [{}])[0].get("message") or {}).get("content", ""))
+                except Exception:
+                    txt = ""
+                if txt:
+                    with _LOCK:
+                        _STATE["last_model"], _STATE["last_error"] = model, ""
+                    return txt, model
+                errs.append(f"{model}: empty reply")
+                continue
+            errs.append(f"{model}: HTTP {r.status_code}")
+            with _LOCK:
+                if r.status_code in (404, 410):
+                    _STATE["dead"][model] = time.time() + 6 * 3600
+                elif r.status_code in (401, 403):
+                    _STATE["cool"][ck] = time.time() + 6 * 3600
+                elif r.status_code == 429:
+                    _STATE["cool"][ck] = time.time() + 45
+                else:
+                    _STATE["cool"][ck] = time.time() + 20
+            if r.status_code in (404, 410):
+                break
+        n += 1
+    with _LOCK:
+        _STATE["last_error"] = "; ".join(errs[-4:])
+    raise NvidiaUnavailable("; ".join(errs[-4:]) or "no model available")
+
+
+def status():
+    with _LOCK:
+        return {"last_model": _STATE["last_model"], "last_error": _STATE["last_error"], "models_listed": len(_STATE["models"] or [])}
+# @@END nvidia_llm
+# @@MODULE ai_chat
+from app_logging import get_logger
+logger = get_logger(__name__)
+import streamlit as st
+import re
+import io
+import asyncio
+import json
+import time
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    HAS_GENAI = True
+except ImportError:
+    genai = None
+    genai_types = None
+    HAS_GENAI = False
+
+try:
+    import edge_tts
+    HAS_TTS = True
+except ImportError:
+    edge_tts = None
+    HAS_TTS = False
+
+from sniper_setup_framework import SNIPER_SETUP_FRAMEWORK
+import gemini_pool
+import hashlib
+
+
+def _build_context_block(context: dict, max_total: int = 14000, per_section: int = 1800) -> str:
+    """Live dashboard numbers as text for Gemini.  BOUNDED: the old version sent every raw
+    table in full on every message (often 100k+ chars) which is what drained the 5 keys.
+    Normal chat gets ~14k chars; explicit trade requests get a bigger window (see caller)."""
+    lines = ["=== LIVE DASHBOARD SNAPSHOT (this is the ONLY market data you may use) ==="]
+    used = 0
+    # engine verdict / strategy sections first so they are never cut
+    priority = [k for k in context if any(t in str(k) for t in
+                ("Strategy", "STRATEGY", "Market Status", "Data Freshness", "Spot", "Latest Price", "Regime", "Order Flow", "AI Trade"))]
+    rest = [k for k in context if k not in priority]
+    for label in priority + rest:
+        value = context.get(label)
+        if value is None or value == "":
+            continue
+        v = str(value)
+        if len(v) > per_section:
+            v = v[:per_section] + " ...[trimmed]"
+        line = f"- {label}: {v}"
+        if used + len(line) > max_total:
+            continue
+        lines.append(line)
+        used += len(line)
+    lines.append("=== END SNAPSHOT ===")
+    return "\n".join(lines)
+
+
+def _is_explicit_trade_request(text: str) -> bool:
+    """True only when the user explicitly asks the AI to produce a trade/setup.
+    This keeps normal dashboard questions from triggering expensive deep research.
+    """
+    q = (text or "").lower().strip()
+    phrases = [
+        "ek trade do", "trade do", "trade plan do", "trade batao",
+        "trade de", "best trade", "entry target sl", "entry batao",
+        "buy ya sell", "buy or sell", "kahan buy", "kahan sell",
+        "setup do", "setup batao", "trade setup", "signal do",
+    ]
+    return any(p in q for p in phrases)
+
+
+def _clean_for_speech(text: str) -> str:
+    """Strips markdown symbols (*, #, `, bullet dashes) before sending text
+    to TTS, so the voice doesn't read out literal asterisks/hashes."""
+    text = re.sub(r'[*_#`]', '', text)
+    text = re.sub(r'^\s*[-•]\s*', '', text, flags=re.MULTILINE)
+    return text
+
+
+async def _generate_speech_bytes(text: str) -> bytes:
+    """Natural, human-sounding Hindi male voice (Microsoft Edge Neural TTS,
+    free, no API key). '+12%' rate makes it speak a bit faster/livelier
+    than the default pace, closer to how a person actually talks."""
+    communicate = edge_tts.Communicate(text=text, voice="hi-IN-MadhurNeural", rate="+12%")
+    audio_bytes = b""
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_bytes += chunk["data"]
+    return audio_bytes
+
+
+def _speak(text: str):
+    """Renders an audio player for the given text using the natural Hindi
+    voice. Safe to call from inside a normal (sync) Streamlit script."""
+    try:
+        clean_text = _clean_for_speech(text)
+        if not clean_text.strip():
+            return
+        audio_bytes = asyncio.run(_generate_speech_bytes(clean_text))
+        if audio_bytes:
+            st.audio(io.BytesIO(audio_bytes), format="audio/mp3")
+    except Exception:
+        logger.exception("Broad exception caught; fallback path executed")
+        st.caption("🔇 Awaaz generate nahi ho payi is baar -- text jawab upar hai.")
+
+
+SYSTEM_PREAMBLE = """You are a trading-desk research assistant embedded inside a live Nifty 50 dashboard.
+Rules you must always follow:
+1. Answer ONLY using the LIVE DASHBOARD SNAPSHOT block provided with each question, plus the
+   conversation so far. Do not invent price levels, percentages, or news that aren't in the snapshot.
+2. You are NOT a financial advisor and must never phrase anything as a guarantee or certainty
+   ("will definitely go up/down", "100% chance"). Use probabilistic, hedged language, the way a
+   professional trading desk analyst would -- because the snapshot itself is a probabilistic model
+   output, not a fact about the future.
+3. If the user asks something the snapshot has no data for, say so plainly instead of guessing.
+4. DO DEEP RESEARCH, not one-liners: when the question is about market direction, a signal, or
+   "what should I know", actively cross-check EVERY relevant metric in the snapshot against each
+   other -- confluence signal vs breadth vs VWAP vs PCR vs FII footprint vs Bank Nifty correlation
+   vs SMC structure vs global sentiment vs Max Pain gravity. Explicitly call out where they agree
+   and where they conflict, and explain what that conflict/agreement implies, before giving your
+   overall read. For simple factual questions ("what's the RSI right now"), just answer directly
+   and briefly -- match the depth of the answer to the depth of the question.
+5. Respond in the same language mix (Hindi/English/Hinglish) the user writes in.
+6. If the user uploads a screenshot, describe what you actually see in it and relate it to the
+   live snapshot data -- don't assume it matches the snapshot exactly, since screenshots may be
+   from a different moment in time.
+7. ALWAYS check the "Market Status" and "Data Freshness" fields in the snapshot before answering
+   any trade-related question. If Data Freshness says STALE/FROZEN, or Market Status says the
+   market is closed, say so explicitly and make clear the rest of the numbers are from the last
+   available session, not right now -- don't discuss them as if they're live in that case.
+8. You have ALSO been given a separate SNIPER SETUP FRAMEWORK document below (loaded from
+   sniper_setup_framework.py). Read it carefully -- it is a full trading knowledge base you must
+   apply whenever the user asks for a trade signal, a setup, or "should I take a trade". For
+   simple factual questions, you don't need to invoke the whole framework -- just answer directly.
+9. NEVER volunteer a specific Entry price, Target, or Stop-Loss unless the user's CURRENT message
+   explicitly asks for one. Give the Setup Bias / Key Levels / Confluence / Trigger analysis
+   without it by default. Only when they explicitly ask (e.g. "entry target batao", "trade plan
+   do") should you compute and state Entry/Target/SL -- and always compute it fresh from that
+   message's live snapshot, never by repeating a number from earlier in the conversation.
+10. When the user asks "buy ya sell entry hai kya", or asks how confident/accurate a call is, or
+    asks for an "up % vs down %" chance: NEVER invent a made-up statistical probability (e.g. "73%
+    chance of going up") -- a language model guessing a precise number like that is fabrication,
+    not real statistics, and could get the user hurt financially. Instead:
+    a) Report the actual "AI Confluence Score" from the snapshot as-is -- this is a real number
+       computed by the app's code from how many technical signals align, not a guess.
+    b) Break down which individual factors in the snapshot point bullish vs bearish (RSI, VWAP,
+       EMA 20/50, MACD, Full/Heavyweight Breadth, Smart Money Structure, FII/DII Footprint, Bank
+       Nifty correlation, PCR, Max Pain Gravity, Global Sentiment) as a simple count, e.g. "6 out
+       of 9 tracked factors lean bullish, 3 lean bearish" -- only using factors present in the
+       snapshot, never inventing ones that aren't there.
+    c) Call this a "confluence lean strength", explicitly NOT a scientific probability of where
+       price will go -- markets can and do move against strong confluence.
+    d) Point to the "Live DB Win Rate" and "Walk-Forward ML Accuracy" fields in the snapshot as the
+       closest thing to a real, historically-grounded accuracy figure, since those come from
+       actual logged outcomes/backtesting rather than a single-moment guess.
+11. EXPLICIT TRADE REQUEST MODE: If the CURRENT user message explicitly asks for a trade/setup
+    (for example "ek trade do", "trade plan do", "buy ya sell", "entry target SL batao"), switch
+    into FULL-DASHBOARD TRADE RESEARCH mode. Before producing the setup, synthesize EVERY
+    AVAILABLE section of the supplied dashboard snapshot, not just the existing dashboard signal.
+    Give priority to live/fresh data and explicitly flag anything STALE, SIMULATED, unavailable,
+    or delayed. Re-check: spot/OHLC, all available timeframes, BOS/CHoCH/SMC/FVG/OB/sweeps,
+    liquidity map and S/R ladder, CPR/pivots/PDH/PDL/opening range, VWAP/POC/volume, option-chain
+    OI/OI-change/PCR/IV/Greeks/skew/max-pain when supplied, order-book imbalance, breadth/sectors,
+    FII/DII footprint, Bank Nifty/Sensex correlation, VIX/volatility regime, global markets/news,
+    ML raw + calibrated confidence and OOS metrics, backtest/Monte-Carlo/drift, position sizing and
+    risk-engine blocks. Do NOT blindly copy the dashboard's precomputed Entry/SL/Target: independently
+    reconcile the evidence and derive the setup from the CURRENT snapshot. If critical evidence
+    conflicts or is missing, downgrade to WATCH/NO TRADE rather than forcing a trade.
+12. In FULL-DASHBOARD TRADE RESEARCH mode, output: Market State/Regime -> Evidence that agrees ->
+    Evidence that conflicts -> Trade direction (BUY/SELL/NO TRADE) -> exact Entry/trigger -> SL/
+    invalidation -> T1/T2/T3 -> R:R -> position-size/risk note -> what must happen before entry ->
+    what cancels the setup -> data freshness/source notes. Any probability/confidence must be an
+    actual model/calibration value supplied by the snapshot; never invent a percentage.
+13. If external Google Search grounding is available for this request, use it only for current,
+    relevant market-moving facts/news/events and clearly distinguish web-researched facts from
+    dashboard-derived calculations. Never use external search to invent missing market prices.
+"""
+
+SYSTEM_PREAMBLE = SYSTEM_PREAMBLE + "\n\n" + SNIPER_SETUP_FRAMEWORK
+
+
+TRADE_ANSWER_RULES = """
+=== TRADE ANSWER RULES (v56) ===
+When asked for a trade / entry / exit / "kahan buy ya sell":
+1. FIRST read 'AI TRADE DECISION (final)' and the live strategy / S/R / OI sections.  If the engine has a trade, quote ITS exact entry, SL, target and R:R.
+2. If the engine has NO trade, say so with the engine's gate reason, then give a CONDITIONAL plan from the real levels in the data:
+   'BUY agar <level> ke upar 5-min close aaye -> entry <price>, SL <price> (max 28 pts), target <price> (near OI wall), R:R <x>' and the mirror SELL plan.
+3. Use only prices that appear in the supplied data (S/R zones, VWAP, EMA, OI walls, day high/low).  Never invent a level.  Show the arithmetic (points to SL / target, R:R).
+4. Say clearly where NO trade should be taken (middle of range, against live price action, extended move) and what would make the setup invalid.
+5. Give a probability in words (strong / medium / weak) with the 3-4 factors that decide it, including the facts against it.  No guarantees.
+"""
+
+
+def _nvidia_keys():
+    try:
+        import nvidia_llm
+        return nvidia_llm.keys_from_secrets(st.secrets)
+    except Exception:
+        return []
+
+
+def _news_for_chat(gemini_keys):
+    """Fresh Google-sourced headline brief for the prompt (cached, never blocks)."""
+    try:
+        import ai_trade_decision as _atd
+        nb = _atd.get_news_brief(gemini_keys)
+        if nb.get("text"):
+            return "=== FRESH NEWS BRIEF (" + str(nb.get("model") or "Google") + ") ===\n" + str(nb["text"])[:2500] + "\n\n"
+    except Exception:
+        pass
+    return ""
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """Detects a rate-limit / quota-exhausted error from the Gemini API so we
+    know it's worth rotating to the next key, instead of just failing on
+    every kind of error (e.g. a bad prompt should not burn through all 5 keys)."""
+    text = str(exc).lower()
+    quota_signals = ["429", "quota", "rate limit", "resource_exhausted", "resource exhausted"]
+    return any(sig in text for sig in quota_signals)
+
+
+def _call_gemini_with_rotation(api_keys: list, model: str, contents: list,
+                               enable_web_research: bool = False):
+    """Backwards-compatible wrapper -> shared quota-aware pool (gemini_pool.py).
+    Rotates keys AND models, handles 429 / 503 / 404 separately, never raises on a 503 first try."""
+    models = [model] + [m for m in gemini_pool.CHAT_MODELS if m != model]
+    text, idx, used_model = gemini_pool.sdk_generate(
+        api_keys, contents, models, genai, genai_types, grounding=enable_web_research)
+    st.session_state["last_gemini_model"] = used_model
+    return text, idx
+
+
+def get_trade_research(gemini_api_keys, dashboard_context: dict, cache_seconds: int = 90):
+    """Run a lightweight independent AI research check for the deterministic
+    trade engine. The result is intentionally a SOFT vote, not an automatic
+    order. It is cached briefly because the dashboard refreshes frequently.
+
+    Returns a small dict: direction, verdict, rationale, conflicts, source.
+    On any API/parse problem returns an empty dict so the deterministic engine
+    continues normally.
+    """
+    if isinstance(gemini_api_keys, str):
+        gemini_api_keys = [gemini_api_keys] if gemini_api_keys else []
+    if not gemini_api_keys or not HAS_GENAI or not dashboard_context:
+        return {}
+
+    try:
+        # Stable enough cache key: price + freshness + core structural fields.
+        key_material = "|".join([
+            str(dashboard_context.get("Nifty Spot Price", "")),
+            str(dashboard_context.get("Data Freshness", "")),
+            str(dashboard_context.get("Confluence Signal", "")),
+            str(dashboard_context.get("RAW Option Chain (all loaded strikes)", ""))[:1200],
+            str(dashboard_context.get("RAW S/R Ladder", ""))[:1200],
+            str(dashboard_context.get("RAW Regime Engine", ""))[:800],
+            str(dashboard_context.get("RAW Order Flow", ""))[:800],
+        ])
+        cache = st.session_state.get("trade_research_cache")
+        now = time.time()
+        if cache and cache.get("key") == key_material and now - float(cache.get("ts", 0)) < cache_seconds:
+            return cache.get("result") or {}
+
+        snapshot = _build_context_block(dashboard_context)
+        prompt = f"""You are an independent second-opinion research layer for a live NIFTY 50 trading engine.
+Use ONLY the supplied dashboard snapshot. Do not invent prices or probabilities.
+The deterministic engine already has hard safety rules; your job is to identify the dominant side
+from the available evidence and point out conflicts. One or two neutral/missing factors must not
+force WAIT if the majority of independent evidence clearly leans one way. However, an explicit
+strong opposite OI wall, stale data, or a clear invalidation is a reason to WAIT.
+
+Return ONLY valid JSON with these keys:
+{{
+  "direction": "BUY" | "SELL" | "WAIT",
+  "verdict": "TRADEABLE" | "WATCH" | "NO_TRADE",
+  "strength": "STRONG" | "MODERATE" | "WEAK",
+  "rationale": "short Hinglish explanation",
+  "conflicts": ["short conflict", "..."],
+  "trigger_type": "BOUNCE" | "REJECTION" | "BREAKOUT" | "BREAKDOWN" | "MOMENTUM" | "WAIT"
+}}
+
+Do not provide guaranteed outcomes.
+
+{snapshot}"""
+        text, _ = _call_gemini_with_rotation(
+            api_keys=gemini_api_keys,
+            model=gemini_pool.CHAT_MODELS[0],
+            contents=[prompt],
+            enable_web_research=True,
+        )
+        raw = (text or "").strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            raw = raw.replace("json\n", "", 1).strip()
+        start, end = raw.find("{"), raw.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("AI research did not return JSON")
+        result = json.loads(raw[start:end + 1])
+        direction = str(result.get("direction", "WAIT")).upper()
+        if direction not in ("BUY", "SELL", "WAIT"):
+            direction = "WAIT"
+        result["direction"] = direction
+        result["verdict"] = str(result.get("verdict", "WATCH")).upper()
+        result["strength"] = str(result.get("strength", "WEAK")).upper()
+        result["source"] = "Gemini independent dashboard research"
+        st.session_state.trade_research_cache = {"ts": now, "key": key_material, "result": result}
+        return result
+    except Exception as exc:
+        logger.exception("Automatic trade research failed; deterministic engine continues")
+        return {}
+
+def render_ai_chat(gemini_api_keys, dashboard_context: dict):
+    """Renders a chat box at the point it's called. Every turn re-sends the
+    CURRENT live dashboard_context (so answers always reflect this run's
+    numbers, not stale ones from when the chat started), plus the running
+    conversation, plus an optional uploaded screenshot.
+
+    IMPORTANT: the caller must render this OUTSIDE any auto-refreshing
+    st.fragment. If it lived inside one, the fragment's own refresh timer
+    would tear down and rebuild this whole section every cycle -- cutting
+    off audio mid-sentence and wiping any text you were still typing into
+    the chat box before you hit enter.
+    """
+    st.subheader("💬 Ask the Dashboard AI")
+    st.caption(
+        "Isse dashboard ke live numbers ke baare me kuch bhi poochho -- deep analysis karke jawab dega. "
+        "Ye sirf probability/analysis deta hai -- guarantee nahi, kyunki market ka koi bhi tool "
+        "future ko pakka nahi bata sakta."
+    )
+
+    # Accept either a single key (string, old callers) or a list of keys.
+    if isinstance(gemini_api_keys, str):
+        gemini_api_keys = [gemini_api_keys] if gemini_api_keys else []
+
+    _nv_keys = _nvidia_keys()
+    _has_gemini = bool(gemini_api_keys) and HAS_GENAI
+    if not _has_gemini and not _nv_keys:
+        st.warning("Na Gemini key hai na NVIDIA key -- chat available nahi hai.")
+        return
+    _opts = []
+    if _nv_keys and _has_gemini:
+        _opts = ["Auto: NVIDIA pehle, Gemini backup", "Sirf NVIDIA (Gemini quota bachao)", "Sirf Gemini"]
+    elif _nv_keys:
+        _opts = ["Sirf NVIDIA (Gemini quota bachao)"]
+    else:
+        _opts = ["Sirf Gemini"]
+    _provider = _opts[0]
+    if len(_opts) > 1:
+        _provider = st.selectbox("Chat ka AI model", _opts, index=0, key="chat_provider",
+                                 help="NVIDIA free model chat ka jawab deta hai, isliye Gemini ka quota trade engine ke liye bachta hai. "
+                                      "Screenshot upload karoge to wo Gemini se padha jayega (NVIDIA text model image nahi dekhta).")
+    elif not _nv_keys:
+        st.caption("NVIDIA key add karne par yahan free NVIDIA model bhi chalega (secrets me NVIDIA_API_KEY).")
+
+    if "dashboard_chat_history" not in st.session_state:
+        st.session_state.dashboard_chat_history = []
+
+    for msg in st.session_state.dashboard_chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    uploaded_img = st.file_uploader(
+        "Optional: chat/chart ka screenshot upload karo",
+        type=["png", "jpg", "jpeg"],
+        key=f"ai_chat_img_{len(st.session_state.dashboard_chat_history)}",
+    )
+
+    user_q = st.chat_input("Apna sawaal likho...")
+    if not user_q:
+        return
+
+    st.session_state.dashboard_chat_history.append({"role": "user", "content": user_q})
+    with st.chat_message("user"):
+        st.markdown(user_q)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Live data padh raha hoon, deep analysis kar raha hoon..."):
+            try:
+                history_text = "\n".join(
+                    f"{m['role'].upper()}: {str(m['content'])[:500]}"
+                    for m in st.session_state.dashboard_chat_history[-6:]
+                )
+                trade_mode = _is_explicit_trade_request(user_q)
+                context_block = _build_context_block(dashboard_context, max_total=(60000 if trade_mode else 14000), per_section=(3500 if trade_mode else 1800))   # v56: trade questions get twice the detail per section
+                mode_block = (
+                    "=== EXPLICIT TRADE REQUEST: FULL-DASHBOARD RESEARCH REQUIRED ===\n"
+                    "Use ALL supplied dashboard sections, independently reconcile the evidence, and only then produce Entry/SL/Targets.\n"
+                    if trade_mode else "=== NORMAL CHAT MODE ===\n"
+                )
+                _news_block = _news_for_chat(gemini_api_keys) if trade_mode else ""
+                prompt_text = (f"{SYSTEM_PREAMBLE}\n\n{TRADE_ANSWER_RULES if trade_mode else ''}\n{mode_block}\n{context_block}\n\n{_news_block}"
+                               f"CONVERSATION SO FAR:\n{history_text}\n\nRespond to the latest USER message.")
+
+                contents = [prompt_text]
+                if uploaded_img is not None:
+                    contents.append({
+                        "inline_data": {
+                            "mime_type": uploaded_img.type,
+                            "data": uploaded_img.getvalue(),
+                        }
+                    })
+
+                # identical question on identical live data within 45 s -> reuse answer (zero quota)
+                _sig = hashlib.sha1((user_q.strip().lower() + "|" + context_block[:6000] + str(uploaded_img is not None)).encode()).hexdigest()
+                _cached = gemini_pool.cache_get(("chat", _sig), 45)
+                if _cached is not None:
+                    answer, key_idx_used = _cached, None
+                    st.caption("♻️ Same sawaal, same live data -- pichla jawab dobara dikhaya (quota bachaya).")
+                else:
+                    answer = None
+                    _use_nv = bool(_nv_keys) and uploaded_img is None and _provider != "Sirf Gemini"
+                    _nv_err = ""
+                    if _use_nv:
+                        try:
+                            import nvidia_llm
+                            answer, _nv_model = nvidia_llm.chat(
+                                _nv_keys, [{"role": "system", "content": SYSTEM_PREAMBLE + ("\n" + TRADE_ANSWER_RULES if trade_mode else "")},
+                                           {"role": "user", "content": prompt_text.split(SYSTEM_PREAMBLE, 1)[-1]}],
+                                secrets=st.secrets, max_tokens=(7000 if trade_mode else 2500), thinking=trade_mode, deadline_s=(125.0 if trade_mode else 90.0))
+                            st.caption(f"🟢 NVIDIA model (free): {_nv_model}")
+                        except Exception as _nv_exc:
+                            answer = None
+                            _nv_err = str(_nv_exc)[:160]
+                            if _provider.startswith("Sirf NVIDIA") or not _has_gemini:
+                                raise RuntimeError("NVIDIA se jawab nahi mila: " + _nv_err)
+                            st.caption("⚠️ NVIDIA abhi jawab nahi de paya (" + _nv_err + ") -- Gemini backup chal raha hai.")
+                    if answer is None:
+                        if not _has_gemini:
+                            raise RuntimeError("Gemini key nahi hai aur NVIDIA ne jawab nahi diya.")
+                        if uploaded_img is not None and _nv_keys and _provider != "Sirf Gemini":
+                            st.caption("🖼️ Screenshot hai -- isliye Gemini use hua.")
+                        answer, key_idx_used = _call_gemini_with_rotation(
+                            api_keys=gemini_api_keys,
+                            model=gemini_pool.CHAT_MODELS[0],
+                            contents=contents,
+                            enable_web_research=trade_mode,
+                        )
+                        st.caption(f"🔑 Key #{key_idx_used + 1}/{len(gemini_api_keys)} | model: {st.session_state.get('last_gemini_model','?')}")
+                    gemini_pool.cache_set(("chat", _sig), answer)
+            except gemini_pool.GeminiUnavailable as e:
+                wait = int(e.wait_s or 0)
+                eta = ("1-2 min" if wait < 5 else (f"~{wait} sec" if wait < 120 else f"~{wait // 60} min"))
+                answer = (
+                    "⚠️ Gemini abhi busy/limit par hai (" + ", ".join(e.attempts[-3:]) + "). "
+                    f"Dobara try karo {eta} baad -- keys ya model apne aap ghoom kar retry honge. "
+                    "Trade engine isse **nahi ruka**: wo apni local strategy+AI research chalata rahta hai."
+                )
+            except Exception as e:
+                logger.exception("Broad exception caught; fallback path executed")
+                answer = f"⚠️ AI se jawab nahi mil paya: {type(e).__name__}: {str(e)[:200]}"
+
+            st.markdown(answer)
+            st.session_state.dashboard_chat_history.append({"role": "assistant", "content": answer})
+
+            if HAS_TTS:
+                _speak(answer)
+# @@END ai_chat

@@ -1,3 +1,4 @@
+import bundle_loader  # noqa: F401  (registers the bundled modules; must stay the first import)
 from app_logging import get_logger
 logger = get_logger(__name__)
 import streamlit as st
@@ -46,6 +47,7 @@ import commodity_engine
 import global_research
 from hybrid_ai_engine import HybridAIEngine
 from alert_manager import AlertManager
+import trade_notify
 from ai_chat import render_ai_chat
 import ui_theme
 import live_chart
@@ -107,6 +109,7 @@ try:
     TELEGRAM_BOT_TOKEN = st.secrets["TELEGRAM_BOT_TOKEN"]
     TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
     alert_sys = AlertManager(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    trade_notify.configure(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)          # v56: Telegram message on every trade entry + exit
 except Exception:
     logger.exception("Broad exception caught; fallback path executed")
     alert_sys = None
@@ -114,6 +117,7 @@ except Exception:
 # Initialize the trades database (creates table if it doesn't exist yet)
 database.init_db()
 trade_learning.init_db()
+trade_learning.set_exit_hook(trade_notify.notify_exit)
 
 # OPTIONAL but STRONGLY recommended: permanent storage for the AI Trade
 # Decision Engine's learning history. Without this, trade_learning.py
@@ -1561,6 +1565,11 @@ def _live_dashboard():
                 )
                 if _sid:
                     st.success(f"✅ Automatically logged (id {_sid}) — tracking ho raha hai, outcome se seekhega.")
+                    trade_notify.notify_entry(_sid, _decision)       # v56: Telegram: pura trade detail
+                    if not trade_notify.is_configured():
+                        st.caption("📵 Telegram configure nahi hai (secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) -- trade ka message nahi jayega.")
+                    elif trade_notify.LAST.get("ok") is False:
+                        st.warning("Telegram message nahi ja paya: " + str(trade_notify.LAST.get("err"))[:150])
 
         # -------------------------------------------------------------
         # 🧬 MARKET BRAIN (v46): records every 5-min candle + its 60-min outcome, learns patterns, runs the daily autopsy
