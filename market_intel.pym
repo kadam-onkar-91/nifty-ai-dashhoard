@@ -178,7 +178,7 @@ def _draw(st, res, ns):
                "Ye sirf SALAAH/JAANKARI hai -- koi trade nahi kholta ya rokta.")
     fc = res["fc"]
 
-    with st.expander("🔮 Agla 60-min move -- forecaster (data se, guarantee nahi)", expanded=True):
+    with st.expander("🔮 Agla 60-min move -- forecaster (data se, guarantee nahi)", expanded=False):
         if not fc.get("ready"):
             st.info(fc.get("msg") or "Data kam hai.")
         else:
@@ -223,7 +223,7 @@ def _draw(st, res, ns):
                              "Kyon palta (shuru par)": "; ".join(c["text"] for c in lg["causes"]) or "Koi clear technical trigger nahi mila (shayad news / bade order -- data me nahi)",
                              "Engine": ", ".join(lg.get("engine") or []) or ("miss" if lg["major"] else "")})
             if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
                 ctx = [lg["context"] for lg in s["legs"] if lg.get("context")]
                 if ctx:
                     st.caption("Live context (sabse bade turn par): " + ctx[0])
@@ -238,7 +238,7 @@ def _draw(st, res, ns):
             st.caption(f"Base: {b['n']} candles me 60 min me +25 pehle {_pct(b['up'])}, -25 pehle {_pct(b['dn'])}.")
             st.dataframe(pd.DataFrame([{"Pattern": p["text"], "Samples": p["n"], "+25 pehle": _pct(p["up"]), "-25 pehle": _pct(p["dn"]),
                                         "Koi nahi": _pct(p["none"]), "UP edge": f"{100 * p['lift_up']:+.0f}", "DOWN edge": f"{100 * p['lift_dn']:+.0f}"} for p in ps]),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
         L = res["lessons"]
         if L["majors"]:
             rk = ", ".join(f"{ma.CAUSE_NAMES.get(k, k)} ({v}/{L['majors']})" for k, v in L["ranking"][:5])
@@ -254,7 +254,7 @@ def _draw(st, res, ns):
                         + (f" | validated model ke ({sc['n_trusted']}): {_pct(sc['acc_trusted'])}" if sc.get("acc_trusted") is not None else ""))
         if res["tf"]:
             st.caption("Engine ke trades par forecaster ki raay (entry se pehle wali). Isse pata chalega ki wo losing trades pehle pakad leta ya nahi:")
-            st.dataframe(pd.DataFrame(res["tf"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(res["tf"]), width="stretch", hide_index=True)
         st.caption("Jab ye scorecard kaafi trades par sabit kare, tab forecaster ko trade ke gate me soft penalty ke taur par jodna theek hoga (abhi OFF).")
 
     with st.expander("📈 Roz ka Upgrade Report -- kya system sach me behtar ho raha hai?", expanded=False):
@@ -270,13 +270,13 @@ def _draw(st, res, ns):
                      "Baseline": _pct(m.get("fc_base")), "Trusted": "✅" if m.get("fc_trusted") else "", "Live sahi": _pct(m.get("live_acc")),
                      "Engine W-L": f"{m.get('engine_w', 0)}-{m.get('engine_l', 0)}"} for d, m in list(stats.items())[-14:]]
             st.markdown("**Din-ba-din trend** (asli saboot: kya AUC/accuracy badh rahi hai?)")
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
         strat = res.get("strat") or {}
         if strat:
             st.markdown("**Strategy scorecard (live)**")
             st.dataframe(pd.DataFrame([{"Strategy": k, "Signals": v["samples"], "Sahi disha": f"{v['wins']}/{v['samples']}", "Asli %": v["raw_win_rate"],
                                         "Random candle %": v["expected_win_rate"], "Score par asar (pts)": round(max(-8.0, min(8.0, (v["win_rate"] - 50.0) * 0.16)), 1)}
-                                       for k, v in sorted(strat.items(), key=lambda z: -z[1]["win_rate"])]), use_container_width=True, hide_index=True)
+                                       for k, v in sorted(strat.items(), key=lambda z: -z[1]["win_rate"])]), width="stretch", hide_index=True)
         else:
             st.caption(f"Strategy scorecard abhi khali: har strategy ke kam se kam {mad.STRAT_MIN_EPISODES} live signals ka natija chahiye (dashboard khula rahe to roz judta hai).")
         g = res.get("gem_sc") or {}
@@ -308,18 +308,18 @@ def _draw_postmortem(st, pm):
         if pm.get("modes"):
             st.markdown("**Haar ke kaaran (loss kaise hue)**")
             st.dataframe(pd.DataFrame([{"Kaaran": m["text"], "Trades": m["n"], "Hissa": _pct(m["share"])} for m in pm["modes"]]),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
         if pm.get("groups"):
             st.markdown("**Signal groups: aligned hone par kya sach me jeete? (global / news / fundamentals / strategy ...)**")
             st.dataframe(pd.DataFrame([{"Group": g["factor"], "Aligned trades": g["aligned_n"], "Aligned jeet": _pct(g["aligned_wr"]),
                                         "Na-aligned trades": g["not_n"], "Na-aligned jeet": _pct(g["not_wr"]), "Natija": g["verdict"]} for g in pm["groups"]]),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
             st.caption(f"Verdict tabhi aata hai jab dono taraf kam se kam {tpm.MIN_GROUP_N} trades hon aur farq statistically saaf ho; warna 'data kam'.")
         if pm.get("factors"):
             with st.expander("Har factor alag se", expanded=False):
                 st.dataframe(pd.DataFrame([{"Factor": f["factor"], "Group": f["group"], "Aligned": f["aligned_n"], "Aligned jeet": _pct(f["aligned_wr"]),
                                             "Na-aligned": f["not_n"], "Na-aligned jeet": _pct(f["not_wr"]), "Natija": f["verdict"]} for f in pm["factors"]]),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
         ws = pm.get("warn") or {}
         if ws.get("hi_n") or ws.get("lo_n"):
             st.markdown(f"**Chetawani-filter:** jab aadhe+ signal groups trade ke khilaf the, trades {_pct(ws.get('hi_wr'))} jeete ({ws.get('hi_n', 0)} trades) "
@@ -331,7 +331,7 @@ def _draw_postmortem(st, pm):
             if pm.get("missed_gates"):
                 st.caption("Gate-wise chhoote 50+ pt moves: " + ", ".join(f"{g}: {n}" for g, n in sorted(pm["missed_gates"].items(), key=lambda z: -z[1])))
             st.dataframe(pd.DataFrame([{"Din": r["day"], "Shuru": r["start"], "Disha": "⬆️" if r["dir"] == "UP" else "⬇️", "Points": r["pts"],
-                                        "Gate": r["gate"], "Wajah": r["reason"]} for r in pm["missed"]]), use_container_width=True, hide_index=True)
+                                        "Gate": r["gate"], "Wajah": r["reason"]} for r in pm["missed"]]), width="stretch", hide_index=True)
             st.caption("Agar ek gate bar-bar badi moves rokta dikhe aur shadow trades me wo jeet-te hon, tab use dheela karna soch sakte hain (apne aap nahi hota).")
         for s_ in pm.get("suggest") or []:
             st.markdown("• " + s_)
