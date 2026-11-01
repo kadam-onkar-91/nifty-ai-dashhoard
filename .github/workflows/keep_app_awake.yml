@@ -1,7 +1,7 @@
 name: keep dashboard open in market hours
 
 # Opens your Streamlit app in a headless browser (the "robot tab") so research / shadow trades / learning / trades keep running
-# even when YOUR phone is off.  Setup steps: see KEEPER_SETUP.md
+# even when YOUR phone is off.  Setup steps: see the "Mobile band, tab chalta rahe" section in README.md
 on:
   schedule:
     # GitHub can delay or DROP a scheduled run, so there is a trigger every 15 minutes through the whole market day (odd minutes: GitHub is
@@ -11,6 +11,9 @@ on:
     # Sessions (IST, set in keep_open.py): anything that starts before 13:45 stays until 13:50, anything later stays until 15:35.
     - cron: "7,22,37,52 3-9 * * 1-5"
   workflow_dispatch:           # "Run workflow" button for a manual test
+
+permissions:
+  contents: read
 
 concurrency:
   group: market-keeper
