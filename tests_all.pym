@@ -2697,9 +2697,35 @@ class ReviewWaitAndEvidence(DbCase):
     def test_gate_stands_aside_only_while_its_refusals_win(self):
         _history(40, 8, live_dom=False)
         self._shadow(50, 2, wins_of_10=6)                     # refused setups win 60 % (n=50)
-        out = _decide("BUY", strategy=_strong("BUY", live=20, cons=40, n=1))   # NOT live-dominant: v55 lane does not apply
+        # v59: this fixture's setup is a ~17 % win-chance one; the sanity floor (tested below) refuses that, so the MECHANISM is tested with the floor lowered
+        _p, _e = atd.EVIDENCE_MIN_PROB, atd.EVIDENCE_MIN_EV_R
+        atd.EVIDENCE_MIN_PROB, atd.EVIDENCE_MIN_EV_R = 0.0, -9.0
+        try:
+            out = _decide("BUY", strategy=_strong("BUY", live=20, cons=40, n=1))   # NOT live-dominant: v55 lane does not apply
+        finally:
+            atd.EVIDENCE_MIN_PROB, atd.EVIDENCE_MIN_EV_R = _p, _e
         self.assertTrue(out["has_setup"], out.get("reason"))
         self.assertTrue(out["factor_flags"].get("evidence_relief"))
+
+    def test_v59_sanity_floor_keeps_garbage_out_even_when_refusals_win(self):
+        _history(40, 8, live_dom=False)
+        self._shadow(50, 2, wins_of_10=6)
+        out = _decide("BUY", strategy=_strong("BUY", live=20, cons=40, n=1))   # ~17 % win chance, -0.58R
+        self.assertFalse(out["has_setup"]); self.assertIn("No positive edge", out["reason"]); self.assertIn("sanity floor", out["reason"])
+
+    def test_v59_two_nov_record_passes_the_relief_test(self):
+        # 2-Nov dashboard: refused setups won 48 of 101 (47.5 %); break-even at R:R 1.5 is 40 %.
+        c = sqlite3.connect(tl.DB_NAME)
+        sh._local_init()
+        for k in range(101):
+            c.execute("INSERT INTO ai_shadow_setups (timestamp,direction,underlying_entry,stop_loss,target,blocked_by,factors_json,status) "
+                      "VALUES ('2026-01-01 10:00:00','BUY',100,90,120,?,?,?)",
+                      ("S/R location / confirmation" if k % 2 else "No positive edge (EV)", json.dumps(_flags(10)), "WIN" if k < 48 else "LOSS"))
+        c.commit(); c.close()
+        old = sh.edge_gate_record(z=1.645); new = sh.edge_gate_record(z=atd.EVIDENCE_Z)
+        self.assertEqual((old["n"], old["wins"]), (101, 48))
+        self.assertLess(old["wilson_low"], 0.40 + 0.02)                                # v58 test: relief never switched on
+        self.assertGreaterEqual(new["wilson_low"], 0.40 + atd.EVIDENCE_MARGIN)          # v59: it does
 
     def test_losing_refusals_keep_the_gate(self):
         _history(40, 8, live_dom=False)
@@ -3097,3 +3123,68 @@ class NvidiaNeverStuck(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 # @@END tests_v58_gate_nvidia
+
+# @@MODULE tests_v59_gates
+"""v59 regression tests: 'entry too far from level' is a probability cost (not a wall) for strategy-led trend entries, and stays a wall far away."""
+import os, sys, unittest
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tests_edge_v36 import DbCase  # noqa: E402
+from tests_v42_momentum_tick import _strong  # noqa: E402
+import ai_trade_decision as atd  # noqa: E402
+
+
+def _decide_far(direction, gap, atr=14.0, live=24000.0, strategy=None):
+    """A strategy-led entry whose S/R level sits `gap` points away from price (all other evidence aligned)."""
+    bull = direction == "BUY"
+    sr = {"status": "OK", "location": "AT_SUPPORT" if bull else "AT_RESISTANCE",
+          "confirmation": {"support_rejection_confirmed": True, "resistance_rejection_confirmed": True}, "entry_timing": {},
+          "major_support": {"price": live - 2, "low": live - 6, "high": live - 1, "sources": ["PDL"]},
+          "major_resistance": {"price": live + 2, "low": live + 1, "high": live + 6, "sources": ["PDH"]}}
+    ctx = {"Data Freshness": "Live / fresh", "RAW Regime Engine": "BULLISH" if bull else "BEARISH",
+           "RAW Multi-Timeframe Structure": "bullish bullish bullish" if bull else "bearish bearish bearish",
+           "RAW Order Flow": {"pressure": "BUYING PRESSURE" if bull else "SELLING PRESSURE"}}
+    lp = {"status": "APPROACHING_LEVEL", "approaching": "support" if bull else "resistance",
+          "level_price": live - gap if bull else live + gap, "distance_pts": gap, "break_pct": 70, "bounce_pct": 72,
+          "directional_bias": "Bullish" if bull else "Bearish",
+          "factors": ["Heavy Put OI" if bull else "Heavy Call OI", "above a rising VWAP" if bull else "below a falling VWAP"]}
+    import macro_confluence as _mc
+    _old = _mc.ENABLED; _mc.ENABLED = False
+    try:
+        return atd.generate_trade_decision(
+            live_price=live, level_prediction=lp, atr=atr, max_pain=23900 if bull else 24100, signal_code=1 if bull else -1, ml_agrees=True,
+            breadth_advances=35 if bull else 12, breadth_declines=15 if bull else 38, global_avg_change=0.4 if bull else -0.4, live_vix=13.0,
+            india_news_sentiment="BULLISH" if bull else "BEARISH", level_ladder=None, sr_context=sr, sniper_bias="BULLISH" if bull else "BEARISH",
+            dashboard_context=ctx, nifty50_news_sentiment="BULLISH" if bull else "BEARISH", nifty50_fundamentals_bias="NEUTRAL",
+            strategy_result=strategy or _strong(direction, live=50, cons=90, n=3), now_ist=datetime(2026, 10, 5, 11, 0))
+    finally:
+        _mc.ENABLED = _old
+
+
+class FarFromLevelIsACost(DbCase):
+    def test_slightly_far_entry_is_taken_with_lower_probability(self):
+        near = _decide_far("BUY", gap=3.0)
+        far = _decide_far("BUY", gap=15.0)               # soft limit = max(0.9 ATR, 10) = 12.6 pts (breakout side) -> 15 is over it, under 1.8 ATR = 25
+        self.assertNotIn("too far", far.get("reason", ""), far.get("reason"))
+        if far.get("has_setup") and near.get("has_setup"):
+            self.assertLess(far["win_probability"], near["win_probability"])
+            self.assertTrue(any("probability reduced" in str(x) for x in far["soft_flags"]))
+
+    def test_very_far_entry_is_still_refused(self):
+        out = _decide_far("BUY", gap=40.0)
+        self.assertFalse(out["has_setup"]); self.assertIn("too far from the validated level", out["reason"])
+        self.assertEqual(atd.classify_block(out["reason"]), "Entry too far from level")
+
+    def test_kill_switch_restores_v58(self):
+        atd.FAR_LEVEL_SOFT = False
+        try:
+            out = _decide_far("BUY", gap=15.0)
+        finally:
+            atd.FAR_LEVEL_SOFT = True
+        self.assertFalse(out["has_setup"]); self.assertIn("too far from the validated level", out["reason"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+# @@END tests_v59_gates
