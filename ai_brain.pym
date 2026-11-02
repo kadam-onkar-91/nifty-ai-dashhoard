@@ -2434,7 +2434,7 @@ COOL_AUTH_S = 10 * 60.0    # 401/403 on one key
 COOL_429_S = 20.0
 COOL_OTHER_S = 10.0
 _LOCK = threading.Lock()
-_STATE = {"models": None, "ts": 0.0, "cool": {}, "dead": {}, "last_model": None, "last_error": ""}
+_STATE = {"models": None, "ts": 0.0, "cool": {}, "dead": {}, "last_model": None, "last_error": "", "last_trail": ""}
 
 
 class NvidiaUnavailable(Exception):
@@ -2558,67 +2558,166 @@ def _post_stream_compat(post, url, key, body, first_byte_s, t_end):
     return code, txt
 
 
-def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadline_s=110.0, post=requests.post, thinking=False):
-    """-> (text, model).  Raises NvidiaUnavailable when no key/model answered."""
+MODEL_LABELS = {
+    "nvidia/nemotron-3-ultra-550b-a55b": "Nemotron 3 Ultra 550B (best research)",
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1": "Nemotron Ultra 253B",
+    "deepseek-ai/deepseek-v3.1": "DeepSeek V3.1",
+    "deepseek-ai/deepseek-r1": "DeepSeek R1",
+    "qwen/qwen3-235b-a22b": "Qwen3 235B",
+    "openai/gpt-oss-120b": "GPT-OSS 120B",
+    "moonshotai/kimi-k2-instruct": "Kimi K2",
+    "nvidia/llama-3.3-nemotron-super-49b-v1": "Nemotron Super 49B",
+    "meta/llama-3.3-70b-instruct": "Llama 3.3 70B",
+    "meta/llama-3.1-405b-instruct": "Llama 3.1 405B",
+}
+AUTO_LABEL = "Auto: sabse best pehle, fail ho to agla"
+
+
+def selectable_labels():
+    """Names shown in the chat's model picker (Auto first)."""
+    return [AUTO_LABEL] + list(MODEL_LABELS.values())
+
+
+def model_from_label(label):
+    for k, v in MODEL_LABELS.items():
+        if v == label:
+            return k
+    return None
+
+
+_CONN_WORDS = ("Connection", "ChunkedEncoding", "Protocol", "RemoteDisconnected", "SSL", "Timeout", "ReadError", "IncompleteRead")
+
+
+def _is_conn_exc(exc):
+    return isinstance(exc, (TimeoutError, ConnectionError)) or any(w in type(exc).__name__ for w in _CONN_WORDS)
+
+
+def _compact_messages(messages, limit=22000):
+    """Same conversation, but a huge user prompt is cut in the middle (head + newest tail kept).  Used only as a last attempt for a model whose
+    connection keeps dropping -- some gateways reset the connection for very large prompts."""
+    out = []
+    for m in messages:
+        c = str(m.get("content") or "")
+        if m.get("role") == "user" and len(c) > limit:
+            c = c[:5000] + "\n[... beech ka hissa chhota kiya ...]\n" + c[-(limit - 5000):]
+        out.append(dict(m, content=c))
+    return out
+
+
+def _post_plain(post, url, key, body, t_end):
+    r = post(url, headers=_hdr(key), json=dict(body, stream=False), timeout=(10.0, max(15.0, min(120.0, t_end - time.time()))))
+    if r.status_code != 200:
+        return r.status_code, ""
+    try:
+        return 200, (((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+    except Exception:
+        return 200, ""
+
+
+def _attempt_ladder(post, model, key, body, thinking, max_tokens, temperature, t_model, t_think_stop):
+    """v59: ONE (model, key) is tried in up to 3 different ways before it counts as failed:
+         1. thinking mode (Nemotron 3 only), streamed        2. fast mode (thinking off), streamed
+         3. fast mode, NOT streamed, with a shortened prompt (connection-reset workaround)
+       A dropped connection / timeout / empty answer moves to the next way, a real HTTP error code (429, 404, 401 ...) is returned to the caller.
+       -> (code, raw_text, mode_used).  Raises the last exception if every way died with an exception."""
+    url = f"{BASE_URL}/chat/completions"
+    is_n3 = "nemotron-3" in model
+    steps = []
+    if bool(thinking) and is_n3:
+        steps.append(("thinking", body, t_think_stop, True))
+    fast = dict(body, temperature=temperature, max_tokens=min(int(max_tokens), 3500))
+    if is_n3:
+        fast["chat_template_kwargs"] = {"enable_thinking": False}
+    steps.append(("fast" if (bool(thinking) and is_n3) else "normal", fast if (bool(thinking) and is_n3) else body, t_model, True))
+    comp = dict(fast, messages=_compact_messages(body["messages"]), max_tokens=min(int(max_tokens), 3000))
+    steps.append(("compact", comp, t_model, False))
+    last_exc, last_code = None, None
+    for idx, (mode, bd, t_stop, stream) in enumerate(steps):
+        if idx and time.time() > t_model:
+            break
+        try:
+            if stream:
+                code, txt = _post_stream_compat(post, url, key, bd, FIRST_BYTE_S, t_stop)
+            else:
+                code, txt = _post_plain(post, url, key, bd, t_model)
+        except Exception as exc:
+            if not _is_conn_exc(exc):
+                raise
+            last_exc = exc
+            logger.warning("NVIDIA %s %s step failed (%s) -> next way", model, mode, type(exc).__name__)
+            continue
+        if code == 200 and clean_reply(txt):
+            return code, txt, mode
+        if code != 200 and code < 500:
+            return code, "", mode                 # 429 / 401 / 404 ...: the caller decides (rest, next key, next model)
+        last_code = code                          # 5xx or an empty reply: try the next way
+        time.sleep(0.6)
+    if last_exc is not None and last_code is None:
+        raise last_exc
+    return (last_code or 502), "", "failed"
+
+
+def _forget_resting(models, keys):
+    with _LOCK:
+        for m in models:
+            _STATE["dead"].pop(m, None)
+            for k in keys:
+                _STATE["cool"].pop((k[-6:], m), None)
+
+
+def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadline_s=110.0, post=requests.post, thinking=False, prefer=None):
+    """-> (text, model).  Raises NvidiaUnavailable when no key/model answered.
+    prefer = the model id the person picked in the chat: it is tried FIRST, it is never skipped because it "rested", and it gets all 3 attempt
+    ways (see _attempt_ladder) on every key; only after that the next-best models are tried."""
     keys = [k for k in (keys or []) if k]
     if not keys:
         raise NvidiaUnavailable("NVIDIA_API_KEY not configured")
     t_end = time.time() + deadline_s
-    models = candidate_models(list_models(keys), forced_model(secrets) if secrets is not None else None)
+    forced = prefer or (forced_model(secrets) if secrets is not None else None)
+    models = candidate_models(list_models(keys), forced)
+    if prefer and prefer not in models[:1]:
+        models = [prefer] + [m for m in models if m != prefer]
     if not models:
         models = list(PREFERRED[:4])          # model list unavailable and no preferred match: try the known-good ids blindly
     errs = []
-    # v58 REVIVE: if EVERY (model, key) is resting right now, resting is cancelled -- one real attempt is always better than answering "no model available".
     with _LOCK:
         _now0 = time.time()
         _usable = any(_STATE["dead"].get(m, 0) <= _now0 and any(_STATE["cool"].get((k[-6:], m), 0) <= _now0 for k in keys) for m in models)
-        if not _usable:
-            for m in models:
-                _STATE["dead"].pop(m, None)
-                for k in keys:
-                    _STATE["cool"].pop((k[-6:], m), None)
-            errs.append("revived: all models were resting")
+    if not _usable:
+        _forget_resting(models, keys)
+        errs.append("revived: all models were resting")
+    if prefer:
+        _forget_resting([prefer], keys)       # the picked model is always given a real try
     n = 0
-    for model in models:
+    for mi, model in enumerate(models):
+        is_pick = bool(prefer) and mi == 0
         with _LOCK:
-            if _STATE["dead"].get(model, 0) > time.time():
+            if not is_pick and _STATE["dead"].get(model, 0) > time.time():
                 errs.append(f"{model}: resting {int(_STATE['dead'][model] - time.time())}s")
                 continue
-        # v57c: no single model may eat the whole deadline (that is why DeepSeek / Qwen / the others never got a turn behind a slow
-        # Nemotron): each model gets at most 70 % of the time that is left (min 45 s), the rest stays for the next model.
+        # no single model may eat the whole deadline: each model gets at most 70 % of the time that is left (min 45 s)
         t_model = min(t_end, time.time() + max(45.0, (t_end - time.time()) * 0.7))
         for i in range(len(keys)):
             if time.time() > t_end:
-                raise NvidiaUnavailable("deadline: " + "; ".join(errs[-3:]))
+                with _LOCK:
+                    _STATE["last_error"] = "; ".join(errs[-6:])
+                raise NvidiaUnavailable("deadline: " + "; ".join(errs[-5:]))
             key = keys[(n + i) % len(keys)]
             ck = (key[-6:], model)
             with _LOCK:
-                if _STATE["cool"].get(ck, 0) > time.time():
+                if not is_pick and _STATE["cool"].get(ck, 0) > time.time():
+                    errs.append(f"{model}: key resting")
                     continue
+            slow = False
             try:
                 body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False}
                 if "nemotron-3" in model:
-                    # v56c: Nemotron 3 is a reasoning model: sampling NVIDIA recommends, and thinking mode on for trade questions
                     body.update({"temperature": 0.6 if thinking else temperature, "top_p": 0.95,
                                  "chat_template_kwargs": {"enable_thinking": bool(thinking)}})
-                fast_used = False
+                mode_used = "normal"
                 if post is requests.post:
-                    can_fast = bool(thinking) and "nemotron-3" in model
-                    t_stop = min(t_model, time.time() + max(60.0, deadline_s * THINK_SHARE)) if can_fast else t_model
-                    fast_used = False
-                    try:
-                        code, raw_txt = _post_stream_compat(post, f"{BASE_URL}/chat/completions", key, body, FIRST_BYTE_S, t_stop)
-                        if can_fast and code == 200 and not clean_reply(raw_txt):
-                            raise TimeoutError("thinking used all tokens without an answer")
-                    except Exception as exc_think:
-                        if not (can_fast and (isinstance(exc_think, TimeoutError) or "Timeout" in type(exc_think).__name__)):
-                            raise
-                        # v57b: thinking was too slow right now -> same model, thinking OFF: a direct answer arrives in seconds
-                        logger.warning("NVIDIA %s thinking too slow (%s) -> fast mode", model, type(exc_think).__name__)
-                        body_fast = dict(body, temperature=temperature, max_tokens=min(int(max_tokens), 3500),
-                                         chat_template_kwargs={"enable_thinking": False})
-                        code, raw_txt = _post_stream_compat(post, f"{BASE_URL}/chat/completions", key, body_fast, FIRST_BYTE_S, t_model)
-                        fast_used = code == 200
+                    t_think = min(t_model, time.time() + max(60.0, deadline_s * THINK_SHARE))
+                    code, raw_txt, mode_used = _attempt_ladder(post, model, key, body, thinking, max_tokens, temperature, t_model, t_think)
                     r = types_SimpleNamespace(status_code=code)
                 else:                              # injected fake `post` (unit tests) keeps the old non-streaming contract
                     r = post(f"{BASE_URL}/chat/completions", headers=_hdr(key), timeout=max(10.0, min(115.0, t_end - time.time())),
@@ -2626,12 +2725,11 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
                     raw_txt = None
             except Exception as exc:
                 errs.append(f"{model}: {type(exc).__name__}")
+                slow = "Timeout" in type(exc).__name__ or isinstance(exc, TimeoutError)
                 with _LOCK:
-                    # a model that timed out is slow RIGHT NOW: rest it for 5 min so the next questions go straight to a working model
-                    slow = "Timeout" in type(exc).__name__ or isinstance(exc, TimeoutError)
-                    _STATE["cool"][ck] = time.time() + (DEAD_SLOW_S if slow else COOL_OTHER_S)
+                    _STATE["cool"][ck] = time.time() + (DEAD_SLOW_S if slow else 5.0)
                     if slow:
-                        _STATE["dead"][model] = time.time() + DEAD_SLOW_S      # all keys share the same slow model -> skip it briefly, do not wait per key
+                        _STATE["dead"][model] = time.time() + DEAD_SLOW_S
                 if slow:
                     break
                 continue
@@ -2646,7 +2744,9 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
                 if txt:
                     with _LOCK:
                         _STATE["last_model"], _STATE["last_error"] = model, ""
-                    return txt, (model + " (fast mode: thinking bahut slow tha)" if raw_txt is not None and fast_used else model)
+                        _STATE["last_trail"] = "; ".join(errs[-6:])
+                    tag = {"fast": " (fast mode: thinking slow tha)", "compact": " (compact mode: connection reset ke baad)"}.get(mode_used, "")
+                    return txt, model + tag
                 errs.append(f"{model}: empty reply")
                 continue
             errs.append(f"{model}: HTTP {r.status_code}")
@@ -2663,13 +2763,29 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
                 break
         n += 1
     with _LOCK:
-        _STATE["last_error"] = "; ".join(errs[-4:])
-    raise NvidiaUnavailable("; ".join(errs[-4:]) or "no model answered (retrying on the next question)")
+        _STATE["last_error"] = "; ".join(errs[-6:])
+    raise NvidiaUnavailable("; ".join(errs[-6:]) or "no model answered (retrying on the next question)")
+
+
+def chat_robust(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadline_s=110.0, post=requests.post, thinking=False, prefer=None):
+    """v59: chat() with a SECOND full round.  If every model failed in round 1 (a network blip, NVIDIA gateway reset ...), all resting is cleared,
+    a short pause is taken and the whole chain (picked model first) is tried once more before the caller falls back to Gemini."""
+    try:
+        return chat(keys, messages, secrets=secrets, max_tokens=max_tokens, temperature=temperature, deadline_s=deadline_s, post=post,
+                    thinking=thinking, prefer=prefer)
+    except NvidiaUnavailable as first:
+        _forget_resting(list(PREFERRED) + ([prefer] if prefer else []), [k for k in (keys or []) if k])
+        time.sleep(2.5)
+        try:
+            return chat(keys, messages, secrets=secrets, max_tokens=max_tokens, temperature=temperature, deadline_s=max(60.0, deadline_s * 0.6),
+                        post=post, thinking=False, prefer=prefer)
+        except NvidiaUnavailable as second:
+            raise NvidiaUnavailable(f"round1: {first} || round2: {second}"[:700])
 
 
 def status():
     with _LOCK:
-        return {"last_model": _STATE["last_model"], "last_error": _STATE["last_error"], "models_listed": len(_STATE["models"] or [])}
+        return {"last_model": _STATE["last_model"], "last_error": _STATE["last_error"], "last_trail": _STATE.get("last_trail", ""), "models_listed": len(_STATE["models"] or [])}
 # @@END nvidia_llm
 # @@MODULE ai_chat
 from app_logging import get_logger
@@ -2957,6 +3073,13 @@ def _news_for_chat(gemini_keys):
             return "=== FRESH NEWS BRIEF (" + str(nb.get("model") or "Google") + ") ===\n" + str(nb["text"])[:2500] + "\n\n"
     except Exception:
         pass
+    try:
+        import news_rss as _rss
+        _t = _rss.brief()
+        if _t:
+            return "=== FRESH NEWS BRIEF (Google News RSS) ===\n" + str(_t)[:2500] + "\n\n"
+    except Exception:
+        pass
     return ""
 
 
@@ -3100,6 +3223,16 @@ def render_ai_chat(gemini_api_keys, dashboard_context: dict):
                                       "Screenshot upload karoge to wo Gemini se padha jayega (NVIDIA text model image nahi dekhta).")
     elif not _nv_keys:
         st.caption("NVIDIA key add karne par yahan free NVIDIA model bhi chalega (secrets me NVIDIA_API_KEY).")
+    _pick_id = None
+    if _nv_keys and _provider != "Sirf Gemini":
+        try:
+            import nvidia_llm as _nvl
+            _pick_label = st.selectbox("NVIDIA model (tap karke ya type karke chuno)", _nvl.selectable_labels(), index=0, key="chat_nv_model",
+                                       help="Jo model chuna wo pehle try hoga (3 tareeqe se, fail na ho). Phir bhi na chale to baaki NVIDIA models ek ek karke, "
+                                            "uske baad Gemini backup. Auto me sabse best model pehle.")
+            _pick_id = _nvl.model_from_label(_pick_label)
+        except Exception:
+            _pick_id = None
 
     if "dashboard_chat_history" not in st.session_state:
         st.session_state.dashboard_chat_history = []
@@ -3162,15 +3295,18 @@ def render_ai_chat(gemini_api_keys, dashboard_context: dict):
                     if _use_nv:
                         try:
                             import nvidia_llm
-                            answer, _nv_model = nvidia_llm.chat(
+                            answer, _nv_model = nvidia_llm.chat_robust(
                                 _nv_keys, [{"role": "system", "content": SYSTEM_PREAMBLE + ("\n" + TRADE_ANSWER_RULES if trade_mode else "")},
                                            {"role": "user", "content": prompt_text.split(SYSTEM_PREAMBLE, 1)[-1]}],
-                                secrets=st.secrets, max_tokens=(7000 if trade_mode else 2500), thinking=trade_mode, deadline_s=(300.0 if trade_mode else 120.0))
+                                secrets=st.secrets, max_tokens=(7000 if trade_mode else 2500), thinking=trade_mode, deadline_s=(300.0 if trade_mode else 120.0),
+                                prefer=_pick_id)
                             st.caption(f"🟢 NVIDIA model (free): {_nv_model}")
+                            if _pick_id and not str(_nv_model).startswith(_pick_id):
+                                st.caption("ℹ️ Aapka chuna model abhi nahi chala, isliye ye model jawab de raha hai. Detail: " + str(nvidia_llm.status().get("last_trail") or "")[:300])
                         except Exception as _nv_exc:
                             answer = None
-                            _nv_err = str(_nv_exc)[:160]
-                            if _provider.startswith("Sirf NVIDIA") or not _has_gemini:
+                            _nv_err = str(_nv_exc)[:420]
+                            if not _has_gemini:
                                 raise RuntimeError("NVIDIA se jawab nahi mila: " + _nv_err)
                             st.caption("⚠️ NVIDIA abhi jawab nahi de paya (" + _nv_err + ") -- Gemini backup chal raha hai.")
                     if answer is None:
