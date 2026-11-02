@@ -2379,6 +2379,7 @@ PREFERRED = (
     "meta/llama-3.1-405b-instruct",
 )
 _BAD_WORDS = ("coder", "code", "-7b", "-8b", "-9b", "-13b", "-1b", "-3b", "mini", "nano", "jamba", "sea-lion", "dbrx", "mistral-7b", "gemma", "phi-")
+THINK_SHARE = 0.65         # thinking mode may use this share of the deadline; if it is not done by then the SAME model answers in fast (no-thinking) mode
 FIRST_BYTE_S = 90.0        # a model that has not started answering in this long is skipped (the next model/Gemini answers instead)
 _SKIP_WORDS = ("embed", "rerank", "guard", "safety", "vision", "-vl", "vl-", "clip", "parse", "retriev", "nv-", "tts", "asr", "image", "diffusion")
 MODELS_TTL_S = 6 * 3600
@@ -2511,6 +2512,9 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
         with _LOCK:
             if _STATE["dead"].get(model, 0) > time.time():
                 continue
+        # v57c: no single model may eat the whole deadline (that is why DeepSeek / Qwen / the others never got a turn behind a slow
+        # Nemotron): each model gets at most 70 % of the time that is left (min 45 s), the rest stays for the next model.
+        t_model = min(t_end, time.time() + max(45.0, (t_end - time.time()) * 0.7))
         for i in range(len(keys)):
             if time.time() > t_end:
                 raise NvidiaUnavailable("deadline: " + "; ".join(errs[-3:]))
@@ -2525,8 +2529,24 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
                     # v56c: Nemotron 3 is a reasoning model: sampling NVIDIA recommends, and thinking mode on for trade questions
                     body.update({"temperature": 0.6 if thinking else temperature, "top_p": 0.95,
                                  "chat_template_kwargs": {"enable_thinking": bool(thinking)}})
+                fast_used = False
                 if post is requests.post:
-                    code, raw_txt = _post_stream(post, f"{BASE_URL}/chat/completions", key, body, FIRST_BYTE_S, t_end)
+                    can_fast = bool(thinking) and "nemotron-3" in model
+                    t_stop = min(t_model, time.time() + max(60.0, deadline_s * THINK_SHARE)) if can_fast else t_model
+                    fast_used = False
+                    try:
+                        code, raw_txt = _post_stream(post, f"{BASE_URL}/chat/completions", key, body, FIRST_BYTE_S, t_stop)
+                        if can_fast and code == 200 and not clean_reply(raw_txt):
+                            raise TimeoutError("thinking used all tokens without an answer")
+                    except Exception as exc_think:
+                        if not (can_fast and (isinstance(exc_think, TimeoutError) or "Timeout" in type(exc_think).__name__)):
+                            raise
+                        # v57b: thinking was too slow right now -> same model, thinking OFF: a direct answer arrives in seconds
+                        logger.warning("NVIDIA %s thinking too slow (%s) -> fast mode", model, type(exc_think).__name__)
+                        body_fast = dict(body, temperature=temperature, max_tokens=min(int(max_tokens), 3500),
+                                         chat_template_kwargs={"enable_thinking": False})
+                        code, raw_txt = _post_stream(post, f"{BASE_URL}/chat/completions", key, body_fast, FIRST_BYTE_S, t_model)
+                        fast_used = code == 200
                     r = types_SimpleNamespace(status_code=code)
                 else:                              # injected fake `post` (unit tests) keeps the old non-streaming contract
                     r = post(f"{BASE_URL}/chat/completions", headers=_hdr(key), timeout=max(10.0, min(115.0, t_end - time.time())),
@@ -2554,7 +2574,7 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
                 if txt:
                     with _LOCK:
                         _STATE["last_model"], _STATE["last_error"] = model, ""
-                    return txt, model
+                    return txt, (model + " (fast mode: thinking bahut slow tha)" if raw_txt is not None and fast_used else model)
                 errs.append(f"{model}: empty reply")
                 continue
             errs.append(f"{model}: HTTP {r.status_code}")

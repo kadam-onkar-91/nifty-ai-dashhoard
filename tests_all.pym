@@ -2972,6 +2972,57 @@ class UpstoxHandlingTests(unittest.TestCase):
         self.assertIn("Invalid Instrument key", market_data.last_upstox_error())
 
 
+class NvidiaFastFallbackTests(unittest.TestCase):
+    def test_thinking_timeout_falls_back_to_fast_mode_same_model(self):
+        import json as _j
+        calls = []
+        class Resp:
+            status_code = 200
+            def __init__(self, lines): self._l = lines
+            def iter_lines(self, decode_unicode=True): return iter(self._l)
+            def close(self): pass
+        def fake_post(url, headers=None, json=None, stream=None, timeout=None):
+            calls.append(json["chat_template_kwargs"]["enable_thinking"])
+            if json["chat_template_kwargs"]["enable_thinking"]:
+                raise TimeoutError("slow thinking")
+            return Resp(["data: " + _j.dumps({"choices": [{"delta": {"content": "FAST ANSWER"}}]}), "data: [DONE]"])
+        orig = nvidia_llm.requests.post
+        nvidia_llm.requests.post = fake_post
+        nvidia_llm._STATE.update(models=["nvidia/nemotron-3-ultra-550b-a55b"], ts=nvidia_llm.time.time(), cool={}, dead={})
+        try:
+            txt, model = nvidia_llm.chat(["k" * 12], [{"role": "user", "content": "hi"}], thinking=True, deadline_s=100.0, post=fake_post)
+        finally:
+            nvidia_llm.requests.post = orig
+        self.assertEqual(txt, "FAST ANSWER")
+        self.assertEqual(calls, [True, False])
+        self.assertIn("nemotron-3-ultra", model)
+
+
+class NvidiaNextModelTests(unittest.TestCase):
+    def test_next_model_answers_when_first_is_slow(self):
+        import json as _j
+        class Resp:
+            status_code = 200
+            def __init__(self, lines): self._l = lines
+            def iter_lines(self, decode_unicode=True): return iter(self._l)
+            def close(self): pass
+        seen = []
+        def fake_post(url, headers=None, json=None, stream=None, timeout=None):
+            seen.append(json["model"])
+            if "nemotron" in json["model"]:
+                raise TimeoutError("slow")
+            return Resp(["data: " + _j.dumps({"choices": [{"delta": {"content": "DEEPSEEK ANSWER"}}]}), "data: [DONE]"])
+        orig = nvidia_llm.requests.post
+        nvidia_llm.requests.post = fake_post
+        nvidia_llm._STATE.update(models=["nvidia/nemotron-3-ultra-550b-a55b", "deepseek-ai/deepseek-v3.1"], ts=nvidia_llm.time.time(), cool={}, dead={})
+        try:
+            txt, model = nvidia_llm.chat(["k" * 12], [{"role": "user", "content": "hi"}], thinking=True, deadline_s=100.0, post=fake_post)
+        finally:
+            nvidia_llm.requests.post = orig
+        self.assertEqual(txt, "DEEPSEEK ANSWER")
+        self.assertEqual(model, "deepseek-ai/deepseek-v3.1")
+
+
 class NvidiaModelListTests(unittest.TestCase):
     def test_junk_models_are_not_tried(self):
         avail = ["ai21labs/jamba-1.5-large-instruct", "aisingapore/sea-lion-7b-instruct", "databricks/dbrx-instruct",
