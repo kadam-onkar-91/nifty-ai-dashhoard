@@ -7,6 +7,8 @@ from app_logging import get_logger
 logger = get_logger(__name__)
 import pandas as pd
 import requests
+import threading
+import time
 import urllib.parse
 import yfinance as yf
 from xgboost import XGBClassifier
@@ -14,6 +16,59 @@ from datetime import datetime, timedelta
 import indicators  # Custom indicators module
 
 NIFTY_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
+
+# v57: the Upstox calls used to swallow every error, so ONE hiccup (rate limit 429, timeout, 5xx) flipped the whole dashboard to the
+# non-tradable Yahoo fallback for that cycle while the sidebar still said "Upstox connected".  Now: each call retries, the real reason is
+# kept in _UPSTOX_STATE["last_error"] (shown in the dashboard), and the last GOOD Upstox data is reused for up to STALE_REUSE_S seconds.
+_UPSTOX_STATE = {"last_error": "", "good_df": None, "good_price": None, "good_ts": 0.0}
+_UPSTOX_LOCK = threading.Lock()
+STALE_REUSE_S = 120
+
+
+def last_upstox_error():
+    return _UPSTOX_STATE.get("last_error", "")
+
+
+def _note_upstox_error(where, detail):
+    msg = f"{where}: {detail}"[:220]
+    _UPSTOX_STATE["last_error"] = msg
+    logger.warning("Upstox data problem -> %s", msg)
+
+
+def _upstox_get_json(url, access_token, where, timeout=8, tries=2):
+    """GET + JSON with a short retry on timeouts / 429 / 5xx.  -> dict (status == success) or None; the reason is recorded."""
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+    for i in range(tries):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+        except requests.exceptions.RequestException as exc:
+            _note_upstox_error(where, type(exc).__name__)
+            time.sleep(0.5 * (i + 1))
+            continue
+        if r.status_code == 401:
+            _note_upstox_error(where, "HTTP 401 token expired/rejected -> Upstox login dobara karo")
+            try:
+                import upstox_auth
+                upstox_auth.mark_invalid(access_token)
+            except Exception:
+                pass
+            return None
+        if r.status_code == 429 or r.status_code >= 500:
+            _note_upstox_error(where, f"HTTP {r.status_code} (Upstox rate-limit/busy)")
+            time.sleep(0.8 * (i + 1))
+            continue
+        try:
+            j = r.json()
+        except Exception:
+            _note_upstox_error(where, f"HTTP {r.status_code} non-JSON reply")
+            return None
+        if j.get('status') == 'success':
+            return j
+        errs = j.get('errors') or []
+        msg = (errs[0].get('message') if errs and isinstance(errs[0], dict) else None) or str(j)[:120]
+        _note_upstox_error(where, f"HTTP {r.status_code} {msg}")
+        return None
+    return None
 
 
 def _load_upstox_nifty_future_key():
@@ -112,30 +167,16 @@ def fetch_candles_for_timeframe(access_token, unit, interval, days_back=5, instr
 
 
 def _fetch_upstox_ltp(access_token, instrument_key=NIFTY_INSTRUMENT_KEY):
-    """Real live LTP from Upstox. Previously this hardcoded the response
-    dict key as 'NSE_Index:Nifty 50' (wrong case -- Upstox actually returns
-    'NSE_INDEX:Nifty 50'), so the lookup silently KeyError'd and fell
-    through to the except-pass every single time, even when the request
-    itself succeeded. Now we just take the first (only) value returned,
-    the same safe pattern used elsewhere in this app."""
+    """Real live LTP from Upstox (retries; the failure reason is recorded in _UPSTOX_STATE). The response key casing differs
+    ('NSE_INDEX:Nifty 50'), so the first (only) value is taken."""
     try:
         encoded_key = urllib.parse.quote(instrument_key, safe='')
-        url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={encoded_key}"
-        headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-        _resp = requests.get(url, headers=headers, timeout=6)
-        if _resp.status_code == 401:            # v51: expired / revoked token -> drop it now (see upstox_auth.mark_invalid)
-            try:
-                import upstox_auth
-                upstox_auth.mark_invalid(access_token)
-            except Exception:
-                pass
+        res = _upstox_get_json(f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={encoded_key}", access_token, "LTP", timeout=6)
+        if not res:
             return None
-        res = _resp.json()
-        if res.get('status') != 'success':
-            return None
-        data = res.get('data', {})
-        match = next(iter(data.values()), None)
+        match = next(iter((res.get('data') or {}).values()), None)
         if match is None or match.get('last_price') is None:
+            _note_upstox_error("LTP", "reply had no last_price")
             return None
         return float(match['last_price'])
     except Exception:
@@ -158,7 +199,6 @@ def _fetch_upstox_candles(access_token, instrument_key=NIFTY_INSTRUMENT_KEY, uni
     if not access_token:
         return None
     encoded_key = urllib.parse.quote(instrument_key, safe='')
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     candles = []
 
     # Past days, up to (not including) today
@@ -166,24 +206,20 @@ def _fetch_upstox_candles(access_token, instrument_key=NIFTY_INSTRUMENT_KEY, uni
         to_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
         hist_url = f"https://api.upstox.com/v3/historical-candle/{encoded_key}/{unit}/{interval}/{to_date}/{from_date}"
-        res = requests.get(hist_url, headers=headers, timeout=8)
-        res_json = res.json()
-        if res_json.get('status') == 'success':
+        res_json = _upstox_get_json(hist_url, access_token, "history candles")
+        if res_json:
             candles.extend(res_json.get('data', {}).get('candles', []))
     except Exception:
         logger.exception("Broad exception caught; fallback path executed")
-        pass
 
     # Today's live/intraday candles
     try:
         intraday_url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/{unit}/{interval}"
-        res = requests.get(intraday_url, headers=headers, timeout=8)
-        res_json = res.json()
-        if res_json.get('status') == 'success':
+        res_json = _upstox_get_json(intraday_url, access_token, "today candles")
+        if res_json:
             candles.extend(res_json.get('data', {}).get('candles', []))
     except Exception:
         logger.exception("Broad exception caught; fallback path executed")
-        pass
 
     if not candles:
         return None
@@ -200,10 +236,34 @@ def fetch_live_market_data(access_token):
     df = None
     live_price = None
 
+    upstox_note = ""
+
     # Step 1: Try fetching data from Upstox API (real, live, broker feed)
     if access_token:
         live_price = _fetch_upstox_ltp(access_token)
         df = _fetch_upstox_candles(access_token)
+        # LTP call failed but fresh Upstox candles arrived: the newest candle's close IS the live price (within 10 min)
+        if live_price is None and df is not None and not df.empty:
+            try:
+                age_s = (pd.Timestamp.now(tz=df.index.tz) - df.index[-1]).total_seconds() if df.index.tz is not None else None
+                if age_s is not None and age_s < 600 + 300:
+                    live_price = float(df['Close'].iloc[-1])
+                    upstox_note = "LTP call failed -> live price taken from newest Upstox candle"
+            except Exception:
+                pass
+        if df is not None and not df.empty and live_price is not None:
+            with _UPSTOX_LOCK:
+                _UPSTOX_STATE.update(good_df=df.copy(), good_price=live_price, good_ts=time.time(), last_error="")
+        else:
+            # transient failure: keep using the last GOOD Upstox data for a short while instead of flipping to non-tradable Yahoo
+            with _UPSTOX_LOCK:
+                good_df, good_price, good_ts = _UPSTOX_STATE["good_df"], _UPSTOX_STATE["good_price"], _UPSTOX_STATE["good_ts"]
+            if good_df is not None and time.time() - good_ts <= STALE_REUSE_S:
+                df, live_price = good_df.copy(), good_price
+                upstox_note = f"Upstox call failed ({last_upstox_error()}) -> reusing last good Upstox data ({time.time() - good_ts:.0f}s old)"
+                logger.warning(upstox_note)
+    else:
+        _note_upstox_error("token", "no access token (Upstox login / UPSTOX_ANALYTICS_TOKEN missing)")
 
     # Step 2: Fallback to Yahoo Finance if Upstox fails or returns empty
     market_source = "UPSTOX_LIVE" if (df is not None and not df.empty and live_price is not None) else "UNAVAILABLE"
@@ -212,6 +272,7 @@ def fetch_live_market_data(access_token):
         # Dashboard-only fallback. It is explicitly marked non-tradable so no
         # strategy/AI decision can mistake Yahoo data for the authenticated
         # Upstox feed requested by the trading engine.
+        upstox_note = last_upstox_error() or upstox_note
         df = yf.download("^NSEI", period="5d", interval="5m", progress=False)
         market_source = "YAHOO_FALLBACK_NON_TRADABLE"
         if isinstance(df.columns, pd.MultiIndex):
@@ -220,6 +281,8 @@ def fetch_live_market_data(access_token):
             df.drop(columns=['Adj Close'], inplace=True)
         if not df.empty:
             live_price = float(df['Close'].iloc[-1])
+    elif market_source == "UNAVAILABLE":
+        upstox_note = last_upstox_error() or "Upstox price missing"
 
     if df is None or df.empty:
         return None, None, [], None
@@ -317,6 +380,7 @@ def fetch_live_market_data(access_token):
     # Persist source metadata on the dataframe without changing the public
     # four-value return contract used throughout the dashboard.
     df.attrs['market_source'] = market_source
+    df.attrs['upstox_error'] = upstox_note if market_source != 'UPSTOX_LIVE' or upstox_note else ''
     df.attrs['live_upstox'] = market_source == 'UPSTOX_LIVE'
     df.attrs['live_price_source'] = 'UPSTOX_LTP' if market_source == 'UPSTOX_LIVE' else market_source
     return df, model, feature_cols, live_price

@@ -833,8 +833,10 @@ def _no_strategy_detail(sr):
         if sr.get("status") == "INSUFFICIENT_DATA":
             return " [Detail: strategy layer ko abhi kaafi candles nahi mile (80 se kam).]"
         if src and src != "UPSTOX_LIVE" and sr.get("live_upstox") is False:
+            why = str(sr.get("upstox_error") or "").strip()
             return (f" [Detail: price data source = {src}, Upstox LIVE feed nahi. Is wajah se koi strategy trade nahi banati -- "
-                    f"Upstox login (roz subah ~3:30 AM ke baad naya) check karo.]")
+                    + (f"Upstox ka asli error: {why}. " if why else "")
+                    + "Token valid ho to ye usually 1-2 minute me khud theek ho jata hai; warna Upstox login (roz subah ~3:30 AM ke baad naya) check karo.]")
         ranked = sr.get("ranked_active") or []
         n_buy, n_sell = int(sr.get("buy_live_count", 0) or 0), int(sr.get("sell_live_count", 0) or 0)
         blocked = [r for r in ranked if not r.get("live_valid", True)]
@@ -2355,6 +2357,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from types import SimpleNamespace as types_SimpleNamespace
 
 import requests
 
@@ -2375,6 +2378,8 @@ PREFERRED = (
     "meta/llama-3.3-70b-instruct",
     "meta/llama-3.1-405b-instruct",
 )
+_BAD_WORDS = ("coder", "code", "-7b", "-8b", "-9b", "-13b", "-1b", "-3b", "mini", "nano", "jamba", "sea-lion", "dbrx", "mistral-7b", "gemma", "phi-")
+FIRST_BYTE_S = 90.0        # a model that has not started answering in this long is skipped (the next model/Gemini answers instead)
 _SKIP_WORDS = ("embed", "rerank", "guard", "safety", "vision", "-vl", "vl-", "clip", "parse", "retriev", "nv-", "tts", "asr", "image", "diffusion")
 MODELS_TTL_S = 6 * 3600
 _LOCK = threading.Lock()
@@ -2442,9 +2447,11 @@ def candidate_models(available, forced=None):
         if (not avail or m in avail) and m not in out:
             out.append(m)
     if avail:
-        extra = [m for m in sorted(avail) if m not in out and not any(w in m.lower() for w in _SKIP_WORDS)
-                 and re.search(r"(instruct|chat|r1|v3|nemotron|gpt-oss|kimi|qwen3|llama)", m.lower())]
-        out += extra[:4]
+        # v57: the alphabetical "extras" used to pick junk that 404s (jamba, sea-lion, dbrx, deepseek-coder-6.7b ...).  Only strong,
+        # general chat families are allowed now; small / coder / legacy models are excluded.
+        extra = [m for m in sorted(avail) if m not in out and not any(w in m.lower() for w in _SKIP_WORDS + _BAD_WORDS)
+                 and re.search(r"(nemotron|gpt-oss|kimi-k2|qwen3|deepseek-(v3|r1)|llama-3\.[13]-(70b|405b))", m.lower())]
+        out += extra[:3]
     return out[:8]
 
 
@@ -2455,6 +2462,40 @@ def clean_reply(text):
     t = _THINK.sub("", text or "")
     t = re.sub(r"^.*?</think>", "", t, flags=re.S | re.I) if "</think>" in t else t      # a reply that lost its opening tag
     return t.strip()
+
+
+def _post_stream(post, url, key, body, first_byte_s, t_end):
+    """Streaming call: the read-timeout then applies to the gap between chunks (not to the whole answer), so a slow reasoning model that is
+    still working keeps the connection alive; a model that never starts answering is abandoned after first_byte_s.
+    -> (status_code, text).  Reasoning text (reasoning_content) is dropped, only the final answer content is kept."""
+    import json as _json
+    r = post(url, headers=_hdr(key), json=dict(body, stream=True), stream=True,
+             timeout=(10.0, max(10.0, min(first_byte_s, t_end - time.time()))))
+    try:
+        if r.status_code != 200:
+            return r.status_code, ""
+        parts = []
+        for raw in r.iter_lines(decode_unicode=True):
+            if time.time() > t_end:
+                raise TimeoutError("deadline while streaming")
+            if not raw or not raw.startswith("data:"):
+                continue
+            data = raw[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                delta = (((_json.loads(data).get("choices") or [{}])[0]).get("delta") or {})
+            except Exception:
+                continue
+            piece = delta.get("content")
+            if piece:
+                parts.append(piece)
+        return 200, "".join(parts)
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
 
 
 def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadline_s=110.0, post=requests.post, thinking=False):
@@ -2484,16 +2525,30 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
                     # v56c: Nemotron 3 is a reasoning model: sampling NVIDIA recommends, and thinking mode on for trade questions
                     body.update({"temperature": 0.6 if thinking else temperature, "top_p": 0.95,
                                  "chat_template_kwargs": {"enable_thinking": bool(thinking)}})
-                r = post(f"{BASE_URL}/chat/completions", headers=_hdr(key), timeout=max(10.0, min(115.0, t_end - time.time())),
-                         json=body)
+                if post is requests.post:
+                    code, raw_txt = _post_stream(post, f"{BASE_URL}/chat/completions", key, body, FIRST_BYTE_S, t_end)
+                    r = types_SimpleNamespace(status_code=code)
+                else:                              # injected fake `post` (unit tests) keeps the old non-streaming contract
+                    r = post(f"{BASE_URL}/chat/completions", headers=_hdr(key), timeout=max(10.0, min(115.0, t_end - time.time())),
+                             json=body)
+                    raw_txt = None
             except Exception as exc:
                 errs.append(f"{model}: {type(exc).__name__}")
                 with _LOCK:
-                    _STATE["cool"][ck] = time.time() + 20
+                    # a model that timed out is slow RIGHT NOW: rest it for 5 min so the next questions go straight to a working model
+                    slow = "Timeout" in type(exc).__name__ or isinstance(exc, TimeoutError)
+                    _STATE["cool"][ck] = time.time() + (300 if slow else 20)
+                    if slow:
+                        _STATE["dead"][model] = time.time() + 300      # all keys share the same slow model -> skip it, do not wait per key
+                if slow:
+                    break
                 continue
             if r.status_code == 200:
                 try:
-                    txt = clean_reply(((r.json().get("choices") or [{}])[0].get("message") or {}).get("content", ""))
+                    if raw_txt is not None:
+                        txt = clean_reply(raw_txt)
+                    else:
+                        txt = clean_reply(((r.json().get("choices") or [{}])[0].get("message") or {}).get("content", ""))
                 except Exception:
                     txt = ""
                 if txt:
@@ -3018,7 +3073,7 @@ def render_ai_chat(gemini_api_keys, dashboard_context: dict):
                             answer, _nv_model = nvidia_llm.chat(
                                 _nv_keys, [{"role": "system", "content": SYSTEM_PREAMBLE + ("\n" + TRADE_ANSWER_RULES if trade_mode else "")},
                                            {"role": "user", "content": prompt_text.split(SYSTEM_PREAMBLE, 1)[-1]}],
-                                secrets=st.secrets, max_tokens=(7000 if trade_mode else 2500), thinking=trade_mode, deadline_s=(125.0 if trade_mode else 90.0))
+                                secrets=st.secrets, max_tokens=(7000 if trade_mode else 2500), thinking=trade_mode, deadline_s=(300.0 if trade_mode else 120.0))
                             st.caption(f"🟢 NVIDIA model (free): {_nv_model}")
                         except Exception as _nv_exc:
                             answer = None

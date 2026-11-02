@@ -2913,3 +2913,66 @@ class Telegram(DbCase):
 if __name__ == "__main__":
     unittest.main()
 # @@END tests_v56_nvidia_news_telegram
+
+# @@MODULE tests_v57_upstox_nvidia
+"""v57 regression tests: Upstox failure handling (retry / reuse last good data / visible reason) and NVIDIA model selection."""
+import sys, types, unittest, os
+for _m in ("feedparser", "streamlit", "yfinance", "upstox_client", "supabase", "plotly"):
+    try:
+        __import__(_m)
+    except Exception:
+        sys.modules[_m] = types.ModuleType(_m)
+try:
+    import xgboost  # noqa: F401
+except Exception:
+    _xgb = types.ModuleType("xgboost"); _xgb.XGBClassifier = object; sys.modules["xgboost"] = _xgb
+import pandas as pd
+import market_data
+import nvidia_llm
+
+
+class _Resp:
+    def __init__(self, code, body):
+        self.status_code, self._b = code, body
+    def json(self):
+        return self._b
+
+
+class UpstoxHandlingTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = market_data.requests.get
+        self._sleep = market_data.time.sleep
+        market_data.time.sleep = lambda s: None
+
+    def tearDown(self):
+        market_data.requests.get = self._orig
+        market_data.time.sleep = self._sleep
+
+    def test_429_is_retried_then_succeeds(self):
+        calls = []
+        def fake(url, headers=None, timeout=None):
+            calls.append(1)
+            return _Resp(429, {}) if len(calls) == 1 else _Resp(200, {"status": "success", "data": {"X": {"last_price": 23300.5}}})
+        market_data.requests.get = fake
+        self.assertEqual(market_data._fetch_upstox_ltp("tok"), 23300.5)
+        self.assertEqual(len(calls), 2)
+
+    def test_failure_reason_is_recorded(self):
+        market_data.requests.get = lambda *a, **k: _Resp(400, {"status": "error", "errors": [{"message": "Invalid Instrument key"}]})
+        self.assertIsNone(market_data._fetch_upstox_ltp("tok"))
+        self.assertIn("Invalid Instrument key", market_data.last_upstox_error())
+
+
+class NvidiaModelListTests(unittest.TestCase):
+    def test_junk_models_are_not_tried(self):
+        avail = ["ai21labs/jamba-1.5-large-instruct", "aisingapore/sea-lion-7b-instruct", "databricks/dbrx-instruct",
+                 "deepseek-ai/deepseek-coder-6.7b-instruct", "nvidia/nemotron-3-ultra-550b-a55b", "meta/llama-3.3-70b-instruct"]
+        got = nvidia_llm.candidate_models(avail)
+        for bad in ("jamba", "sea-lion", "dbrx", "coder"):
+            self.assertFalse(any(bad in m for m in got), got)
+        self.assertEqual(got[0], "nvidia/nemotron-3-ultra-550b-a55b")
+
+
+if __name__ == "__main__":
+    unittest.main()
+# @@END tests_v57_upstox_nvidia

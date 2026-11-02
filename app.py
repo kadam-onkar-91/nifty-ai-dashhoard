@@ -203,6 +203,14 @@ def _live_dashboard():
 
     # Step 2: Fetch Live Market Data
     df, model, feature_cols, live_price = market_data.fetch_live_market_data(access_token)
+    try:                                   # v57: "Upstox connected" only means a token exists -- say plainly when the data call itself failed
+        if df is not None and not df.empty and getattr(df, "attrs", {}).get("market_source") != "UPSTOX_LIVE":
+            st.sidebar.warning("⚠️ Token hai par Upstox se data nahi aaya -- Yahoo (non-tradable) chal raha hai.\n\nAsli wajah: "
+                               + str(df.attrs.get("upstox_error") or "pata nahi (logs dekho)"))
+        elif df is not None and getattr(df, "attrs", {}).get("upstox_error"):
+            st.sidebar.caption("ℹ️ " + str(df.attrs.get("upstox_error")))
+    except Exception:
+        pass
 
     if df is not None and not df.empty:
 
