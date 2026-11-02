@@ -2948,16 +2948,25 @@ class UpstoxHandlingTests(unittest.TestCase):
         market_data.requests.get = self._orig
         market_data.time.sleep = self._sleep
 
-    def test_429_is_retried_then_succeeds(self):
+    def test_429_is_not_retried_and_cache_saves_calls(self):
         calls = []
         def fake(url, headers=None, timeout=None):
-            calls.append(1)
-            return _Resp(429, {}) if len(calls) == 1 else _Resp(200, {"status": "success", "data": {"X": {"last_price": 23300.5}}})
+            calls.append(url)
+            return _Resp(200, {"status": "success", "data": {"candles": [["2026-11-02T09:15:00+05:30", 1, 2, 0.5, 1.5, 0, 0]]}})
         market_data.requests.get = fake
-        self.assertEqual(market_data._fetch_upstox_ltp("tok"), 23300.5)
-        self.assertEqual(len(calls), 2)
+        market_data._CACHE.clear()
+        market_data._fetch_upstox_candles("tok", instrument_key="K|1")
+        n1 = len(calls)
+        market_data._fetch_upstox_candles("tok", instrument_key="K|1")      # second tab / next refresh within TTL -> no new Upstox calls
+        self.assertEqual(n1, 2)
+        self.assertEqual(len(calls), n1)
+        calls.clear(); market_data._CACHE.clear()
+        market_data.requests.get = lambda *a, **k: (calls.append(1), _Resp(429, {}))[1]
+        self.assertIsNone(market_data._fetch_upstox_ltp("tok"))
+        self.assertEqual(len(calls), 1)                                       # exactly one attempt: no retry storm, no sleep
 
     def test_failure_reason_is_recorded(self):
+        market_data._CACHE.clear()
         market_data.requests.get = lambda *a, **k: _Resp(400, {"status": "error", "errors": [{"message": "Invalid Instrument key"}]})
         self.assertIsNone(market_data._fetch_upstox_ltp("tok"))
         self.assertIn("Invalid Instrument key", market_data.last_upstox_error())

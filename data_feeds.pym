@@ -25,6 +25,33 @@ _UPSTOX_LOCK = threading.Lock()
 STALE_REUSE_S = 120
 
 
+_CACHE = {}
+HIST_TTL_S = 1800            # past-days candles never change during the day -> one call per 30 min instead of one per refresh
+INTRADAY_TTL_S = 10          # shared by every open tab (PC, phone, robot tab) -> one Upstox call serves all of them
+INTRADAY_STALE_OK_S = 90     # if Upstox refuses (429) keep serving the last good copy for this long
+LTP_TTL_S = 2
+
+
+def _cached(key, ttl, stale_ok_s, loader):
+    """Process-wide cache: fresh hit -> no Upstox call.  loader() returns None on FAILURE (then a not-too-old copy is served instead)."""
+    now = time.time()
+    with _UPSTOX_LOCK:
+        hit = _CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = loader()
+    if val is not None:
+        with _UPSTOX_LOCK:
+            _CACHE[key] = (now, val)
+            if len(_CACHE) > 200:
+                for k in sorted(_CACHE, key=lambda k_: _CACHE[k_][0])[:50]:
+                    _CACHE.pop(k, None)
+        return val
+    if hit and now - hit[0] <= stale_ok_s:
+        return hit[1]
+    return None
+
+
 def last_upstox_error():
     return _UPSTOX_STATE.get("last_error", "")
 
@@ -35,15 +62,15 @@ def _note_upstox_error(where, detail):
     logger.warning("Upstox data problem -> %s", msg)
 
 
-def _upstox_get_json(url, access_token, where, timeout=8, tries=2):
-    """GET + JSON with a short retry on timeouts / 429 / 5xx.  -> dict (status == success) or None; the reason is recorded."""
+def _upstox_get_json(url, access_token, where, timeout=8, tries=1):
+    """GET + JSON (single attempt: retrying a 429 only makes the rate limit worse and slows the refresh; the shared cache below covers
+    short failures).  -> dict (status == success) or None; the reason is recorded."""
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     for i in range(tries):
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
         except requests.exceptions.RequestException as exc:
             _note_upstox_error(where, type(exc).__name__)
-            time.sleep(0.5 * (i + 1))
             continue
         if r.status_code == 401:
             _note_upstox_error(where, "HTTP 401 token expired/rejected -> Upstox login dobara karo")
@@ -55,7 +82,6 @@ def _upstox_get_json(url, access_token, where, timeout=8, tries=2):
             return None
         if r.status_code == 429 or r.status_code >= 500:
             _note_upstox_error(where, f"HTTP {r.status_code} (Upstox rate-limit/busy)")
-            time.sleep(0.8 * (i + 1))
             continue
         try:
             j = r.json()
@@ -171,14 +197,17 @@ def _fetch_upstox_ltp(access_token, instrument_key=NIFTY_INSTRUMENT_KEY):
     ('NSE_INDEX:Nifty 50'), so the first (only) value is taken."""
     try:
         encoded_key = urllib.parse.quote(instrument_key, safe='')
-        res = _upstox_get_json(f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={encoded_key}", access_token, "LTP", timeout=6)
-        if not res:
-            return None
-        match = next(iter((res.get('data') or {}).values()), None)
-        if match is None or match.get('last_price') is None:
-            _note_upstox_error("LTP", "reply had no last_price")
-            return None
-        return float(match['last_price'])
+
+        def _load():
+            res = _upstox_get_json(f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={encoded_key}", access_token, "LTP", timeout=6)
+            if not res:
+                return None
+            match = next(iter((res.get('data') or {}).values()), None)
+            if match is None or match.get('last_price') is None:
+                _note_upstox_error("LTP", "reply had no last_price")
+                return None
+            return float(match['last_price'])
+        return _cached(("ltp", instrument_key), LTP_TTL_S, 15, _load)
     except Exception:
         logger.exception("Broad exception caught; fallback path executed")
         return None
@@ -206,18 +235,22 @@ def _fetch_upstox_candles(access_token, instrument_key=NIFTY_INSTRUMENT_KEY, uni
         to_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
         hist_url = f"https://api.upstox.com/v3/historical-candle/{encoded_key}/{unit}/{interval}/{to_date}/{from_date}"
-        res_json = _upstox_get_json(hist_url, access_token, "history candles")
-        if res_json:
-            candles.extend(res_json.get('data', {}).get('candles', []))
+
+        def _load_hist():
+            rj = _upstox_get_json(hist_url, access_token, "history candles")
+            return None if not rj else list(rj.get('data', {}).get('candles', []))
+        candles.extend(_cached(("hist", instrument_key, unit, interval, days_back, to_date), HIST_TTL_S, 6 * 3600, _load_hist) or [])
     except Exception:
         logger.exception("Broad exception caught; fallback path executed")
 
     # Today's live/intraday candles
     try:
         intraday_url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/{unit}/{interval}"
-        res_json = _upstox_get_json(intraday_url, access_token, "today candles")
-        if res_json:
-            candles.extend(res_json.get('data', {}).get('candles', []))
+
+        def _load_today():
+            rj = _upstox_get_json(intraday_url, access_token, "today candles")
+            return None if not rj else list(rj.get('data', {}).get('candles', []))
+        candles.extend(_cached(("today", instrument_key, unit, interval), INTRADAY_TTL_S, INTRADAY_STALE_OK_S, _load_today) or [])
     except Exception:
         logger.exception("Broad exception caught; fallback path executed")
 
