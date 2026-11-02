@@ -3036,3 +3036,64 @@ class NvidiaModelListTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 # @@END tests_v57_upstox_nvidia
+
+# @@MODULE tests_v58_gate_nvidia
+"""v58 regression tests: strong-tape relief for the full-context confluence gate, and NVIDIA never saying "no model available" while it rests."""
+import os, sys, unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tests_edge_v36 import DbCase  # noqa: E402
+from tests_v42_momentum_tick import _strong  # noqa: E402
+from tests_v54_reaction import _decide_conflicting  # noqa: E402
+import ai_trade_decision as atd  # noqa: E402
+import nvidia_llm as nv  # noqa: E402
+
+
+class StrongTapeRelief(DbCase):
+    def test_sell_with_strong_down_tape_and_one_live_strategy_is_not_vetoed_by_lagging_reads(self):
+        # 2-Nov-2026 11:41: live tape -46, one live SELL strategy (59 %), regime + MTF still bullish -> used to be "4 confirmations; 2 conflicts"
+        out = _decide_conflicting("SELL", _strong("SELL", live=46, cons=59, n=1))
+        self.assertNotIn("confluence is not strong", out.get("reason", ""), out.get("reason"))
+
+    def test_weak_tape_still_vetoed(self):
+        out = _decide_conflicting("SELL", _strong("SELL", live=20, cons=40, n=1))
+        self.assertFalse(out["has_setup"]); self.assertIn("confluence is not strong", out["reason"])
+
+    def test_kill_switch(self):
+        atd.TAPE_RELIEF = False
+        try:
+            out = _decide_conflicting("SELL", _strong("SELL", live=46, cons=59, n=1))
+        finally:
+            atd.TAPE_RELIEF = True
+        self.assertFalse(out["has_setup"]); self.assertIn("confluence is not strong", out["reason"])
+
+
+class NvidiaNeverStuck(unittest.TestCase):
+    def test_all_models_resting_are_revived_and_answer(self):
+        import time
+        models = ["nvidia/nemotron-3-ultra-550b-a55b", "deepseek-ai/deepseek-v3.1"]
+        far = time.time() + 99999
+        nv._STATE.update(models=models, ts=time.time(), cool={("kkkkkk", m): far for m in models}, dead={m: far for m in models})
+
+        class _R:
+            status_code = 200
+            def json(self): return {"choices": [{"message": {"content": "ok jawab"}}]}
+
+        txt, model = nv.chat(["k" * 12], [{"role": "user", "content": "hi"}], post=lambda *a, **k: _R())
+        self.assertEqual(txt, "ok jawab")
+
+    def test_error_text_is_never_the_empty_no_model_available(self):
+        import time
+        nv._STATE.update(models=["nvidia/nemotron-3-ultra-550b-a55b"], ts=time.time(), cool={}, dead={})
+
+        class _R:
+            status_code = 500
+        with self.assertRaises(nv.NvidiaUnavailable) as cm:
+            nv.chat(["k" * 12], [{"role": "user", "content": "hi"}], post=lambda *a, **k: _R())
+        self.assertNotEqual(str(cm.exception), "no model available")
+        self.assertIn("HTTP 500", str(cm.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()
+# @@END tests_v58_gate_nvidia

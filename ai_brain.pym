@@ -105,6 +105,18 @@ EARLY_MAX_OPPOSITE_CONSENSUS = 30.0
 REACTION_ENTRIES = True
 REACTION_NEEDS_LOCATION = True
 CONFLICT_RELIEF = True                # v54b: lagging regime/MTF/order-flow conflicts (2 of 3) stop vetoing a live-dominant or reaction entry
+# v58 STRONG-TAPE RELIEF (2-Nov: Nifty +350 pts rally, then -50 pts fall; the gate said "4 direct confirmations; 2 major conflicts" and the engine never traded).
+# Regime / MTF / order-flow are LAGGING reads: after a big move they still describe the OLD move, so they 'conflict' exactly when a new move is running.
+# When the live tape itself (EMA/VWAP/momentum/supertrend score) is already pushing >= TAPE_MIN_LIVE in the trade direction and at least
+# TAPE_MIN_STRATEGIES live strategy agrees (the old relief wanted 3 strategies + 80 % consensus, which never exists at the start of a move),
+# those lagging conflicts become a probability COST (already charged in the edge calculation) instead of a veto.  Edge/EV bar, no-chase rule,
+# SL, cooldown, session window and the AI-chat / Gemini final decision all still apply.  Kill switch: TAPE_RELIEF = False -> exactly v57.
+TAPE_RELIEF = True
+TAPE_MIN_LIVE = 40.0                  # |live price-action score| (0-100) in the trade direction
+TAPE_MIN_STRATEGIES = 1               # live strategies agreeing
+TAPE_MAX_OPPOSITE_CONSENSUS = 35.0
+TAPE_VERY_STRONG_LIVE = 55.0          # at this tape strength even all three lagging reads together do not veto
+TAPE_MAX_EV_SHORTFALL = 0.12          # the strong-tape lane may waive at most this much EV (R) below the bar, and only with win chance >= LANE_MIN_WIN_PROB
 EVIDENCE_RELIEF = True                 # v55b kill switch.  The calibrated-edge / win-floor gate stands aside WHILE the setups it refused have been winning above break-even (shadow evidence)
 EVIDENCE_MIN_N = 30                    # resolved shadow trades needed before the gate's own record is trusted
 EVIDENCE_MARGIN = 0.02                 # the 90 % lower bound of the refused setups' win rate must beat break-even by this much
@@ -345,6 +357,24 @@ def _early_live_ok(strategy_result, direction, entry_quality):
         return (score >= EARLY_LIVE_MIN and cnt >= EARLY_MIN_LIVE_STRATEGIES and opp <= EARLY_MAX_OPPOSITE_CONSENSUS and not severe)
     except Exception:
         return False
+
+
+def _tape_strong_level(strategy_result, direction, entry_quality):
+    """v58: 0 = no relief, 1 = strong tape (score >= TAPE_MIN_LIVE), 2 = very strong tape (>= TAPE_VERY_STRONG_LIVE).  Needs >= TAPE_MIN_STRATEGIES live
+    strategy in the trade direction, little opposition and no severe chase.  Used only to stop LAGGING conflicts from vetoing a move that is already running."""
+    try:
+        sr = strategy_result or {}
+        buy = direction == "BUY"
+        score = float((sr.get("live_state") or {}).get("score", 0) or 0) * (1.0 if buy else -1.0)
+        opp = float(sr.get("sell_consensus" if buy else "buy_consensus", 0) or 0)
+        cnt = int(sr.get("buy_live_count" if buy else "sell_live_count", 0) or 0)
+        eq = entry_quality if isinstance(entry_quality, dict) else {}
+        severe = bool(eq.get("severe")) or len(eq.get("chase_flags") or []) >= 3
+        if severe or cnt < TAPE_MIN_STRATEGIES or opp > TAPE_MAX_OPPOSITE_CONSENSUS or score < TAPE_MIN_LIVE:
+            return 0
+        return 2 if score >= TAPE_VERY_STRONG_LIVE else 1
+    except Exception:
+        return 0
 
 
 # Cached, Google-Search-grounded news brief (refreshed in the background, never blocks a refresh or a trade).
@@ -1588,9 +1618,13 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     # broad strategy agreement dominate (the same test as the momentum lane) or the entry is a confirmed turning-point reaction, two lagging conflicts
     # are a probability COST (already charged: 0.20 each) and not a veto; all three together still block.  Reaction entries are also exempt from the
     # "opposite transition" knife flag (that IS the turn).  Kill switch: CONFLICT_RELIEF = False.
-    _conflict_relief = bool(CONFLICT_RELIEF and (_live_dom or _reaction_keep) and not _macro_strong_opposed)
+    _tape_lvl = _tape_strong_level(strategy_result, direction, _eq_early if isinstance(_eq_early, dict) else None) if (TAPE_RELIEF and CONFLICT_RELIEF) else 0
+    _tape_strong = bool(_tape_lvl and not _macro_strong_opposed and critical_true >= 3)
+    _conflict_relief = bool(CONFLICT_RELIEF and (_live_dom or _reaction_keep or _tape_strong) and not _macro_strong_opposed)
     _max_conflicts = 3 if _conflict_relief else 2
-    _opp_trans_block = (not factor_flags.get('no_opposite_transition')) and not _reaction_keep
+    if _tape_strong and _tape_lvl >= 2 and critical_true >= 4:
+        _max_conflicts = 4                       # very strong live tape: three lagging reads together still cannot veto a running move
+    _opp_trans_block = (not factor_flags.get('no_opposite_transition')) and not _reaction_keep and not _tape_strong
     if critical_true < 3 or hard_conflicts >= _max_conflicts or unknown_major >= _unknown_limit or _opp_trans_block or _timing_block or (reversal_used and ((direction == "SELL" and _bearish_reversal_score < 5) or (direction == "BUY" and _bullish_reversal_score < 5))):
         return {"has_setup": False,
                 "reason": f"Full-context confluence is not strong enough ({critical_true} direct confirmations; {hard_conflicts} major conflicts). Waiting for a cleaner setup.",
@@ -1932,10 +1966,19 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     _lane_ok = bool(strategy_path) and _momentum_lane_ok(strategy_result, direction, _eq) and (_macro_agrees or _live_relief or not LANE_NEEDS_MACRO)
     _lane_ok = _lane_ok and float(edge.get("win_probability") or 0.0) >= LANE_MIN_WIN_PROB \
         and edge["expectancy_r"] >= _min_ev - LANE_MAX_EV_SHORTFALL
+    # v58 strong-tape lane: the live tape alone (score >= TAPE_MIN_LIVE + a live strategy, see _tape_strong_level) may waive a SMALL shortfall of the
+    # learned bar, exactly like the lane above, but without needing 3 strategies / 80 % consensus (which only exist after the move is over).
+    _tape_lane_ok = bool(TAPE_RELIEF and _tape_strong and not _live_dom and strategy_path      # live-dominant entries keep the v50 lane rules
+                         and float(edge.get("win_probability") or 0.0) >= LANE_MIN_WIN_PROB
+                         and edge["expectancy_r"] >= _min_ev - TAPE_MAX_EV_SHORTFALL)
+    _tape_lane_used = False
     _momentum_lane = False
-    if _lane_ok and (edge["expectancy_r"] < _min_ev or float(edge.get("win_probability") or 0.0) < _win_floor(_now)[0]):
+    if (_lane_ok or _tape_lane_ok) and (edge["expectancy_r"] < _min_ev or float(edge.get("win_probability") or 0.0) < _win_floor(_now)[0]):
         _momentum_lane = True
-        _bar_notes.append("momentum-capture lane: live price action + strategies + macro model all agree -> small shortfall of the learned bar waived")
+        _tape_lane_used = bool(_tape_lane_ok and not _lane_ok)
+        _bar_notes.append("momentum-capture lane: live price action + strategies + macro model all agree -> small shortfall of the learned bar waived"
+                          if not _tape_lane_used else
+                          "strong-tape lane: live price action is already moving hard in this direction with a live strategy -> small shortfall of the learned bar waived")
         edge["required_ev_r"] = round(_min_ev, 3)
 
     if _now.time() < OPENING_NO_TRADE_UNTIL and _macro_verdict != "STRONG_ALIGNED" and _opening_exception \
@@ -2006,7 +2049,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     _entry_meta = {"playbook": str(_playbook), "grade": _grade, "hour_bucket": f"{_now.hour:02d}h",
                    "side": direction, "probe": False, "logic_version": trade_learning.LOGIC_VERSION}
     if _momentum_lane:
-        _entry_meta["lane"] = "momentum"
+        _entry_meta["lane"] = "tape" if _tape_lane_used else "momentum"
     if _reaction_keep:
         _entry_meta["lane"] = "reaction"
     elif _live_dom_keep and not _momentum_lane:
@@ -2383,6 +2426,13 @@ THINK_SHARE = 0.65         # thinking mode may use this share of the deadline; i
 FIRST_BYTE_S = 90.0        # a model that has not started answering in this long is skipped (the next model/Gemini answers instead)
 _SKIP_WORDS = ("embed", "rerank", "guard", "safety", "vision", "-vl", "vl-", "clip", "parse", "retriev", "nv-", "tts", "asr", "image", "diffusion")
 MODELS_TTL_S = 6 * 3600
+# v58: REST TIMES.  Before v58 a slow model was rested 5 min, a 404 6 h and a 401/403 6 h; after ONE slow/failed round every model was resting, the
+# loop skipped them ALL without trying anything and the chat said "no model available" for hours -- that is why NVIDIA answered once and then never.
+DEAD_SLOW_S = 45.0         # a model that timed out: skip it only briefly (all keys share it)
+DEAD_404_S = 20 * 60.0     # a model id that really is gone
+COOL_AUTH_S = 10 * 60.0    # 401/403 on one key
+COOL_429_S = 20.0
+COOL_OTHER_S = 10.0
 _LOCK = threading.Lock()
 _STATE = {"models": None, "ts": 0.0, "cool": {}, "dead": {}, "last_model": None, "last_error": ""}
 
@@ -2499,6 +2549,15 @@ def _post_stream(post, url, key, body, first_byte_s, t_end):
             pass
 
 
+def _post_stream_compat(post, url, key, body, first_byte_s, t_end):
+    """v58: some models reject chat_template_kwargs (HTTP 400/422).  Retry the SAME model once without it instead of failing it for good."""
+    code, txt = _post_stream(post, url, key, body, first_byte_s, t_end)
+    if code in (400, 422) and "chat_template_kwargs" in body:
+        body2 = {k: v for k, v in body.items() if k != "chat_template_kwargs"}
+        code, txt = _post_stream(post, url, key, body2, first_byte_s, t_end)
+    return code, txt
+
+
 def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadline_s=110.0, post=requests.post, thinking=False):
     """-> (text, model).  Raises NvidiaUnavailable when no key/model answered."""
     keys = [k for k in (keys or []) if k]
@@ -2506,11 +2565,24 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
         raise NvidiaUnavailable("NVIDIA_API_KEY not configured")
     t_end = time.time() + deadline_s
     models = candidate_models(list_models(keys), forced_model(secrets) if secrets is not None else None)
+    if not models:
+        models = list(PREFERRED[:4])          # model list unavailable and no preferred match: try the known-good ids blindly
     errs = []
+    # v58 REVIVE: if EVERY (model, key) is resting right now, resting is cancelled -- one real attempt is always better than answering "no model available".
+    with _LOCK:
+        _now0 = time.time()
+        _usable = any(_STATE["dead"].get(m, 0) <= _now0 and any(_STATE["cool"].get((k[-6:], m), 0) <= _now0 for k in keys) for m in models)
+        if not _usable:
+            for m in models:
+                _STATE["dead"].pop(m, None)
+                for k in keys:
+                    _STATE["cool"].pop((k[-6:], m), None)
+            errs.append("revived: all models were resting")
     n = 0
     for model in models:
         with _LOCK:
             if _STATE["dead"].get(model, 0) > time.time():
+                errs.append(f"{model}: resting {int(_STATE['dead'][model] - time.time())}s")
                 continue
         # v57c: no single model may eat the whole deadline (that is why DeepSeek / Qwen / the others never got a turn behind a slow
         # Nemotron): each model gets at most 70 % of the time that is left (min 45 s), the rest stays for the next model.
@@ -2535,7 +2607,7 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
                     t_stop = min(t_model, time.time() + max(60.0, deadline_s * THINK_SHARE)) if can_fast else t_model
                     fast_used = False
                     try:
-                        code, raw_txt = _post_stream(post, f"{BASE_URL}/chat/completions", key, body, FIRST_BYTE_S, t_stop)
+                        code, raw_txt = _post_stream_compat(post, f"{BASE_URL}/chat/completions", key, body, FIRST_BYTE_S, t_stop)
                         if can_fast and code == 200 and not clean_reply(raw_txt):
                             raise TimeoutError("thinking used all tokens without an answer")
                     except Exception as exc_think:
@@ -2545,7 +2617,7 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
                         logger.warning("NVIDIA %s thinking too slow (%s) -> fast mode", model, type(exc_think).__name__)
                         body_fast = dict(body, temperature=temperature, max_tokens=min(int(max_tokens), 3500),
                                          chat_template_kwargs={"enable_thinking": False})
-                        code, raw_txt = _post_stream(post, f"{BASE_URL}/chat/completions", key, body_fast, FIRST_BYTE_S, t_model)
+                        code, raw_txt = _post_stream_compat(post, f"{BASE_URL}/chat/completions", key, body_fast, FIRST_BYTE_S, t_model)
                         fast_used = code == 200
                     r = types_SimpleNamespace(status_code=code)
                 else:                              # injected fake `post` (unit tests) keeps the old non-streaming contract
@@ -2557,9 +2629,9 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
                 with _LOCK:
                     # a model that timed out is slow RIGHT NOW: rest it for 5 min so the next questions go straight to a working model
                     slow = "Timeout" in type(exc).__name__ or isinstance(exc, TimeoutError)
-                    _STATE["cool"][ck] = time.time() + (300 if slow else 20)
+                    _STATE["cool"][ck] = time.time() + (DEAD_SLOW_S if slow else COOL_OTHER_S)
                     if slow:
-                        _STATE["dead"][model] = time.time() + 300      # all keys share the same slow model -> skip it, do not wait per key
+                        _STATE["dead"][model] = time.time() + DEAD_SLOW_S      # all keys share the same slow model -> skip it briefly, do not wait per key
                 if slow:
                     break
                 continue
@@ -2580,19 +2652,19 @@ def chat(keys, messages, secrets=None, max_tokens=3500, temperature=0.2, deadlin
             errs.append(f"{model}: HTTP {r.status_code}")
             with _LOCK:
                 if r.status_code in (404, 410):
-                    _STATE["dead"][model] = time.time() + 6 * 3600
+                    _STATE["dead"][model] = time.time() + DEAD_404_S
                 elif r.status_code in (401, 403):
-                    _STATE["cool"][ck] = time.time() + 6 * 3600
+                    _STATE["cool"][ck] = time.time() + COOL_AUTH_S
                 elif r.status_code == 429:
-                    _STATE["cool"][ck] = time.time() + 45
+                    _STATE["cool"][ck] = time.time() + COOL_429_S
                 else:
-                    _STATE["cool"][ck] = time.time() + 20
+                    _STATE["cool"][ck] = time.time() + COOL_OTHER_S
             if r.status_code in (404, 410):
                 break
         n += 1
     with _LOCK:
         _STATE["last_error"] = "; ".join(errs[-4:])
-    raise NvidiaUnavailable("; ".join(errs[-4:]) or "no model available")
+    raise NvidiaUnavailable("; ".join(errs[-4:]) or "no model answered (retrying on the next question)")
 
 
 def status():
