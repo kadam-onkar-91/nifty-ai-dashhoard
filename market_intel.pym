@@ -1758,3 +1758,941 @@ def scorecard(snaps):
             "n_conf": len(conf), "acc_conf": (sum(1 for h, _ in conf if h) / len(conf)) if conf else None,
             "n_trusted": len(trusted), "acc_trusted": (sum(trusted) / len(trusted)) if trusted else None}
 # @@END market_learner
+# @@MODULE consensus_engine
+"""
+consensus_engine.py -- v60: ONE place that counts how many of the tool's factors are BUYING, SELLING or NEUTRAL right now.
+
+It reads what the dashboard has already computed (trend, VWAP/EMA/RSI/MACD, structure, S/R, option chain + OI, PCR, FII, order flow, breadth,
+sectors, Bank Nifty + the 6 index banks, global markets, news, fundamentals, strategy engine, ML, AI engine) and adds two things that were missing:
+  * BANK block  -- live move of the 6 index banks, Bank Nifty vs Nifty, bank FUNDAMENTALS (ROE / growth / margin / P/B, from Yahoo, cached 6 h)
+                   and bank NEWS (Google News RSS).
+  * a better news reader (word-boundary lexicon; the old keyword check matched "up" inside "update", "down" inside "download").
+
+HOW THE WINNER IS CHOSEN (honest, not magic)
+  * counts (BUY / SELL / NEUTRAL) are plain counts of factors.
+  * the "strongest side" is NOT the raw count: correlated factors (RSI, MACD, EMA, VWAP ... all say the same thing) would out-shout everything.
+    So every GROUP gets its own balanced edge (-1..+1) and the groups are averaged with group weights.  Edge >= 0.35 STRONG, >= 0.18 MODERATE,
+    >= 0.08 WEAK, else BALANCED (no clear side -> sit out).
+  * a missing source is "data nahi" (not counted as neutral); the data-coverage % is shown so you know how much to trust the reading.
+  * this is evidence about what the data says NOW, not a prediction.  A session track-record (did the edge agree with price 15 min later) is
+    kept so you can see for yourself whether it is useful.
+
+Pure + defensive: every factor is computed inside its own try/except, nothing here can stop the dashboard.  `ENABLED = False` switches it off.
+"""
+import logging
+import math
+import re
+import time
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, wait as _wait
+
+logger = logging.getLogger(__name__)
+
+ENABLED = True
+
+# group -> weight in the final edge (groups, not single factors, decide the winner: avoids double counting correlated indicators)
+GROUP_W = {
+    "Price & Trend": 1.5, "Structure & Levels": 1.5, "Options & OI": 1.2, "Flow & Breadth": 1.2, "Bank": 1.0,
+    "Global": 1.0, "News": 0.7, "Fundamentals": 0.5, "Models": 1.3,
+}
+GROUP_ORDER = list(GROUP_W)
+
+STRONG_EDGE, MODERATE_EDGE, WEAK_EDGE = 0.35, 0.18, 0.08
+
+BANKS = ["HDFCBANK", "ICICIBANK", "SBIN", "KOTAKBANK", "AXISBANK", "INDUSINDBK"]
+BANK_NAME = {"HDFCBANK": "HDFC Bank", "ICICIBANK": "ICICI Bank", "SBIN": "SBI", "KOTAKBANK": "Kotak Bank",
+             "AXISBANK": "Axis Bank", "INDUSINDBK": "IndusInd Bank"}
+_BANK_ALIASES = {"HDFCBANK": ("HDFCBANK", "HDFC BANK"), "ICICIBANK": ("ICICIBANK", "ICICI BANK"), "SBIN": ("SBIN", "SBI", "STATE BANK"),
+                 "KOTAKBANK": ("KOTAKBANK", "KOTAK BANK", "KOTAK MAHINDRA"), "AXISBANK": ("AXISBANK", "AXIS BANK"),
+                 "INDUSINDBK": ("INDUSINDBK", "INDUSIND BANK")}
+
+BANK_FUND_TTL = 6 * 3600
+_BANK_FUND_FAIL = {"ts": 0.0}
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------
+# small helpers
+# ----------------------------------------------------------------------------------------------------------------------------------
+def _f(x):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else None
+    except Exception:
+        return None
+
+
+def _lean(text):
+    """+1 / -1 / 0 from a text like 'BULLISH 🟢', 'BREAKDOWN LIKELY (bearish) 🔴', 'BUY'.  None when there is no usable text."""
+    t = str(text or "").upper()
+    if not t.strip() or any(k in t for k in ("UNAVAILABLE", "UNKNOWN", "N/A", "NO DATA", "DATA NAHI", "NOT ENOUGH")):
+        return None
+    if "BEAR" in t or t.strip() in ("SELL", "NEGATIVE") or t.startswith("SELL"):
+        return -1
+    if "BULL" in t or t.strip() in ("BUY", "POSITIVE") or t.startswith("BUY"):
+        return 1
+    return 0
+
+
+def _sgn_pct(chg, dead):
+    c = _f(chg)
+    if c is None:
+        return None
+    return 1 if c > dead else -1 if c < -dead else 0
+
+
+def _norm(s):
+    return re.sub(r"[^A-Z0-9]", "", str(s or "").upper())
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------
+# news reader
+# ----------------------------------------------------------------------------------------------------------------------------------
+_POS = ["surge", "surges", "surged", "jump", "jumps", "jumped", "gain", "gains", "gained", "rally", "rallies", "soar", "soars", "climb", "climbs",
+        "rise", "rises", "rose", "rebound", "rebounds", "recover", "recovers", "recovery", "upgrade", "upgrades", "upgraded", "beat", "beats",
+        "strong", "stronger", "boost", "boosts", "optimism", "optimistic", "bullish", "inflow", "inflows", "buying", "buyers", "outperform",
+        "outperforms", "record high", "all-time high", "rate cut", "rate cuts", "ceasefire", "trade deal", "peace", "stimulus", "profit jumps",
+        "net buyers", "positive", "growth", "expands", "approval", "approved", "relief"]
+_NEG = ["fall", "falls", "fell", "drop", "drops", "dropped", "dip", "dips", "slump", "slumps", "crash", "crashes", "plunge", "plunges",
+        "tumble", "tumbles", "sink", "sinks", "slide", "slides", "decline", "declines", "loss", "losses", "sell-off", "selloff", "selling",
+        "sellers", "outflow", "outflows", "downgrade", "downgrades", "downgraded", "miss", "misses", "weak", "weaker", "weakness", "fear", "fears",
+        "worry", "worries", "concern", "concerns", "tension", "tensions", "war", "strike", "sanction", "sanctions", "tariff", "tariffs",
+        "inflation", "default", "fraud", "probe", "penalty", "fine", "bearish", "pressure", "rate hike", "rate hikes", "net sellers",
+        "profit booking", "job cuts", "slowdown", "recession", "volatile", "negative", "warns", "warning", "risk", "risks", "bad loans", "npa"]
+
+
+def _compile(words):
+    # longest first so "rate cut" wins over "cut"; word boundaries so "up" can never match inside "update"
+    ws = sorted(set(words), key=len, reverse=True)
+    return re.compile(r"(?<![a-z0-9])(?:" + "|".join(re.escape(w) for w in ws) + r")(?![a-z0-9])", re.I)
+
+
+_POS_RE, _NEG_RE = _compile(_POS), _compile(_NEG)
+
+
+def _clean_title(t):
+    t = re.sub(r"\s+", " ", str(t or "")).strip()
+    return re.sub(r"\s+-\s+[^-]{2,40}$", "", t)          # Google News adds " - Source name"
+
+
+def news_score(titles):
+    """-> {label, pos, neg, n, headline, headlines}.  label BULLISH / BEARISH / NEUTRAL / UNAVAILABLE.  Each headline counts once, by the
+    sign of (positive words - negative words) in it."""
+    titles = [_clean_title(t) for t in (titles or []) if str(t or "").strip()]
+    if not titles:
+        return {"label": "UNAVAILABLE", "pos": 0, "neg": 0, "n": 0, "headline": "", "headlines": []}
+    pos = neg = 0
+    for t in titles:
+        d = len(_POS_RE.findall(t)) - len(_NEG_RE.findall(t))
+        if d > 0:
+            pos += 1
+        elif d < 0:
+            neg += 1
+    scored = pos + neg
+    diff = pos - neg
+    if scored == 0:
+        label = "NEUTRAL"
+    elif diff >= 2 or (diff > 0 and diff / scored >= 0.34):
+        label = "BULLISH"
+    elif diff <= -2 or (diff < 0 and -diff / scored >= 0.34):
+        label = "BEARISH"
+    else:
+        label = "NEUTRAL"
+    return {"label": label, "pos": pos, "neg": neg, "n": len(titles), "headline": titles[0], "headlines": titles[:6]}
+
+
+def _rss_titles(query, limit=10):
+    import multi_stock_engine as _mse
+    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+    feed = _mse._cached_rss(url)
+    return [e.get("title", "") for e in feed.entries[:limit]]
+
+
+def fetch_bank_news():
+    return _rss_titles("Bank Nifty banking stocks India RBI HDFC ICICI SBI", limit=10)
+
+
+def fetch_nifty_news():
+    return _rss_titles("NIFTY 50 NSE India stock market index news", limit=10)
+
+
+def bank_news_result():
+    return news_score(fetch_bank_news())
+
+
+def nifty_news_result():
+    return news_score(fetch_nifty_news())
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------
+# bank fundamentals (outside data: Yahoo Finance, cached by safe_io.guarded for 6 h)
+# ----------------------------------------------------------------------------------------------------------------------------------
+def score_bank_fundamentals(info):
+    """info: dict with returnOnEquity, earningsGrowth, revenueGrowth, profitMargins, priceToBook -> (score, label, notes). Missing = no point."""
+    s, notes = 0, []
+    roe, eg, rg, pm, pb = (_f(info.get(k)) for k in ("returnOnEquity", "earningsGrowth", "revenueGrowth", "profitMargins", "priceToBook"))
+    if roe is not None:
+        if roe >= 0.13:
+            s += 1; notes.append(f"ROE {roe*100:.0f}%")
+        elif roe < 0.09:
+            s -= 1; notes.append(f"ROE low {roe*100:.0f}%")
+    if eg is not None:
+        if eg > 0.05:
+            s += 1; notes.append(f"profit growth {eg*100:+.0f}%")
+        elif eg < 0:
+            s -= 1; notes.append(f"profit falling {eg*100:+.0f}%")
+    if rg is not None:
+        if rg > 0.05:
+            s += 1; notes.append(f"revenue {rg*100:+.0f}%")
+        elif rg < 0:
+            s -= 1; notes.append(f"revenue {rg*100:+.0f}%")
+    if pm is not None:
+        if pm > 0.25:
+            s += 1; notes.append(f"margin {pm*100:.0f}%")
+        elif pm < 0.12:
+            s -= 1; notes.append(f"margin low {pm*100:.0f}%")
+    if pb is not None:
+        if pb > 3.5:
+            s -= 1; notes.append(f"P/B {pb:.1f} costly")
+        elif pb <= 2.0:
+            s += 1; notes.append(f"P/B {pb:.1f} cheap")
+    have = sum(v is not None for v in (roe, eg, rg, pm, pb))
+    if have < 3:
+        return 0, "NA", notes
+    return s, ("STRONG" if s >= 2 else "WEAK" if s <= -1 else "OK"), notes
+
+
+def fetch_bank_fundamentals():
+    """{symbol: {label, score, notes}}.  Raises when nothing could be read (so safe_io keeps the previous good value and retries later)."""
+    if time.time() - _BANK_FUND_FAIL["ts"] < 600:
+        raise RuntimeError("bank fundamentals: backing off after a failed fetch")
+    import yfinance as yf
+
+    def _one(sym):
+        info = yf.Ticker(sym + ".NS").info or {}
+        sc, label, notes = score_bank_fundamentals(info)
+        return {"label": label, "score": sc, "notes": notes}
+
+    ex = ThreadPoolExecutor(max_workers=6)
+    futs = {s: ex.submit(_one, s) for s in BANKS}
+    try:
+        _wait(list(futs.values()), timeout=25)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    out = {}
+    for s, f in futs.items():
+        try:
+            if f.done():
+                out[s] = f.result()
+        except Exception:
+            pass
+    if not any(v.get("label") != "NA" for v in out.values()):
+        _BANK_FUND_FAIL["ts"] = time.time()
+        raise RuntimeError("bank fundamentals: no data returned")
+    return out
+
+
+def gather_outside(safe_io):
+    """Outside data, never blocking the page for long: (bank_fund dict, bank_news dict|None, nifty_news dict|None).
+    safe_io.guarded keeps the last good value and finishes slow fetches in the background."""
+    bank_fund = safe_io.guarded("consensus_bank_fund", fetch_bank_fundamentals, timeout=2, ttl=BANK_FUND_TTL, default={})
+    bank_news = safe_io.guarded("consensus_bank_news", bank_news_result, timeout=3, ttl=300, default=None)
+    nifty_news = safe_io.guarded("consensus_nifty_news", nifty_news_result, timeout=3, ttl=300, default=None)
+    return (bank_fund or {}), bank_news, nifty_news
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------
+# the factor collector
+# ----------------------------------------------------------------------------------------------------------------------------------
+class _Board:
+    def __init__(self):
+        self.rows = []
+
+    def add(self, group, name, vote, detail="", w=1.0):
+        """vote: +1 BUY / -1 SELL / 0 NEUTRAL / None = no data."""
+        try:
+            v = None if vote is None else (1 if vote > 0 else -1 if vote < 0 else 0)
+        except Exception:
+            v = None
+        self.rows.append({"group": group, "name": name, "vote": v, "detail": str(detail or ""), "w": float(w)})
+
+    def safe(self, group, name, fn, w=1.0):
+        """fn() -> (vote, detail).  Any error = 'no data' for that factor only."""
+        try:
+            vote, detail = fn()
+        except Exception:
+            logger.debug("consensus factor %s failed", name, exc_info=True)
+            vote, detail = None, "data nahi"
+        self.add(group, name, vote, detail, w)
+
+
+def _bank_row_change(sym, df_full50, df_heavy):
+    aliases = {_norm(a) for a in _BANK_ALIASES.get(sym, (sym,))}
+    for df, col in ((df_full50, "Symbol"), (df_heavy, "Stock")):
+        try:
+            if df is None or getattr(df, "empty", True) or col not in df.columns or "Change (%)" not in df.columns:
+                continue
+            for _, r in df.iterrows():
+                if _norm(r[col]) in aliases:
+                    c = _f(r["Change (%)"])
+                    if c is not None:
+                        return c
+        except Exception:
+            continue
+    return None
+
+
+def _global_change(df, *needles):
+    """average Change (%) of the global rows whose name contains one of the needles"""
+    try:
+        if df is None or getattr(df, "empty", True):
+            return None
+        col = "Global Market / Asset"
+        vals = [_f(r["Change (%)"]) for _, r in df.iterrows() if any(n.lower() in str(r[col]).lower() for n in needles)]
+        vals = [v for v in vals if v is not None]
+        return sum(vals) / len(vals) if vals else None
+    except Exception:
+        return None
+
+
+def build(ctx):
+    """ctx: dict of what the dashboard already has (all optional).  Returns the consensus result dict (never raises)."""
+    try:
+        return _build(ctx or {})
+    except Exception:
+        logger.exception("consensus_engine failed (ignored)")
+        return {"ok": False, "one_line": "Consensus abhi nahi bana (data error) -- baaki dashboard theek chal raha hai", "side": "NA", "factors": [],
+                "buy": 0, "sell": 0, "neutral": 0, "na": 0, "total": 0, "line1": "", "line2": "", "line3": "", "summary_text": ""}
+
+
+def _build(c):
+    c = dict(c)
+    c["index_corr"] = [r for r in (c.get("index_corr") if isinstance(c.get("index_corr"), (list, tuple)) else []) if isinstance(r, dict)]
+    for k in ("ai_analysis", "strategy_result", "ml_results", "level_prediction", "sr_context", "regime", "mtf", "orb", "candle", "order_flow",
+              "pcr_vel", "global_research", "bank_fund", "bank_news", "nifty_news"):
+        if not isinstance(c.get(k), dict):
+            c[k] = None
+    B = _Board()
+    px = _f(c.get("live_price"))
+    atr = _f(c.get("atr")) or 15.0
+    df = c.get("df")
+    last = None
+    try:
+        if df is not None and not df.empty:
+            last = df.iloc[-1]
+    except Exception:
+        last = None
+
+    def L(key, default=None):
+        try:
+            return _f(last.get(key)) if last is not None else default
+        except Exception:
+            return default
+
+    # ------------------------------------------------------------- PRICE & TREND
+    G = "Price & Trend"
+
+    def f_vwap():
+        v = L("VWAP")
+        if px is None or v is None:
+            return None, "data nahi"
+        d = (px - v) / atr
+        return (1 if d >= 0.1 else -1 if d <= -0.1 else 0), f"price {px - v:+.0f} pts vs VWAP"
+    B.safe(G, "Price vs VWAP", f_vwap)
+
+    def f_ema():
+        e20, e50 = L("EMA_20"), L("EMA_50")
+        if px is None or e20 is None or e50 is None:
+            return None, "data nahi"
+        if px > e20 > e50:
+            return 1, "price > EMA20 > EMA50"
+        if px < e20 < e50:
+            return -1, "price < EMA20 < EMA50"
+        return 0, "EMAs mixed"
+    B.safe(G, "EMA trend", f_ema)
+
+    def f_rsi():
+        r = L("RSI")
+        if r is None:
+            return None, "data nahi"
+        if r > 72:
+            return 0, f"RSI {r:.0f} overbought (thaka hua)"
+        if r < 28:
+            return 0, f"RSI {r:.0f} oversold (thaka hua)"
+        return (1 if r >= 58 else -1 if r <= 42 else 0), f"RSI {r:.0f}"
+    B.safe(G, "RSI", f_rsi)
+
+    def f_macd():
+        h = L("MACD_Hist")
+        if h is None:
+            m, s = L("MACD"), L("MACD_Signal")
+            h = (m - s) if (m is not None and s is not None) else None
+        if h is None:
+            return None, "data nahi"
+        return (1 if h > 0.5 else -1 if h < -0.5 else 0), f"MACD hist {h:+.1f}"
+    B.safe(G, "MACD", f_macd)
+
+    def f_mom():
+        if df is None or len(df) < 8 or px is None:
+            return None, "data nahi"
+        past = _f(df["Close"].iloc[-7])
+        if past is None:
+            return None, "data nahi"
+        d = (px - past) / atr
+        return (1 if d >= 0.5 else -1 if d <= -0.5 else 0), f"pichhle 6 candle {px - past:+.0f} pts"
+    B.safe(G, "Short momentum", f_mom)
+
+    def f_poc():
+        p = _f(c.get("live_poc"))
+        if px is None or p is None:
+            return None, "data nahi"
+        d = (px - p) / atr
+        return (1 if d >= 0.1 else -1 if d <= -0.1 else 0), f"price {px - p:+.0f} pts vs volume POC"
+    B.safe(G, "Price vs POC", f_poc, w=0.8)
+
+    def f_cpr():
+        t = str(c.get("cpr_pos") or "").upper()
+        if not t or "INSUFFICIENT" in t:
+            return None, "data nahi"
+        return (1 if t.startswith("ABOVE") else -1 if t.startswith("BELOW") else 0), t.split("(")[0].strip().title()
+    B.safe(G, "CPR position", f_cpr)
+
+    def f_orb():
+        o = c.get("orb") or {}
+        t = str(o.get("read") or "").upper()
+        if o.get("status") != "OK" or not t or "FORMING" in t:
+            return None, "data nahi"
+        return (1 if "BREAKOUT" in t else -1 if "BREAKDOWN" in t else 0), t.title()
+    B.safe(G, "Opening range", f_orb)
+
+    def f_candle():
+        cd = c.get("candle") or {}
+        v = _lean(cd.get("bias"))
+        if v is None:
+            return None, "data nahi"
+        return (v if _f(cd.get("strength")) and _f(cd.get("strength")) >= 0.5 else 0), str(cd.get("pattern") or "")[:30]
+    B.safe(G, "Candle pattern", f_candle, w=0.7)
+
+    # ------------------------------------------------------------- STRUCTURE & LEVELS
+    G = "Structure & Levels"
+
+    def f_smc():
+        v = _lean(c.get("smc_event"))
+        return (None, "data nahi") if v is None else (v, str(c.get("smc_event"))[:34])
+    B.safe(G, "Market structure (BOS/CHoCH)", f_smc)
+
+    mtf = c.get("mtf") or {}
+
+    def f_htf():
+        v = _lean(mtf.get("htf_bias"))
+        return (None, "data nahi") if v is None else (v, f"HTF {mtf.get('htf_bias')}")
+    B.safe(G, "Higher timeframes", f_htf, w=1.5)
+
+    def f_ltf():
+        v = _lean(mtf.get("ltf_bias"))
+        return (None, "data nahi") if v is None else (v, f"LTF {mtf.get('ltf_bias')}")
+    B.safe(G, "Lower timeframes", f_ltf)
+
+    def f_sr():
+        sr = c.get("sr_context") or {}
+        loc = str(sr.get("location") or "")
+        if not loc or loc in ("UNKNOWN",):
+            return None, "data nahi"
+        v = 1 if loc in ("AT_SUPPORT", "NEAR_SUPPORT") else -1 if loc in ("AT_RESISTANCE", "NEAR_RESISTANCE") else 0
+        return v, loc.replace("_", " ").title()
+    B.safe(G, "Support / Resistance location", f_sr)
+
+    def f_level():
+        lp = c.get("level_prediction") or {}
+        if lp.get("status") != "APPROACHING_LEVEL":
+            return None, "koi level paas nahi"
+        v = _lean(lp.get("directional_bias"))
+        return (None, "data nahi") if v is None else (v, f"break {lp.get('break_pct')}% / bounce {lp.get('bounce_pct')}%")
+    B.safe(G, "Level break/bounce predictor", f_level, w=1.5)
+
+    def f_regime():
+        r = str((c.get("regime") or {}).get("primary") or "").upper()
+        if not r:
+            return None, "data nahi"
+        return (1 if "BULL" in r else -1 if "BEAR" in r else 0), r.title()
+    B.safe(G, "Market regime (ADX)", f_regime)
+
+    # ------------------------------------------------------------- OPTIONS & OI
+    G = "Options & OI"
+    pcr = _f(c.get("current_pcr"))
+    oc = c.get("oc")
+    oc_live = bool(c.get("oc_live"))
+
+    def f_pcr():
+        if pcr is None or not oc_live:
+            return None, "live option chain nahi"
+        return (1 if pcr >= 1.2 else -1 if pcr <= 0.8 else 0), f"PCR {pcr:.2f}"
+    B.safe(G, "PCR", f_pcr)
+
+    def f_pcrv():
+        pv = c.get("pcr_vel") or {}
+        v = _lean(pv.get("bias"))
+        if v is None or pv.get("per15") is None:
+            return None, "history ban rahi hai"
+        return v, str(pv.get("note") or "")[:40]
+    B.safe(G, "PCR velocity", f_pcrv, w=0.8)
+
+    def f_fii():
+        t = str(c.get("fii_footprint") or "").upper()
+        if not t or t in ("N/A", "NONE"):
+            return None, "data nahi"
+        return (1 if t.startswith("BULLISH") else -1 if t.startswith("BEARISH") else 0), str(c.get("fii_footprint"))[:30]
+    B.safe(G, "FII option footprint", f_fii)
+
+    def f_skew():
+        s = c.get("iv_skew")
+        sk = _f(s.get("skew")) if isinstance(s, dict) else None
+        if sk is None:
+            return None, "data nahi"
+        return (1 if sk <= -1.5 else -1 if sk >= 4.0 else 0), f"IV skew {sk:+.1f}"
+    B.safe(G, "IV skew", f_skew, w=0.6)
+
+    def f_wall():
+        if not oc_live or oc is None or getattr(oc, "empty", True) or px is None:
+            return None, "live option chain nahi"
+        below = oc[oc["Strike"] <= px]
+        above = oc[oc["Strike"] >= px]
+        if below.empty or above.empty:
+            return None, "data nahi"
+        sup = float(below.loc[below["Put OI"].idxmax(), "Strike"])
+        res = float(above.loc[above["Call OI"].idxmax(), "Strike"])
+        ds, dr = px - sup, res - px
+        if ds <= 0 and dr <= 0:
+            return 0, "OI walls overlap"
+        v = 1 if (ds >= 0 and ds < dr * 0.6) else -1 if (dr >= 0 and dr < ds * 0.6) else 0
+        return v, f"Put wall {sup:.0f} ({ds:.0f} niche) / Call wall {res:.0f} ({dr:.0f} upar)"
+    B.safe(G, "OI walls (nearest)", f_wall, w=1.2)
+
+    def f_pain():
+        mp = _f(c.get("max_pain"))
+        if mp is None or px is None or not oc_live:
+            return None, "data nahi"
+        d = (px - mp) / atr
+        return (1 if d <= -0.5 else -1 if d >= 0.5 else 0), f"max pain {mp:.0f}"
+    B.safe(G, "Max pain pull", f_pain, w=0.5)
+
+    def f_vix():
+        v = _f(c.get("live_vix"))
+        if v is None:
+            return None, "data nahi"
+        return (-1 if v >= 20 else 1 if v < 14 else 0), f"India VIX {v:.1f}"
+    B.safe(G, "India VIX", f_vix, w=0.6)
+
+    # ------------------------------------------------------------- FLOW & BREADTH
+    G = "Flow & Breadth"
+
+    def f_of():
+        of = c.get("order_flow") or {}
+        t = str(of.get("pressure") or "").upper()
+        if of.get("status") != "OK" or not t:
+            return None, "futures depth nahi"
+        return (1 if t.startswith("BUYING") else -1 if t.startswith("SELLING") else 0), f"imbalance {of.get('imbalance_pct')}%"
+    B.safe(G, "Futures order book", f_of)
+
+    def f_adv(adv, dec, label):
+        a, d = _f(adv), _f(dec)
+        if a is None or d is None or a + d <= 0:
+            return None, "data nahi"
+        r = (a - d) / (a + d)
+        return (1 if r >= 0.2 else -1 if r <= -0.2 else 0), f"{int(a)} up / {int(d)} down"
+    B.safe(G, "Heavyweight breadth", lambda: f_adv(c.get("adv"), c.get("dec"), "heavy"))
+    B.safe(G, "Nifty-50 breadth", lambda: f_adv(c.get("adv50"), c.get("dec50"), "full"))
+
+    def f_sector():
+        sb = c.get("sector_breadth")
+        if sb is None or len(sb) < 4:
+            return None, "data nahi"
+        ch = [x for x in (_f(v) for v in sb["Avg Change (%)"]) if x is not None]
+        if len(ch) < 4:
+            return None, "data nahi"
+        up, dn = sum(v > 0.10 for v in ch), sum(v < -0.10 for v in ch)
+        r = (up - dn) / len(ch)
+        return (1 if r >= 0.4 else -1 if r <= -0.4 else 0), f"{up} sector up / {dn} down"
+    B.safe(G, "Sector breadth", f_sector)
+
+    def f_sensex():
+        for r in c.get("index_corr") or []:
+            if str(r.get("name")) == "Sensex":
+                v = _sgn_pct(r.get("change_pct"), 0.15)
+                return (None, "data nahi") if v is None else (v, f"Sensex {r.get('change_pct'):+.2f}%")
+        return None, "data nahi"
+    B.safe(G, "Sensex", f_sensex, w=0.7)
+
+    # ------------------------------------------------------------- BANK (live)
+    G = "Bank"
+    bank_move = {}
+    for sym in BANKS:
+        ch = _bank_row_change(sym, c.get("df_full50"), c.get("df_heavy"))
+        bank_move[sym] = ch
+        v = _sgn_pct(ch, 0.15)
+        B.add(G, BANK_NAME[sym], v, "data nahi" if ch is None else f"{ch:+.2f}%", 0.8)
+
+    bn = next((r for r in (c.get("index_corr") or []) if str(r.get("name")) == "Bank Nifty"), None)
+    bn_chg = _f((bn or {}).get("change_pct"))
+    nifty_chg = _f(c.get("nifty_change_pct"))
+    B.add(G, "Bank Nifty", _sgn_pct(bn_chg, 0.15), "data nahi" if bn_chg is None else f"{bn_chg:+.2f}%", 1.5)
+
+    def f_bn_rel():
+        if bn_chg is None or nifty_chg is None:
+            return None, "data nahi"
+        d = bn_chg - nifty_chg
+        if abs(d) < 0.15:
+            return 0, f"Bank Nifty Nifty ke saath ({d:+.2f}%)"
+        return (1 if d > 0 else -1), f"Bank Nifty Nifty se {'aage' if d > 0 else 'peeche'} ({d:+.2f}%)"
+    B.safe(G, "Bank Nifty vs Nifty", f_bn_rel)
+
+    bank_fund = c.get("bank_fund") or {}
+
+    def f_bank_fund():
+        rows = [v for v in bank_fund.values() if v.get("label") in ("STRONG", "OK", "WEAK")]
+        if len(rows) < 3:
+            return None, "fundamentals load ho rahe hain / data nahi"
+        strong = sum(v["label"] == "STRONG" for v in rows)
+        weak = sum(v["label"] == "WEAK" for v in rows)
+        net = strong - weak
+        v = 1 if (net >= 2 or (net > 0 and strong >= len(rows) / 2)) else -1 if (net <= -2 or (net < 0 and weak >= len(rows) / 2)) else 0
+        return v, f"{strong} strong / {weak} weak / {len(rows) - strong - weak} theek (of {len(rows)} banks)"
+    B.safe(G, "Bank fundamentals", f_bank_fund, w=0.8)
+
+    bank_news = c.get("bank_news") or {"label": "UNAVAILABLE"}
+    B.add(G, "Bank news", _lean(bank_news.get("label")) if bank_news.get("label") != "UNAVAILABLE" else None,
+          f"{bank_news.get('pos', 0)} +ve / {bank_news.get('neg', 0)} -ve", 0.8)
+
+    # ------------------------------------------------------------- GLOBAL
+    G = "Global"
+    gm = c.get("df_global")
+
+    def mk(name, needles, dead, invert=False, w=1.0, fmt="{:+.2f}%"):
+        def _f1():
+            v = _global_change(gm, *needles)
+            if v is None:
+                return None, "data nahi"
+            s = _sgn_pct(v, dead)
+            return (-s if invert else s), fmt.format(v)
+        B.safe(G, name, _f1, w=w)
+    mk("US markets", ("S&P 500", "Nasdaq", "Dow Jones"), 0.25, w=1.2)
+    mk("Asia markets", ("Nikkei", "Hang Seng", "KOSPI", "Shanghai", "Straits"), 0.25)
+    mk("Europe markets", ("FTSE", "DAX", "CAC"), 0.25, w=0.8)
+    mk("Crude oil", ("Crude Oil",), 0.8, invert=True, w=0.6)
+    mk("US Dollar (DXY)", ("Dollar Index",), 0.25, invert=True, w=0.6)
+    mk("US 10Y yield", ("10-Year",), 1.0, invert=True, w=0.6)
+    mk("USD/INR (rupee)", ("USD/INR",), 0.2, invert=True, w=0.6)
+
+    def f_gres():
+        gr = c.get("global_research") or {}
+        if str(gr.get("status", "")).upper() != "AVAILABLE":
+            return None, "data nahi"
+        v = _lean(gr.get("directional_bias"))
+        return (None, "data nahi") if v is None else (v, f"{gr.get('strength', '')} {gr.get('directional_bias', '')}".strip()[:36])
+    B.safe(G, "Global research bias", f_gres, w=1.3)
+
+    # ------------------------------------------------------------- NEWS
+    G = "News"
+
+    def f_india_news():
+        gs = c.get("df_global_sent")
+        if gs is None or getattr(gs, "empty", True):
+            return None, "data nahi"
+        row = gs[gs["Region / Country"].astype(str).str.contains("India", na=False)]
+        if row.empty:
+            return None, "data nahi"
+        t = row.iloc[0]["Net Sentiment"]
+        v = _lean(t)
+        return (None, "data nahi") if v is None else (v, str(t)[:26])
+    B.safe(G, "India market news", f_india_news)
+
+    n50 = c.get("nifty_news") or {"label": "UNAVAILABLE"}
+    B.add(G, "Nifty-50 headlines", _lean(n50.get("label")) if n50.get("label") != "UNAVAILABLE" else None,
+          f"{n50.get('pos', 0)} +ve / {n50.get('neg', 0)} -ve of {n50.get('n', 0)}", 1.0)
+
+    # ------------------------------------------------------------- FUNDAMENTALS
+    G = "Fundamentals"
+
+    def f_n50_fund():
+        fb = c.get("n50_fund_bias")
+        v = _lean(fb)
+        return (None, "refresh nahi hua") if v is None else (v, f"Nifty-50 growth/ROE {fb}")
+    B.safe(G, "Nifty-50 fundamentals", f_n50_fund)
+
+    # ------------------------------------------------------------- MODELS
+    G = "Models"
+
+    def f_ai():
+        ai = c.get("ai_analysis") or {}
+        ns = _f(ai.get("net_score"))
+        if ns is None:
+            return None, "data nahi"
+        return (1 if ns >= 0.22 else -1 if ns <= -0.22 else 0), f"AI net score {ns:+.2f}"
+    B.safe(G, "AI confluence engine", f_ai, w=1.5)
+
+    def f_strat():
+        s = c.get("strategy_result") or {}
+        b, se = int(s.get("buy_live_count") or 0), int(s.get("sell_live_count") or 0)
+        if s.get("status") != "READY":
+            return None, "data nahi"
+        if b == se:
+            return 0, f"strategies {b} BUY / {se} SELL"
+        return (1 if b > se else -1), f"{b} strategy BUY / {se} SELL"
+    B.safe(G, "Strategy engine (named setups)", f_strat, w=1.5)
+
+    def f_ml():
+        m = c.get("ml_results") or {}
+        if not m.get("model_ready"):
+            return None, "model ready nahi"
+        sig = int(m.get("latest_signal") or 0)
+        conf = _f(m.get("latest_confidence"))
+        return (sig if sig in (-1, 1) else 0), (f"confidence {conf:.0f}%" if conf is not None else "")
+    B.safe(G, "ML model (walk-forward)", f_ml)
+
+    return _summarise(B.rows, c, bank_move, bank_fund, bank_news, n50, bn_chg, nifty_chg, px, atr)
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------
+# summary
+# ----------------------------------------------------------------------------------------------------------------------------------
+def _tally(rows):
+    b = sum(1 for r in rows if r["vote"] == 1)
+    s = sum(1 for r in rows if r["vote"] == -1)
+    n = sum(1 for r in rows if r["vote"] == 0)
+    na = sum(1 for r in rows if r["vote"] is None)
+    return b, s, n, na
+
+
+def _group_edge(rows):
+    num = den = 0.0
+    for r in rows:
+        if r["vote"] is None:
+            continue
+        num += r["w"] * r["vote"]
+        den += r["w"]
+    return (num / den) if den > 0 else None
+
+
+_LBL = {"BULLISH": "Bullish", "BEARISH": "Bearish", "MIXED": "Mixed", "NEUTRAL": "Neutral", "NA": "data nahi", "UNAVAILABLE": "data nahi"}
+
+
+def _strength(edge):
+    a = abs(edge)
+    return "STRONG" if a >= STRONG_EDGE else "MODERATE" if a >= MODERATE_EDGE else "WEAK" if a >= WEAK_EDGE else "BALANCED"
+
+
+def _summarise(rows, c, bank_move, bank_fund, bank_news, n50, bn_chg, nifty_chg, px, atr):
+    buy, sell, neu, na = _tally(rows)
+    total = buy + sell + neu
+    groups = {}
+    for g in GROUP_ORDER:
+        gr = [r for r in rows if r["group"] == g]
+        if not gr:
+            continue
+        gb, gs, gn, gna = _tally(gr)
+        groups[g] = {"buy": gb, "sell": gs, "neutral": gn, "na": gna, "edge": _group_edge(gr)}
+    num = den = 0.0
+    for g, v in groups.items():
+        if v["edge"] is not None:
+            num += GROUP_W[g] * v["edge"]
+            den += GROUP_W[g]
+    edge = (num / den) if den > 0 else 0.0
+    strength = _strength(edge) if total >= 8 else "BALANCED"
+    side = "BUY" if (edge > 0 and strength != "BALANCED") else "SELL" if (edge < 0 and strength != "BALANCED") else "BALANCED"
+    coverage = round(100.0 * total / max(1, len(rows)))
+
+    # strongest / weakest group for the side
+    ranked = sorted([(g, v) for g, v in groups.items() if v["edge"] is not None], key=lambda kv: kv[1]["edge"])
+    top_buy = ranked[-1] if ranked and ranked[-1][1]["edge"] > 0.2 else None
+    top_sell = ranked[0] if ranked and ranked[0][1]["edge"] < -0.2 else None
+
+    # ---- bank block
+    bank_rows = [r for r in rows if r["group"] == "Bank"]
+    bb, bs, bn_, bna = _tally(bank_rows)
+    bank_edge = _group_edge(bank_rows)
+    bank_label = "NA" if bank_edge is None else "BULLISH" if bank_edge >= 0.2 else "BEARISH" if bank_edge <= -0.2 else "MIXED"
+    fr = next((r for r in rows if r["name"] == "Bank fundamentals"), None)
+    if fr is None or fr["vote"] is None:
+        fund_txt = "fundamentals load ho rahe hain"
+        fund_vote = None
+    else:
+        fund_vote = fr["vote"]
+        fund_txt = ("mazboot -> peeche se BUYING support" if fund_vote > 0 else "kamzor -> peeche se SELLING pressure" if fund_vote < 0
+                    else "theek-thaak -> koi side nahi")
+    bank_lines = []
+    for sym in BANKS:
+        ch = bank_move.get(sym)
+        fd = (bank_fund or {}).get(sym) or {}
+        bank_lines.append({"bank": BANK_NAME[sym], "change": ch, "fund": fd.get("label", "NA"), "notes": ", ".join(fd.get("notes") or [])})
+    laggard = min((b for b in bank_lines if b["change"] is not None), key=lambda b: b["change"], default=None)
+    leader = max((b for b in bank_lines if b["change"] is not None), key=lambda b: b["change"], default=None)
+
+    # ---- lines
+    icon = {"BUY": "🟢", "SELL": "🔴", "BALANCED": "🟡"}[side]
+    line1 = f"🔴 SELL (neeche) **{sell}**  ·  🟢 BUY (upar) **{buy}**  ·  ⚪ NEUTRAL **{neu}**   (kul {total} factor, data coverage {coverage}%)"
+    nl = n50.get("label", "UNAVAILABLE")
+    news_txt = {"BULLISH": "🟢 Bullish", "BEARISH": "🔴 Bearish", "NEUTRAL": "⚪ Neutral", "UNAVAILABLE": "⚫ data nahi"}[nl]
+    if nl != "UNAVAILABLE":
+        news_txt += f" ({n50.get('pos', 0)}+ / {n50.get('neg', 0)}-)"
+    head = n50.get("headline") or ""
+    if head:
+        news_txt += f" — “{head[:70]}{'…' if len(head) > 70 else ''}”"
+    bank_txt = {"BULLISH": "🟢 Bullish", "BEARISH": "🔴 Bearish", "MIXED": "🟡 Mixed", "NA": "⚫ data nahi"}[bank_label]
+    bank_txt += f" ({bb} BUY / {bs} SELL / {bn_} neutral)"
+    if bn_chg is not None:
+        bank_txt += f", BankNifty {bn_chg:+.2f}%"
+    bank_txt += f", fundamentals {fund_txt}"
+    line2 = f"📰 News: {news_txt}\n\n🏦 Bank: {bank_txt}"
+    if side == "BALANCED":
+        line3 = f"⚖️ Abhi koi side clear powerful nahi (edge {edge*100:+.0f}%) — jaldi mat karo, wait karo."
+    else:
+        word = "BUY" if side == "BUY" else "SELL"
+        grp = top_buy if side == "BUY" else top_sell
+        gtxt = f" · sabse strong group: {grp[0]} ({grp[1]['buy'] if side == 'BUY' else grp[1]['sell']}/{grp[1]['buy'] + grp[1]['sell'] + grp[1]['neutral']})" if grp else ""
+        line3 = f"{icon} Abhi **{word}** side zyada powerful — **{strength}** (edge {abs(edge)*100:.0f}%){gtxt}"
+    one_line = (f"🧮 Consensus: 🟢 BUY {buy} · 🔴 SELL {sell} · ⚪ NEUTRAL {neu}  →  "
+                + ("⚖️ BALANCED (koi side clear nahi)" if side == "BALANCED" else f"{icon} {side} {strength}")
+                + f"  |  🏦 Bank {_LBL[bank_label]}  |  📰 News {_LBL[nl]}")
+    summary_text = "\n".join([line1, line2.replace("\n\n", "\n"), line3])
+
+    return {
+        "ok": True, "factors": rows, "buy": buy, "sell": sell, "neutral": neu, "na": na, "total": total, "coverage": coverage,
+        "groups": groups, "edge": round(edge, 3), "side": side, "strength": strength,
+        "bank": {"label": bank_label, "buy": bb, "sell": bs, "neutral": bn_, "na": bna, "edge": bank_edge, "fund_vote": fund_vote, "fund_text": fund_txt,
+                 "rows": bank_lines, "leader": leader, "laggard": laggard, "bank_nifty_change": bn_chg, "nifty_change": nifty_chg,
+                 "news": bank_news},
+        "news": n50, "line1": line1, "line2": line2, "line3": line3, "one_line": one_line, "summary_text": summary_text,
+        "price": px, "atr": atr, "ts": time.time(),
+    }
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------
+# session history: trend of the counts + honest in-session track record
+# ----------------------------------------------------------------------------------------------------------------------------------
+HIST_MAX = 500
+
+
+def record(store, res, min_gap=60.0, now=None):
+    """store: a plain list (kept in st.session_state).  One entry per >= min_gap seconds."""
+    try:
+        if not res or not res.get("ok"):
+            return
+        t = time.time() if now is None else float(now)
+        if store and t - store[-1]["ts"] < min_gap:
+            return
+        store.append({"ts": t, "price": res.get("price"), "atr": res.get("atr"), "edge": res.get("edge"), "side": res.get("side"),
+                      "strength": res.get("strength"), "buy": res.get("buy"), "sell": res.get("sell"), "neutral": res.get("neutral")})
+        if len(store) > HIST_MAX:
+            del store[: len(store) - HIST_MAX]
+    except Exception:
+        logger.debug("consensus record failed", exc_info=True)
+
+
+def trend_note(store, res, minutes=10, now=None):
+    """'10 min pehle BUY 12 / SELL 15 -> ab BUY 18 / SELL 11' (None if there is no old enough entry)."""
+    try:
+        t = time.time() if now is None else float(now)
+        old = [e for e in (store or []) if t - e["ts"] >= minutes * 60 - 45]
+        if not old or not res or not res.get("ok"):
+            return None
+        e = old[-1]
+        if t - e["ts"] > 3 * 3600:
+            return None
+        mins = int(round((t - e["ts"]) / 60.0))
+        db, ds = res["buy"] - e["buy"], res["sell"] - e["sell"]
+        arrow = "BUY side badh rahi hai" if db - ds >= 2 else "SELL side badh rahi hai" if ds - db >= 2 else "lagbhag same"
+        return f"{mins} min pehle: BUY {e['buy']} / SELL {e['sell']} / NEUTRAL {e['neutral']}  →  ab: BUY {res['buy']} / SELL {res['sell']} / NEUTRAL {res['neutral']}  ({arrow})"
+    except Exception:
+        return None
+
+
+def track_record(store, horizon_min=15, min_edge=MODERATE_EDGE):
+    """Did a MODERATE/STRONG reading agree with where price was ~15 min later?  Session-only, small sample -- shown with its n."""
+    try:
+        h = horizon_min * 60.0
+        n = hits = 0
+        for i, e in enumerate(store or []):
+            if e.get("edge") is None or abs(e["edge"]) < min_edge or e.get("price") is None:
+                continue
+            later = next((x for x in store[i + 1:] if x["ts"] - e["ts"] >= h and x["ts"] - e["ts"] <= h + 600 and x.get("price") is not None), None)
+            if later is None:
+                continue
+            move = later["price"] - e["price"]
+            if abs(move) < 0.1 * (e.get("atr") or 15.0):
+                continue                                    # flat -> neither right nor wrong
+            n += 1
+            hits += 1 if (move > 0) == (e["edge"] > 0) else 0
+        return {"n": n, "hits": hits, "pct": (100.0 * hits / n) if n else None}
+    except Exception:
+        return {"n": 0, "hits": 0, "pct": None}
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------
+# streamlit rendering (st is passed in so this module stays import-light)
+# ----------------------------------------------------------------------------------------------------------------------------------
+def _names(rows, vote, limit=40):
+    out = [f"{r['name']}" + (f" ({r['detail']})" if r["detail"] and r["detail"] != "data nahi" else "") for r in rows if r["vote"] == vote]
+    return out[:limit]
+
+
+def render(st, res, hist=None):
+    """One always-visible line + one constant-label expander (constant label => it keeps its open/closed state across the 30 s refresh)."""
+    if not res:
+        return
+    if not res.get("ok"):
+        st.caption(res.get("one_line", ""))
+        return
+    side = res["side"]
+    box = st.success if side == "BUY" else st.error if side == "SELL" else st.info
+    box(res["one_line"])
+    with st.expander("🧮 Consensus Engine — poora detail (kaun-kaun se factor BUY / SELL / NEUTRAL)", expanded=False):
+        st.markdown(res["line1"])
+        st.markdown(res["line2"])
+        st.markdown(res["line3"])
+        tn = trend_note(hist, res) if hist is not None else None
+        if tn:
+            st.caption("⏱️ " + tn)
+        st.markdown("**Group-wise (kaun sa hissa kis taraf):**")
+        rows = []
+        for g, v in res["groups"].items():
+            e = v["edge"]
+            lean = "—" if e is None else ("🟢 BUY" if e >= 0.2 else "🔴 SELL" if e <= -0.2 else "⚪ mixed")
+            rows.append({"Group": g, "BUY": v["buy"], "SELL": v["sell"], "NEUTRAL": v["neutral"], "Lean": lean})
+        try:
+            import pandas as _pd
+            st.dataframe(_pd.DataFrame(rows), hide_index=True, width="stretch")
+        except Exception:
+            for r in rows:
+                st.write(r)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Agar abhi BUY lo to**")
+            st.markdown(f"✅ Saath ({res['buy']}): " + (" · ".join(_names(res['factors'], 1)) or "—"))
+            st.markdown(f"❌ Khilaf ({res['sell']}): " + (" · ".join(_names(res['factors'], -1)) or "—"))
+        with c2:
+            st.markdown("**Agar abhi SELL lo to**")
+            st.markdown(f"✅ Saath ({res['sell']}): " + (" · ".join(_names(res['factors'], -1)) or "—"))
+            st.markdown(f"❌ Khilaf ({res['buy']}): " + (" · ".join(_names(res['factors'], 1)) or "—"))
+        st.markdown(f"⚪ Neutral ({res['neutral']}): " + (" · ".join(_names(res['factors'], 0)) or "—"))
+        nas = [r["name"] for r in res["factors"] if r["vote"] is None]
+        if nas:
+            st.caption("⚫ Data nahi aaya (count mein nahi gine): " + ", ".join(nas))
+        bk = res["bank"]
+        st.markdown("**🏦 Bank detail**")
+        try:
+            import pandas as _pd
+            st.dataframe(_pd.DataFrame([{"Bank": b["bank"], "Aaj": "—" if b["change"] is None else f"{b['change']:+.2f}%",
+                                          "Fundamentals": b["fund"], "Kyun": b["notes"]} for b in bk["rows"]]), hide_index=True, width="stretch")
+        except Exception:
+            pass
+        if bk.get("news", {}).get("headlines"):
+            st.caption("Bank news: " + " | ".join(h[:80] for h in bk["news"]["headlines"][:3]))
+        if res["news"].get("headlines"):
+            st.caption("Nifty news: " + " | ".join(h[:80] for h in res["news"]["headlines"][:3]))
+        tr = track_record(hist) if hist is not None else None
+        if tr and tr["n"] >= 5:
+            st.caption(f"📈 Is session mein MODERATE/STRONG reading 15 min baad {tr['hits']}/{tr['n']} baar sahi rahi ({tr['pct']:.0f}%) — chhota sample, bharose se mat lo.")
+        elif tr is not None:
+            st.caption(f"📈 Track record abhi ban raha hai ({tr['n']} reading check hui) — 5+ ke baad % dikhega.")
+        st.caption("Ye data ka reading hai (kitne factor kis taraf) — future ki guarantee nahi. Winner raw count se nahi, group-balanced edge se chuna jata hai "
+                   "taaki RSI/MACD/EMA jaise ek hi baat bolne wale factor baaki sabko dabaa na dein.")
+# @@END consensus_engine

@@ -45,6 +45,7 @@ import risk_engine
 import multi_stock_engine
 import commodity_engine
 import global_research
+import consensus_engine
 from hybrid_ai_engine import HybridAIEngine
 from alert_manager import AlertManager
 import trade_notify
@@ -239,6 +240,9 @@ def _live_dashboard():
             st.success(f"{status_line} ✅ Data looks fresh")
         else:
             st.info(f"{status_line} — market band hai, ye last traded price hai, live tick nahi.")
+
+        # v60: CONSENSUS ENGINE line lives here (top of the page); it is filled further below, once every data source of this refresh exists.
+        _consensus_slot = st.container()
 
         # -------------------------------------------------------------
         # 🔊 REAL VOLUME (via near-month Nifty Futures contract)
@@ -1269,6 +1273,44 @@ def _live_dashboard():
             "ENTRY requires: at least one named strategy currently formed + AI Self-Learning\n"
             "research in the SAME direction. AI alone is research only; no strategy = no entry."
         )
+
+        # -------------------------------------------------------------
+        # 🧮 v60 CONSENSUS ENGINE -- counts every factor of this tool (+ bank block, bank fundamentals, news) as BUY / SELL / NEUTRAL and says which
+        # side is stronger.  Read-only: it never touches the trade decision, entry, SL or target.  A failure here only hides this one line.
+        # -------------------------------------------------------------
+        try:
+            _sp.step("Consensus engine")
+            _c_bank_fund, _c_bank_news, _c_nifty_news = consensus_engine.gather_outside(safe_io)
+            try:
+                _c_pcr_vel = pcr_velocity.bias()
+            except Exception:
+                _c_pcr_vel = None
+            try:
+                _c_n50_bias = multi_stock_engine.get_nifty50_fundamentals_bias(st.session_state.get("_nifty50_fund_cache")).get("label")
+            except Exception:
+                _c_n50_bias = None
+            _cons = consensus_engine.build(dict(
+                live_price=live_price, atr=ai_analysis['tech_metrics'].get('atr', 15.0), df=df,
+                live_poc=(float(df['POC_Level'].iloc[-1]) if 'POC_Level' in df.columns else None),
+                cpr_pos=cpr_pos, orb=orb, candle=candle_pattern, smc_event=smc_event, mtf=mtf_structure,
+                sr_context=sr_context, level_prediction=level_prediction, regime=regime,
+                current_pcr=current_pcr, oc=df_option_chain, oc_live=(oc_source == "LIVE"), max_pain=max_pain,
+                pcr_vel=_c_pcr_vel, fii_footprint=fii_footprint, iv_skew=iv_skew, live_vix=live_vix,
+                order_flow=order_flow_snapshot, adv=advances, dec=declines, adv50=adv50, dec50=dec50,
+                sector_breadth=sector_breadth, index_corr=index_correlation_data, nifty_change_pct=nifty_change_pct,
+                df_global=df_global_markets, global_research=global_research_snapshot, df_global_sent=df_global_sentiment,
+                nifty_news=_c_nifty_news, bank_news=_c_bank_news, bank_fund=_c_bank_fund, n50_fund_bias=_c_n50_bias,
+                df_full50=df_full50, df_heavy=df_heavyweights,
+                ai_analysis=ai_analysis, strategy_result=strategy_result, ml_results=ml_results,
+            ))
+            _cons_hist = st.session_state.setdefault("_consensus_hist", [])
+            consensus_engine.record(_cons_hist, _cons)
+            with _consensus_slot:
+                consensus_engine.render(st, _cons, _cons_hist)
+            if _cons.get("ok"):
+                st.session_state['dashboard_context']['Consensus Engine (factor count BUY/SELL/NEUTRAL, bank, news)'] = _cons.get("summary_text", "")
+        except Exception:
+            logger.exception("consensus engine failed (ignored)")
         # Show every named strategy separately so the user can see which setup
         # is active, its historical walk-forward statistics, and its current
         # score. Unknown history is shown as N/A rather than inventing a rate.
