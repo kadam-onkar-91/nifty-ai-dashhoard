@@ -92,7 +92,10 @@ def main() -> int:
     from playwright.sync_api import sync_playwright   # imported late so the helpers above can be tested without it
 
     wake_btn = re.compile(r"get this app back up", re.I)
-    bad_text = ("Connection error", "Disconnected", "Oh no.", "This app has gone to sleep")
+    # "Failed to fetch dynamically imported module" = the tab holds an OLD Streamlit page after the app was rebooted/redeployed (its JS files no
+    # longer exist on the server).  Only a fresh page load fixes it, so the robot must treat it as broken and reload.
+    bad_text = ("Connection error", "Disconnected", "Oh no.", "This app has gone to sleep",
+                "Failed to fetch dynamically imported module", "error loading module")
     with sync_playwright() as p:
         launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
         browser = p.chromium.launch(args=launch_args)
