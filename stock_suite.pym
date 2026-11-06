@@ -1,0 +1,2734 @@
+# stock_suite.pym -- the stock dashboard + robot watchlist modules (Phase 1-4), merged into ONE file.
+# Same bundle format as the other .pym files: each module sits between "# @@MODULE name" and "# @@END name".
+# Modules in this bundle: stock_universe, stock_store, stock_news, stock_peers, stock_family, stock_pipeline, stock_engine, stock_phase2_ui, stock_phase3_ui, stock_watchlist, stock_dashboard
+
+# @@MODULE stock_universe
+"""
+stock_universe.py -- the list of EVERY NSE-listed equity, plus fast search.
+
+Source order (first that works):
+  1. Upstox instrument master  (https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz)
+     -> every NSE equity: symbol, company name, ISIN, instrument_key, lot/tick size.  Cached on disk for 24 h.
+  2. Last good disk copy (even if older than 24 h).
+  3. Bundled fallback list (Nifty 50 + Next 50 + ~200 liquid names) so the picker is never empty.
+
+Nothing here touches Nifty-50 code.  Used by the sidebar "Select Your Stock" picker and by stock_pipeline.py.
+"""
+import gzip
+import io
+import json
+import os
+import re
+import tempfile
+import threading
+import time
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+UNIVERSE_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
+CACHE_PATH = os.path.join(tempfile.gettempdir(), "nse_stock_universe_v1.json")
+CACHE_TTL_S = 24 * 3600
+_LOCK = threading.Lock()
+_MEM = {"ts": 0.0, "data": None, "source": "none"}
+
+# Non-equity series that live in the same Upstox NSE file (bonds, G-secs, SGBs, T-bills, warrants, rights...).
+_SKIP_TYPES = {"GB", "GS", "SG", "TB", "N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "NA", "NB", "NC", "ND",
+               "NE", "NF", "NG", "NH", "NI", "NJ", "NK", "NL", "NM", "NN", "NO", "NP", "NQ", "NR", "NS", "NT", "NU",
+               "NV", "NW", "NX", "NY", "NZ", "W1", "WA", "IDX", "INDEX", "AUCTION"}
+
+_FALLBACK = """RELIANCE HDFCBANK ICICIBANK BHARTIARTL TCS INFY ITC LT SBIN AXISBANK KOTAKBANK HINDUNILVR BAJFINANCE M&M MARUTI
+SUNPHARMA HCLTECH WIPRO TITAN ULTRACEMCO ADANIENT ADANIPORTS NTPC POWERGRID ONGC COALINDIA TATASTEEL JSWSTEEL HINDALCO
+TMPV EICHERMOT HEROMOTOCO BAJAJ-AUTO ASIANPAINT NESTLEIND BRITANNIA CIPLA DRREDDY DIVISLAB APOLLOHOSP BEL HAL INDIGO TRENT
+ETERNAL JIOFIN SHRIRAMFIN BAJAJFINSV INDUSINDBK TECHM GRASIM TATACONSUM SBILIFE HDFCLIFE LTIM ADANIGREEN ADANIPOWER
+ADANIENSOL AMBUJACEM ABB ACC AUROPHARMA BANDHANBNK BANKBARODA BERGEPAINT BHEL BIOCON BOSCHLTD BPCL CANBK CHOLAFIN COLPAL
+CONCOR CUMMINSIND DABUR DLF DMART FEDERALBNK GAIL GODREJCP GODREJPROP HAVELLS ICICIGI ICICIPRULI IDFCFIRSTB IGL INDHOTEL
+INDUSTOWER IOC IRCTC IRFC JINDALSTEL JSWENERGY JUBLFOOD LICI LUPIN MARICO MAXHEALTH MOTHERSON MPHASIS MRF MUTHOOTFIN
+NAUKRI NHPC NMDC OBEROIRLTY OFSS PAGEIND PATANJALI PAYTM PERSISTENT PETRONET PFC PIDILITIND PIIND PNB POLICYBZR POLYCAB
+RECLTD SAIL SBICARD SIEMENS SRF TATACHEM TATACOMM TATAELXSI TATAPOWER TIINDIA TORNTPHARM TORNTPOWER TVSMOTOR UNIONBANK
+UNITDSPR UPL VBL VEDL VOLTAS YESBANK ZYDUSLIFE ASHOKLEY ASTRAL ATGL BALKRISIND BATAINDIA BHARATFORG BSE CDSL COFORGE
+CROMPTON DEEPAKNTR DIXON ESCORTS EXIDEIND FORTIS GLENMARK GMRAIRPORT GUJGASLTD HDFCAMC HINDPETRO HUDCO IDEA IEX INDIANB
+IPCALAB IREDA JKCEMENT KALYANKJIL KEI KPITTECH LAURUSLABS LICHSGFIN LODHA LTTS M&MFIN MANAPPURAM MFSL NATIONALUM NYKAA
+OIL PEL PHOENIXLTD PRESTIGE RAMCOCEM RBLBANK RVNL SJVN SOLARINDS SONACOMS SUPREMEIND SUZLON SYNGENE TATATECH TRIDENT
+UNOMINDA WAAREEENER ZEEL ANGELONE APLAPOLLO ABCAPITAL ALKEM AARTIIND ABFRL AIAENG AJANTPHARM APOLLOTYRE BANKINDIA
+BLUESTARCO BRIGADE CAMS CANFINHOME CASTROLIND CEATLTD COCHINSHIP CRISIL DELHIVERY EMAMILTD ENGINERSIN FACT FINCABLES
+FLUOROCHEM GICRE GILLETTE GLAXO GODREJIND GRANULES GSPL HAPPSTMNDS HONAUT IDBI INOXWIND IOB IRB ITI J&KBANK JBCHEPHARM
+JKTYRE JSL JUBLINGREA KANSAINER KARURVYSYA KFINTECH KIMS LALPATHLAB LATENTVIEW LAURUS LTF MAHABANK MAHSEAMLES MANKIND
+MAZDOCK MEDANTA METROPOLIS NAM-INDIA NATCOPHARM NAVINFLUOR NBCC NCC NLCINDIA OLECTRA PGHH PNBHOUSING POONAWALLA
+POWERINDIA PPLPHARMA PVRINOX RADICO RAILTEL RAINBOW RITES SAREGAMA SCHAEFFLER SHREECEM SHYAMMETL SONATSOFTW STARHEALTH
+SUNDARMFIN SUNDRMFAST SUNTV SUPRAJIT SWANENERGY TANLA TATAINVEST TEJASNET THERMAX TIMKEN TITAGARH TRITURBINE UCOBANK UTIAMC
+VGUARD VINATIORGA WELCORP WHIRLPOOL WOCKPHARMA YESBANK ZENSARTECH RPOWER JPPOWER HCC""".split()
+
+
+def clean_symbol(raw):
+    """'reliance', ' Reliance.NS ', 'NSE:RELIANCE', 'RELIANCE-EQ' -> 'RELIANCE'. Keeps '&' and '-' (M&M, BAJAJ-AUTO)."""
+    s = str(raw or "").strip().upper()
+    if not s:
+        return ""
+    s = s.split("|")[-1].split(":")[-1]
+    s = re.sub(r"\.(NS|NSE|BO|BSE)$", "", s)
+    if s.endswith("-EQ"):
+        s = s[:-3]
+    return s.strip()
+
+
+def _fallback_rows():
+    seen, rows = set(), []
+    for sym in _FALLBACK:
+        if sym not in seen:
+            seen.add(sym)
+            rows.append({"symbol": sym, "name": "", "isin": "", "instrument_key": "", "lot_size": 1, "tick_size": 0.05})
+    return rows
+
+
+def _download():
+    import pandas as pd
+    import requests
+    r = requests.get(UNIVERSE_URL, timeout=25)
+    r.raise_for_status()
+    raw = gzip.decompress(r.content) if r.content[:2] == b"\x1f\x8b" else r.content
+    d = pd.read_csv(io.BytesIO(raw))
+    cols = {c.lower(): c for c in d.columns}
+    if "tradingsymbol" not in cols or "instrument_key" not in cols:
+        raise ValueError("unexpected instrument master columns: %s" % list(d.columns)[:12])
+    key_col = cols["instrument_key"]
+    d = d[d[key_col].astype(str).str.startswith("NSE_EQ|")]
+    if "instrument_type" in cols:
+        t = d[cols["instrument_type"]].astype(str).str.upper()
+        d = d[~t.isin(_SKIP_TYPES)]
+    rows, seen = [], set()
+    for _, r_ in d.iterrows():
+        sym = str(r_[cols["tradingsymbol"]]).strip().upper()
+        if not sym or sym in seen:
+            continue
+        # skip bond / debenture style symbols such as '749GS2055' or '10.25NCD27'
+        if re.match(r"^\d", sym) and re.search(r"(GS|NCD|SG|TB)", sym):
+            continue
+        seen.add(sym)
+
+        def _g(name, default=""):
+            c = cols.get(name)
+            if c is None:
+                return default
+            v = r_[c]
+            return default if v is None or (isinstance(v, float) and v != v) else v
+        rows.append({
+            "symbol": sym, "name": str(_g("name")).strip(), "isin": str(_g("isin") or _g("isin_code")).strip(),
+            "instrument_key": str(r_[key_col]).strip(),
+            "lot_size": int(float(_g("lot_size", 1) or 1)), "tick_size": float(_g("tick_size", 0.05) or 0.05),
+        })
+    if len(rows) < 500:
+        raise ValueError("instrument master returned only %d equities" % len(rows))
+    rows.sort(key=lambda x: x["symbol"])
+    return rows
+
+
+def _read_disk():
+    try:
+        with open(CACHE_PATH, "r", encoding="utf-8") as fh:
+            j = json.load(fh)
+        return float(j.get("ts", 0)), j.get("rows") or []
+    except Exception:
+        return 0.0, []
+
+
+def _write_disk(rows):
+    try:
+        tmp = CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"ts": time.time(), "rows": rows}, fh)
+        os.replace(tmp, CACHE_PATH)
+    except Exception:
+        logger.exception("could not write stock universe cache (ignored)")
+
+
+def load_universe(force=False):
+    """List of dicts {symbol, name, isin, instrument_key, lot_size, tick_size}.  Never raises, never empty."""
+    now = time.time()
+    with _LOCK:
+        if not force and _MEM["data"] and now - _MEM["ts"] < CACHE_TTL_S:
+            return _MEM["data"]
+        disk_ts, disk_rows = _read_disk()
+        if not force and disk_rows and now - disk_ts < CACHE_TTL_S:
+            _MEM.update(ts=disk_ts, data=disk_rows, source="disk cache")
+            return disk_rows
+        try:
+            rows = _download()
+            _write_disk(rows)
+            _MEM.update(ts=now, data=rows, source="Upstox instrument master (live)")
+            return rows
+        except Exception:
+            logger.exception("Upstox instrument master unavailable -- using older copy / fallback list")
+        if disk_rows:
+            _MEM.update(ts=now - CACHE_TTL_S + 600, data=disk_rows, source="older disk cache")
+            return disk_rows
+        rows = _fallback_rows()
+        _MEM.update(ts=now - CACHE_TTL_S + 300, data=rows, source="bundled fallback list")      # retry download in 5 min
+        return rows
+
+
+def universe_source():
+    return _MEM.get("source", "none")
+
+
+def _index():
+    rows = load_universe()
+    if _MEM.get("_idx_for") is not rows:
+        _MEM["_idx"] = {r["symbol"]: r for r in rows}
+        _MEM["_idx_for"] = rows
+    return _MEM["_idx"]
+
+
+def resolve(raw):
+    """Symbol typed/selected by the user -> dict(symbol, name, isin, instrument_key, lot_size, tick_size, known).
+    Unknown-but-plausible symbols are still returned (known=False) so any NSE ticker can be tried."""
+    sym = clean_symbol(raw)
+    if not sym:
+        return {}
+    hit = _index().get(sym)
+    if hit:
+        return dict(hit, known=True)
+    # forgiving match: ignore '&' and '-' ("MM" -> M&M, "BAJAJAUTO" -> BAJAJ-AUTO)
+    flat = re.sub(r"[&\-]", "", sym)
+    for s, r in _index().items():
+        if re.sub(r"[&\-]", "", s) == flat:
+            return dict(r, known=True)
+    return {"symbol": sym, "name": "", "isin": "", "instrument_key": "", "lot_size": 1, "tick_size": 0.05, "known": False}
+
+
+def search(query, limit=40):
+    """Symbol-prefix matches first, then symbol-contains, then company-name matches."""
+    q = str(query or "").strip().upper()
+    rows = load_universe()
+    if not q:
+        return rows[:limit]
+    flat_q = re.sub(r"[&\-\s]", "", q)
+    pre, mid, nm = [], [], []
+    for r in rows:
+        s = r["symbol"]
+        n = (r.get("name") or "").upper()
+        fs = re.sub(r"[&\-]", "", s)
+        if s.startswith(q) or fs.startswith(flat_q):
+            pre.append(r)
+        elif q in s or flat_q in fs:
+            mid.append(r)
+        elif q in n:
+            nm.append(r)
+    return (pre + mid + nm)[:limit]
+
+
+def option_labels():
+    """('RELIANCE — RELIANCE INDUSTRIES LIMITED', 'RELIANCE') pairs for the searchable dropdown (type-to-search)."""
+    out = []
+    for r in load_universe():
+        n = (r.get("name") or "").strip()
+        out.append((f"{r['symbol']} — {n}" if n else r["symbol"], r["symbol"]))
+    return out
+
+
+def count():
+    return len(load_universe())
+# @@END stock_universe
+
+# @@MODULE stock_store
+"""
+stock_store.py -- keeps a stock's trade history alive across Streamlit restarts (the local SQLite file of a free Streamlit Cloud app is wiped).
+
+The family's own SQLite (stock_data/<SYMBOL>/learning.db) is the working store.  This module mirrors its trades to the Supabase table
+`stock_ai_setups` (already in schema.sql, `symbol` column; Nifty's `ai_trade_setups` is never touched) and restores them when the local file
+is empty.  Best-effort and rate-limited: any failure is logged and ignored -- trading/learning never depends on it.
+"""
+import sqlite3
+import time
+import threading
+
+import requests
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+TABLE = "stock_ai_setups"
+_LAST = {}
+_LOCK = threading.Lock()
+
+
+def _cfg():
+    try:
+        import trade_learning as nifty_tl            # only reads the connection settings the app already configured
+        if nifty_tl._supabase_url and nifty_tl._supabase_key:
+            h = {"apikey": nifty_tl._supabase_key, "Authorization": f"Bearer {nifty_tl._supabase_key}", "Content-Type": "application/json"}
+            return nifty_tl._supabase_url.rstrip("/") + "/rest/v1/" + TABLE, h
+    except Exception:
+        pass
+    return None, None
+
+
+def _local_rows(fam):
+    conn = sqlite3.connect(fam.mods["trade_learning"].DB_NAME)
+    try:
+        cur = conn.execute("SELECT timestamp, direction, underlying_entry, stop_loss, target, confidence_pct, factors_json, status, exit_price, "
+                           "exit_timestamp FROM ai_trade_setups ORDER BY id ASC")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def restore(fam):
+    """Local DB empty (fresh container) -> load this symbol's trades back from Supabase."""
+    url, hdr = _cfg()
+    if not url:
+        return 0
+    if _local_rows(fam):
+        return 0
+    r = requests.get(f"{url}?symbol=eq.{fam.symbol}&order=id.asc&limit=2000", headers=hdr, timeout=8)
+    r.raise_for_status()
+    rows = r.json() or []
+    conn = sqlite3.connect(fam.mods["trade_learning"].DB_NAME)
+    try:
+        for x in rows:
+            conn.execute("INSERT INTO ai_trade_setups (timestamp, direction, strike, option_type, underlying_entry, stop_loss, target, "
+                         "confidence_pct, factors_json, status, exit_price, exit_timestamp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (x.get("timestamp"), x.get("direction"), 0, "EQ", x.get("entry"), x.get("stop_loss"), x.get("target"),
+                          x.get("confidence_pct"), x.get("factors_json"), x.get("status") or "OPEN", x.get("exit_price"),
+                          x.get("exit_timestamp")))
+        conn.commit()
+    finally:
+        conn.close()
+    return len(rows)
+
+
+def mirror(fam, min_gap=20.0):
+    """Push new trades / status changes (OPEN -> WIN/LOSS/EXPIRED) of this stock to Supabase."""
+    url, hdr = _cfg()
+    if not url:
+        return 0
+    with _LOCK:
+        if time.time() - _LAST.get(fam.symbol, 0.0) < min_gap:
+            return 0
+        _LAST[fam.symbol] = time.time()
+    local = _local_rows(fam)
+    if not local:
+        return 0
+    r = requests.get(f"{url}?symbol=eq.{fam.symbol}&select=id,timestamp,direction,status&limit=3000", headers=hdr, timeout=8)
+    r.raise_for_status()
+    remote = {(x["timestamp"], x["direction"]): x for x in (r.json() or [])}
+    n = 0
+    for ts, d, entry, sl, tgt, conf, fj, st, xp, xts in local:
+        row = {"symbol": fam.symbol, "timestamp": ts, "direction": d, "entry": entry, "stop_loss": sl, "target": tgt,
+               "confidence_pct": conf, "factors_json": fj, "status": st, "exit_price": xp, "exit_timestamp": xts}
+        hit = remote.get((ts, d))
+        if hit is None:
+            requests.post(url, headers=hdr, json=row, timeout=8).raise_for_status()
+            n += 1
+        elif hit.get("status") != st:
+            requests.patch(f"{url}?id=eq.{hit['id']}", headers=hdr, json={"status": st, "exit_price": xp, "exit_timestamp": xts},
+                           timeout=8).raise_for_status()
+            n += 1
+    return n
+
+
+def safe_mirror(fam):
+    try:
+        return mirror(fam)
+    except Exception:
+        logger.exception("stock mirror failed (ignored)")
+        return 0
+# @@END stock_store
+
+# @@MODULE stock_news
+"""
+stock_news.py -- news sentiment of ONE stock's headlines (same word-boundary reader the Consensus Engine uses for Nifty news).
+Phase 2: label for the AI decision engine.  Phase 3.5 adds the headline table / consensus 'News vote' on top of the same function.
+"""
+import consensus_engine
+
+
+def news_sentiment(news_rows):
+    """-> {label BULLISH|BEARISH|NEUTRAL|UNAVAILABLE, pos, neg, n, headline, headlines}.  Missing news = UNAVAILABLE (no vote), never invented."""
+    titles = [str((r or {}).get("title", "")) for r in (news_rows or [])]
+    try:
+        return consensus_engine.news_score(titles)
+    except Exception:
+        return {"label": "UNAVAILABLE", "pos": 0, "neg": 0, "n": 0, "headline": "", "headlines": []}
+
+
+def news_sentiment_label(news_rows):
+    return news_sentiment(news_rows).get("label")
+# @@END stock_news
+
+# @@MODULE stock_peers
+"""
+stock_peers.py -- PHASE 3.3: peer-stocks breadth, the stock version of Nifty's "Internal Breadth & Heavyweights".
+
+Peers = the Nifty-50 heavyweights of the same sector (data_feeds.SECTOR_MAP) -- real liquid stocks with Upstox instrument keys.  ONE batched
+Upstox market-quote call for all peers (<= 50 keys), cached 120 s per stock.  advances + declines + unchanged == peers fetched, always.
+Nothing is invented: no login / no quote -> status UNAVAILABLE and an empty table.
+"""
+import time
+import threading
+
+import pandas as pd
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+_CACHE = {}
+_LOCK = threading.Lock()
+TTL = 120
+UNCH_BAND = 0.05      # |change| <= 0.05 % counts as unchanged
+
+# Yahoo/Upstox style sector or industry words -> SECTOR_MAP group (first match wins, lower-case substring)
+_KEYWORDS = (("bank", "Banking"), ("financial", "Financial Services (NBFC/Insurance)"), ("insurance", "Financial Services (NBFC/Insurance)"),
+             ("technology", "IT"), ("software", "IT"), ("information", "IT"), ("oil", "Energy / Oil & Gas"), ("energy", "Energy / Oil & Gas"),
+             ("gas", "Energy / Oil & Gas"), ("coal", "Energy / Oil & Gas"), ("telecom", "Telecom"), ("communication", "Telecom"),
+             ("consumer defensive", "FMCG"), ("fmcg", "FMCG"), ("food", "FMCG"), ("infra", "Infra / Capital Goods / Power"),
+             ("industrial", "Infra / Capital Goods / Power"), ("utilit", "Infra / Capital Goods / Power"), ("power", "Infra / Capital Goods / Power"))
+
+
+def _groups():
+    import data_feeds
+    return data_feeds.SECTOR_MAP
+
+
+def sector_group(symbol, sector_label):
+    sm = _groups()
+    if symbol in sm:
+        return sm[symbol]
+    low = str(sector_label or "").lower()
+    for kw, grp in _KEYWORDS:
+        if kw in low:
+            return grp
+    for grp in set(sm.values()):                     # exact / partial match on the group name itself (Auto, Pharma, Metals ...)
+        if low and (low in grp.lower() or grp.lower() in low):
+            return grp
+    return None
+
+
+def peers_for(symbol, sector_label, limit=14):
+    grp = sector_group(symbol, sector_label)
+    if not grp:
+        return grp, []
+    return grp, [s for s, g in _groups().items() if g == grp and s != symbol][:limit]
+
+
+def fetch(symbol, sector_label, token, signal_dir=None, own_change_pct=None):
+    """-> {'status','group','rows'[{Symbol,LTP,Change %}],'adv','dec','unch','fetched','avg_change','leaders','laggards','warning'}"""
+    key = (symbol, signal_dir)
+    with _LOCK:
+        hit = _CACHE.get(key)
+        if hit and time.time() - hit[0] < TTL:
+            return hit[1]
+    out = {"status": "UNAVAILABLE", "group": None, "rows": [], "adv": 0, "dec": 0, "unch": 0, "fetched": 0, "avg_change": None,
+           "leaders": [], "laggards": [], "warning": None, "reason": ""}
+    try:
+        grp, peers = peers_for(symbol, sector_label)
+        out["group"] = grp
+        if not peers:
+            out["reason"] = "Is stock ke sector ka koi mapped Nifty-50 peer nahi mila."
+            return out
+        if not token:
+            out["reason"] = "Upstox login nahi -- peers ka live quote nahi aa sakta."
+            return out
+        import stock_universe, multi_stock_engine as multi_asset
+        keys, names = [], {}
+        for p in peers:
+            m = stock_universe.resolve(p)
+            if m and m.get("instrument_key"):
+                keys.append(m["instrument_key"]); names[m["instrument_key"].split("|")[-1]] = p
+        data = multi_asset._upstox_json("https://api.upstox.com/v2/market-quote/quotes", token,
+                                        params={"instrument_key": ",".join(keys[:50])}, timeout=8) if keys else None
+        if not data:
+            out["reason"] = "Upstox quote nahi mila."
+            return out
+        rows = []
+        for k, q in (data.get("data") or {}).items():
+            last, prev = q.get("last_price"), (q.get("ohlc") or {}).get("close")
+            try:
+                last, prev = float(last), float(prev)
+                if prev <= 0:
+                    continue
+            except Exception:
+                continue
+            sym = q.get("symbol") or k.split(":")[-1]
+            rows.append({"Symbol": sym, "LTP": round(last, 2), "Change %": round((last / prev - 1) * 100, 2)})
+        if not rows:
+            out["reason"] = "Peers ke prices valid nahi aaye."
+            return out
+        df = pd.DataFrame(rows).sort_values("Change %", ascending=False)
+        out["rows"] = df.to_dict("records")
+        out["adv"] = int((df["Change %"] > UNCH_BAND).sum()); out["dec"] = int((df["Change %"] < -UNCH_BAND).sum())
+        out["unch"] = int(len(df) - out["adv"] - out["dec"]); out["fetched"] = int(len(df))
+        out["avg_change"] = round(float(df["Change %"].mean()), 2)
+        out["leaders"], out["laggards"] = out["rows"][:3], out["rows"][-3:][::-1]
+        out["status"] = "AVAILABLE"
+        if signal_dir == "BUY" and out["avg_change"] <= -0.25 and out["dec"] > out["adv"]:
+            out["warning"] = "FAKE BREAKOUT WARNING: stock BUY signal de raha hai par sector peers girte hue hain."
+        elif signal_dir == "SELL" and out["avg_change"] >= 0.25 and out["adv"] > out["dec"]:
+            out["warning"] = "FAKE BREAKDOWN WARNING: stock SELL signal de raha hai par sector peers badhte hue hain."
+        return out
+    except Exception:
+        logger.exception("peers fetch failed (ignored)")
+        out["reason"] = "Peers engine error (ignored)."
+        return out
+    finally:
+        with _LOCK:
+            _CACHE[key] = (time.time(), out)
+# @@END stock_peers
+
+# @@MODULE stock_family
+"""
+stock_family.py -- PHASE 2/3: a PRIVATE copy of the Nifty engines for ONE stock.
+
+WHY A COPY (and not "same module + a symbol argument")
+  The Nifty engines (strategy_engine, ai_trade_decision, trade_learning, shadow_trades, gate_log, market_brain ...) keep their state in module
+  globals and write to ONE database file.  Re-using the very same module objects for a stock would (a) mix the stock's trades/learning/caches
+  with Nifty's and with other stocks, and (b) force edits inside Nifty's code.  Instead every stock gets its own module objects, built from the
+  SAME bundle source, in a private namespace:
+      * Nifty modules are never touched (they stay exactly as they are -- same file, same globals, same database).
+      * the stock's trades, learning, shadow trades, gate log, market memory, walk-forward cache and ML cache live in
+        stock_data/<SYMBOL>/ and are visible only to that stock.
+      * a handful of Nifty-point constants (28-pt max stop, 20-pt base stop, 2-pt costs, 12..140-pt OI-wall window, 20-pt walk-forward stop,
+        option strike / CE-PE) are re-expressed in the stock's price / ATR -- only inside the copy.
+
+HOW
+  exec() of the module's bundle source with a private __import__: when a module in the family does `import trade_learning` it receives the
+  family's trade_learning, not Nifty's.  Everything else (pandas, requests, safe_io, gemini_pool ...) is the normal shared module.
+"""
+import builtins
+import os
+import re
+import sqlite3
+import threading
+import types
+
+import bundle_loader  # noqa: F401  (fills bundle_loader._INDEX)
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+FAMILY = ("edge_model", "learner_nn", "entry_quality", "trade_learning", "shadow_trades", "gate_log", "trade_diagnostics",
+          "trade_postmortem", "market_memory", "market_adaptive", "market_autopsy", "market_learner", "market_brain",
+          "strategy_engine", "ml_engine", "ai_trade_decision")
+ROOT = os.environ.get("STOCK_DATA_DIR", "stock_data")
+_FAMS = {}
+_LOCK = threading.RLock()
+
+
+def safe_name(symbol):
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(symbol or "").upper()).strip("_") or "UNKNOWN"
+
+
+def _source(name):
+    path, start, end = bundle_loader._INDEX[name]
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        lines = fh.read().split("\n")
+    return "\n" * start + "\n".join(lines[start:end]) + "\n"
+
+
+# ---- text patches applied ONLY to the stock's copy (Nifty source is never edited) -------------------------------------------------------
+def _patch(name, src, symbol, misses):
+    def sub(old, new, count=0, regex=False):
+        nonlocal src
+        hit = bool(re.search(old, src)) if regex else (old in src)
+        if not hit:
+            misses.append(f"{name}: pattern not found: {old[:60]}")
+            return
+        src = re.sub(old, new, src) if regex else src.replace(old, new)
+
+    if name == "ai_trade_decision":
+        sub("sl_distance = min(28.0, max(20.0, round(0.9 * float(atr), 1))) if atr else 20.0",
+            "sl_distance = min(MAX_SL_PTS, max(MIN_SL_PTS, round(0.9 * float(atr), 4))) if atr else MIN_SL_PTS")
+        sub(r"sl_distance = 20\.0", "sl_distance = MIN_SL_PTS", regex=True)
+        sub("round(_d_edge + 0.25 * float(atr), 1)", "round(_d_edge + 0.25 * float(atr), 4)")
+        sub("min_pts=12.0, max_pts=140.0", "min_pts=None, max_pts=None")
+        sub("strike = _round_to_strike(live_price)", "strike = round(float(live_price), 2)")
+        sub('option_type = "CE" if direction == "BUY" else "PE"', 'option_type = "EQ"')
+        sub("intraday NIFTY trading system", f"intraday NSE cash-equity (MIS) trading system for the stock {symbol} (shares, not options)")
+        sub("fresh NIFTY news", f"fresh news about {symbol} and its sector")
+        sub("Nifty Spot Price", "Stock Spot Price")
+        sub("RAW Full NIFTY 50 Breadth/Stock Data", "RAW Sector Peers Breadth/Stock Data")
+    if name == "market_brain":
+        sub('"_mb_cache"', f'"_mb_cache_{symbol}"')          # one cache per stock inside st.session_state
+    return src
+
+
+def _load(fam, name):
+    mod = types.ModuleType(name)
+    mod.__file__ = bundle_loader._INDEX[name][0]
+    fam.mods[name] = mod                                   # registered BEFORE exec -> circular imports are safe
+    bi = dict(builtins.__dict__)
+    real_import = builtins.__import__
+
+    def _imp(n, globals=None, locals=None, fromlist=(), level=0):
+        if level == 0 and n in FAMILY:
+            return fam.get(n)
+        return real_import(n, globals, locals, fromlist, level)
+
+    bi["__import__"] = _imp
+    mod.__dict__["__builtins__"] = bi
+    src = _patch(name, _source(name), fam.symbol, fam.misses)
+    exec(compile(src, f"{mod.__file__}[{fam.symbol}]", "exec"), mod.__dict__)
+    return mod
+
+
+class Family:
+    """The stock's private engines.  Attribute access: fam.trade_learning, fam.strategy_engine, fam.ai_trade_decision ..."""
+
+    def __init__(self, symbol):
+        self.symbol = safe_name(symbol)
+        self.dir = os.path.join(ROOT, self.symbol)
+        os.makedirs(self.dir, exist_ok=True)
+        self.mods, self.misses = {}, []
+        self.lock = threading.RLock()
+        for n in FAMILY:
+            self.get(n)
+        self._wire()
+
+    def get(self, name):
+        with _LOCK:
+            if name in self.mods:
+                return self.mods[name]
+            return _load(self, name)
+
+    def __getattr__(self, name):
+        if name in FAMILY:
+            return self.get(name)
+        raise AttributeError(name)
+
+    # ---- storage isolation -----------------------------------------------------------------------------------------------------
+    def _wire(self):
+        tl = self.mods["trade_learning"]
+        tl.DB_NAME = os.path.join(self.dir, "learning.db")      # shadow_trades / market_memory / postmortem read tl.DB_NAME too
+        tl._supabase_url = tl._supabase_key = None              # the copy uses its own local DB; Supabase mirror is stock_store.py
+        try:
+            tl.init_db()
+        except Exception:
+            logger.exception("stock trade_learning init failed (%s)", self.symbol)
+        self.mods["gate_log"].DB_PATH = os.path.join(self.dir, "gate_log.db")
+        atd = self.mods["ai_trade_decision"]
+        orig = atd._oi_walls
+
+        def _walls(raw, lp, direction, min_pts=None, max_pts=None):
+            return orig(raw, lp, direction, atd.WALL_MIN_PTS if min_pts is None else min_pts,
+                        atd.WALL_MAX_PTS if max_pts is None else max_pts)
+        atd._oi_walls = _walls
+        self.scale(100.0, 1.0)
+        try:
+            from stock_store import restore
+            restore(self)
+        except Exception:
+            logger.exception("stock restore failed (ignored)")
+
+    def scale(self, price, atr):
+        """Re-express the Nifty point constants in this stock's price/ATR (called before every run).  Nifty ratios kept: base stop ~1.3 ATR,
+        ceiling ~1.9 ATR, OI walls 0.8..9 ATR, round-trip cost ~0.05 % of price; never below 0.25 % of price (the plan's floor)."""
+        try:
+            price, atr = float(price), float(atr)
+        except Exception:
+            return
+        if price <= 0:
+            return
+        atr = atr if atr > 0 else price * 0.003
+        floor = price * 0.0025
+        lo = max(1.3 * atr, floor)
+        hi = max(1.9 * atr, lo * 1.4)
+        atd = self.mods["ai_trade_decision"]
+        atd.MIN_SL_PTS, atd.MAX_SL_PTS = round(lo, 4), round(hi, 4)
+        atd.ROUND_TRIP_COST_PTS = round(price * 0.0005, 4)
+        atd.WALL_MIN_PTS, atd.WALL_MAX_PTS = round(0.8 * atr, 4), round(9.0 * atr, 4)
+        self.mods["strategy_engine"].WF_SL_POINTS = round(lo, 4)
+        self.sl_min, self.sl_max = atd.MIN_SL_PTS, atd.MAX_SL_PTS
+
+
+def get_family(symbol):
+    key = safe_name(symbol)
+    with _LOCK:
+        fam = _FAMS.get(key)
+        if fam is None:
+            fam = _FAMS[key] = Family(key)
+            if fam.misses:
+                logger.warning("stock family %s: %s", key, "; ".join(fam.misses))
+        return fam
+
+
+def loaded_symbols():
+    return sorted(_FAMS)
+# @@END stock_family
+
+# @@MODULE stock_pipeline
+"""
+stock_pipeline.py -- runs the SAME research engines the Nifty 50 dashboard runs, but on ONE selected stock's own data.
+
+PHASE 1 (this file): data + Support/Resistance + Early Warning + Regime/CPR/Liquidity + SMC/ICT + Order flow (VWAP/POC/depth)
+                     + Option chain (when the stock has F&O) + Sniper + Multi-timeframe + Position/Risk + News/Fundamentals.
+PHASE 2 (next):      Named Strategy Library (40 strategies) -> Consensus engine -> AI Trade Decision engine (self-learning) -> Gemini approval.
+PHASE 3 (after):     Market Brain / learning loop / shadow trades / post-mortem / per-stock Supabase storage / breadth / alerts.
+
+Every engine is the existing Nifty engine, imported unchanged; only its inputs are the stock's.  Price-scale dependent pieces
+(round-number ladder step, round-number confluence) are scaled to the stock's price.  Anything a stock does not have (e.g. an option
+chain for a non-F&O stock) is returned as UNAVAILABLE and shown honestly empty -- nothing is borrowed from Nifty or invented.
+"""
+import bundle_loader  # noqa: F401  (registers the bundled modules)
+import math
+import time
+import threading
+
+import numpy as np
+import pandas as pd
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+import safe_io
+import smart_money
+import support_resistance
+import market_regime
+import cpr_pivot
+import liquidity_engine
+import sniper_setup
+import position_sizing
+import risk_engine
+import backtest_engine
+import monte_carlo
+import drift_detection
+import database
+import market_data
+import market_status
+import multi_stock_engine as mse
+import stock_universe
+
+PIPELINE_VERSION = "stock-phase1-v1"
+_SLOW = {}                      # (symbol, kind) -> (ts, value)   slow, rarely-changing sources (news / fundamentals / sector)
+_SLOW_LOCK = threading.Lock()
+
+
+# ----------------------------------------------------------------------------------------------------------- helpers
+def nice_step(price):
+    """Ladder step for a price: about 0.4% of price, rounded to a 'nice' rupee number (Nifty 24,600 -> ~100; Rs 400 stock -> 2; Rs 2,900 -> 10)."""
+    try:
+        target = max(float(price), 1.0) * 0.004
+    except Exception:
+        return 1.0
+    nice = [0.05, 0.1, 0.25, 0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000]
+    return float(min(nice, key=lambda n: abs(math.log(n / target))))
+
+
+def _slow(symbol, kind, ttl, fn, default=None):
+    now = time.time()
+    k = (symbol, kind)
+    with _SLOW_LOCK:
+        hit = _SLOW.get(k)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    try:
+        val = safe_io.guarded(f"stk_{kind}_{symbol}", fn, timeout=12, default=default)
+    except Exception:
+        logger.exception("slow source %s failed", kind)
+        val = default
+    if val is not None and val is not default:        # never cache a timeout/default placeholder
+        with _SLOW_LOCK:
+            _SLOW[k] = (now, val)
+    return val
+
+
+def session_vwap(df):
+    """VWAP that restarts every trading day (equities have real volume).  Falls back to a 14-bar typical-price mean when volume is zero."""
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    v = df["Volume"].astype(float)
+    if v.sum() <= 0:
+        return tp.rolling(14, min_periods=1).mean(), False
+    day = pd.Series(df.index.date, index=df.index)
+    pv = (tp * v).groupby(day).cumsum()
+    vv = v.groupby(day).cumsum().replace(0, np.nan)
+    return (pv / vv).fillna(df["Close"]), True
+
+
+def volume_poc(df):
+    """Point of control: price bin (50 bins over the loaded history, same method as the Nifty dashboard) with the most traded volume."""
+    try:
+        if df["Volume"].sum() > 0:
+            vp = df[["Close", "Volume"]].dropna().copy()
+            vp["bin"] = pd.cut(vp["Close"], bins=50)
+            g = vp.groupby("bin", observed=False)["Volume"].sum()
+            return float(g.idxmax().mid)
+        step = nice_step(df["Close"].iloc[-1]) / 2
+        return float(((df["Close"] / step).round() * step).mode().iloc[0])
+    except Exception:
+        return float(df["Close"].iloc[-1])
+
+
+def _fetch_candles(meta, token):
+    """5-min candles: Upstox first (cached / 429-tolerant, same fetcher the Nifty dashboard uses), Yahoo as a labelled fallback."""
+    sym, key = meta["symbol"], meta.get("instrument_key") or ""
+    df, src = None, "UNAVAILABLE"
+    if token and key:
+        try:
+            df = market_data.fetch_candles_for_timeframe(token, "minutes", "5", days_back=8, instrument_key=key)
+        except Exception:
+            logger.exception("Upstox candles failed for %s", sym)
+            df = None
+        if df is not None and not df.empty:
+            src = "UPSTOX_LIVE"
+    if df is None or df.empty:
+        y = mse._yf_candles(sym + ".NS", period="8d", interval="5m")
+        if y is not None and not y.empty:
+            df, src = y, "YAHOO_FALLBACK_NON_TRADABLE"
+    if df is None or df.empty:
+        return None, "UNAVAILABLE"
+    df = mse._prepare(df)
+    return df, src
+
+
+def _ltp(meta, token):
+    key = meta.get("instrument_key")
+    if not (token and key):
+        return None
+    try:
+        return market_data._fetch_upstox_ltp(token, key)
+    except Exception:
+        return None
+
+
+def max_pain_from_rows(rows):
+    """Max-pain strike from the strikes we have (the 17 nearest ATM -- labelled as such in the UI)."""
+    try:
+        strikes = [(float(r["Strike"]), float(r.get("CE OI") or 0), float(r.get("PE OI") or 0)) for r in rows]
+        if len(strikes) < 3 or sum(c + p for _, c, p in strikes) <= 0:
+            return 0.0
+        best, best_pain = None, None
+        for k, _, _ in strikes:
+            pain = sum(c * max(0.0, k - s) + p * max(0.0, s - k) for s, c, p in strikes)
+            if best_pain is None or pain < best_pain:
+                best, best_pain = k, pain
+        return float(best or 0.0)
+    except Exception:
+        return 0.0
+
+
+def pcr_from_rows(rows):
+    try:
+        ce = sum(float(r.get("CE OI") or 0) for r in rows)
+        pe = sum(float(r.get("PE OI") or 0) for r in rows)
+        return round(pe / ce, 2) if ce > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def iv_skew_from_rows(rows, spot):
+    """Same idea as option_chain.calculate_iv_skew: put IV two strikes below ATM vs call IV two strikes above."""
+    try:
+        r = sorted(rows, key=lambda x: float(x["Strike"]))
+        if len(r) < 5:
+            return None
+        i = min(range(len(r)), key=lambda j: abs(float(r[j]["Strike"]) - spot))
+        d, u = r[max(i - 2, 0)], r[min(i + 2, len(r) - 1)]
+        div, uiv = d.get("PE IV"), u.get("CE IV")
+        if div in (None, 0) or uiv in (None, 0):
+            return None
+        div, uiv = float(div), float(uiv)
+        skew = round(div - uiv, 2)
+        read = ("Puts richer than calls -- downside protection being bought (fear)" if skew > 2 else
+                "Calls richer than puts -- upside chase / call buying" if skew < -2 else "Balanced IV skew")
+        return {"downside_strike": float(d["Strike"]), "downside_iv": round(div, 2), "upside_strike": float(u["Strike"]),
+                "upside_iv": round(uiv, 2), "skew": skew, "read": read}
+    except Exception:
+        return None
+
+
+def atm_iv_from_rows(rows, spot):
+    try:
+        r = min(rows, key=lambda x: abs(float(x["Strike"]) - spot))
+        vals = [float(v) for v in (r.get("CE IV"), r.get("PE IV")) if v not in (None, 0)]
+        return round(sum(vals) / len(vals), 2) if vals else None
+    except Exception:
+        return None
+
+
+def order_flow_from_quote(q):
+    if not q or q.get("status") != "AVAILABLE":
+        return {"status": "UNAVAILABLE", "reason": "No live depth for this stock (needs Upstox login + resolvable NSE instrument)."}
+    try:
+        bb, ba = q.get("best_bid"), q.get("best_ask")
+        return {"status": "OK", "pressure": q["pressure"], "imbalance_pct": q.get("imbalance_pct") or 0.0,
+                "total_buy_qty": int(q.get("total_buy_qty") or 0), "total_sell_qty": int(q.get("total_sell_qty") or 0),
+                "best_bid": bb, "best_ask": ba, "spread": round(float(ba) - float(bb), 2) if bb and ba else None}
+    except Exception:
+        return {"status": "UNAVAILABLE", "reason": "Depth reply could not be parsed."}
+
+
+def build_mtf(token, meta, df):
+    """Real per-timeframe candles of THIS stock from Upstox (same engine as Nifty's Phase-4 table); candle-resample fallback if no login."""
+    key = meta.get("instrument_key")
+    if token and key:
+        try:
+            import multi_timeframe
+            import smart_money as sm
+            res, h1 = {}, None
+            for label, unit, interval, days in multi_timeframe.TIMEFRAMES:
+                d = multi_timeframe._resample_to_4h(h1) if label == "4H" else market_data.fetch_candles_for_timeframe(
+                    token, unit, interval, days, instrument_key=key)
+                if label == "1H":
+                    h1 = d
+                if d is None or d.empty or len(d) < 25:
+                    res[label] = {"status": "DATA_UNAVAILABLE"}
+                    continue
+                st_ = sm.detect_market_structure(d)
+                res[label] = {"status": "OK", "trend": multi_timeframe._classify_trend(d),
+                              "structure_event": st_[0]["Market Event"] if st_ else "Unknown",
+                              "last_close": round(float(d["Close"].iloc[-1]), 2), "candle_count": len(d)}
+            ok = {k: v for k, v in res.items() if v.get("status") == "OK"}
+            if ok:
+                def _bias(labels):
+                    t = [ok[x]["trend"] for x in labels if x in ok]
+                    b, s = sum("Bullish" in str(x) for x in t), sum("Bearish" in str(x) for x in t)
+                    return None if not t else ("Bullish" if b > s else "Bearish" if s > b else "Mixed/Neutral")
+                h, l = _bias(["1D", "4H", "1H"]), _bias(["30M", "15M", "5M"])
+                if h and l:
+                    cls = (f"HTF {h}, LTF {l} -- fully aligned" if h == l else
+                           f"HTF {h}, LTF {l} -- one side unclear, treat with extra caution" if "Mixed" in (h, l) else
+                           f"HTF {h}, LTF {l} pullback/counter-trend -- HTF bias should dominate")
+                else:
+                    cls = "Not enough timeframe data for an HTF/LTF classification"
+                return {"status": "OK", "timeframes": res, "classification": cls, "htf_bias": h, "ltf_bias": l,
+                        "alignment": ", ".join(f"{k}={v['trend']}" for k, v in ok.items()), "source": "Upstox candles (this stock)"}
+        except Exception:
+            logger.exception("per-timeframe Upstox fetch failed -- using resample fallback")
+    m = mse._stock_mtf(df)
+    rows = {k: {"status": "OK", "trend": v["trend"], "structure_event": v.get("structure"), "last_close": round(v["last"], 2),
+                "candle_count": v["bars"]} for k, v in m.items() if isinstance(v, dict) and v.get("status") == "OK"}
+    if not rows:
+        return {"status": "DATA_UNAVAILABLE", "reason": "No timeframe returned usable candles.", "timeframes": {}, "alignment": None}
+    return {"status": "OK", "timeframes": rows, "classification": f"Resampled from 5-min candles -- alignment: {m.get('alignment')}",
+            "alignment": m.get("alignment"), "source": "5-min candles resampled (no Upstox login)"}
+
+
+# ------------------------------------------------------------------------------------------------------ main entry
+def build_context(symbol, access_token, ai_engine, *, capital=100000.0, risk_pct=1.0, global_avg_change=0.0,
+                  sentiment_score="Neutral", live_vix=None, state=None):
+    """Everything the stock dashboard shows, computed from the stock's own data.  Never raises: returns {'status': 'ERROR'|'DATA_UNAVAILABLE', ...}
+    on failure.  `state` is a dict (st.session_state) used to keep the Early-Warning level lock per symbol across refreshes."""
+    t_start = time.time()
+    steps, errors = [], []
+    state = state if state is not None else {}
+
+    def tick(name, t0):
+        steps.append((name, round((time.time() - t0) * 1000)))
+
+    def safe(name, fn, default=None):
+        t0 = time.time()
+        try:
+            return fn()
+        except Exception as e:
+            logger.exception("stock pipeline step %s failed", name)
+            errors.append(f"{name}: {type(e).__name__}: {e}")
+            return default
+        finally:
+            tick(name, t0)
+
+    meta = stock_universe.resolve(symbol)
+    if not meta:
+        return {"status": "DATA_UNAVAILABLE", "symbol": symbol, "message": "Stock ka naam khaali hai."}
+    sym = meta["symbol"]
+
+    t0 = time.time()
+    df, src = _fetch_candles(meta, access_token)
+    tick("candles", t0)
+    if df is None or df.empty or len(df) < 30:
+        return {"status": "DATA_UNAVAILABLE", "symbol": sym, "meta": meta,
+                "message": (f"{sym} ke liye Upstox/Yahoo se candle data nahi mila. Symbol sahi check karo "
+                            f"(NSE tradingsymbol, jaise RELIANCE, TCS, M&M)" + ("" if meta.get("known") else " -- ye naam NSE list me nahi mila."))}
+    ltp = _ltp(meta, access_token) if src == "UPSTOX_LIVE" else None
+    live_price = float(ltp) if ltp else float(df["Close"].iloc[-1])
+    if ltp:
+        df.iloc[-1, df.columns.get_loc("Close")] = live_price
+    df["VWAP"], vol_real = session_vwap(df)
+    poc = volume_poc(df)
+    df["POC_Level"] = poc
+    df.attrs.update(market_source=src, live_upstox=(src == "UPSTOX_LIVE"), live_price_source=("UPSTOX_LTP" if ltp else src))
+
+    mkt = market_status.get_market_status()
+    fresh = market_status.check_data_freshness(df.index[-1], mkt["state"])
+    step = nice_step(live_price)
+    atr = float(df["ATR"].iloc[-1]) or live_price * 0.003
+
+    # ---- SMC / structure -------------------------------------------------------------------------------------------
+    fvg, ob, sweeps = safe("smc", lambda: smart_money.detect_smc_zones(df), ([], [], []))
+    structure = safe("structure", lambda: smart_money.detect_market_structure(df), [])
+    smc_event = structure[0]["Market Event"] if structure else "Neutral Structure"
+    candle = safe("candle", lambda: smart_money.detect_candlestick_pattern(df), None)
+
+    # ---- sector / index / fundamentals / news (slow, cached) ---------------------------------------------------------
+    fund = _slow(sym, "fund", 3600, lambda: mse._fundamentals(sym, access_token=access_token, isin=meta.get("isin")), {}) or {}
+    company = meta.get("name") or fund.get("longName") or sym
+    sector = fund.get("sector") or fund.get("industry") or "Unknown"
+    nifty_ctx = _slow("NIFTY", "idx", 120, mse._index_context, {}) or {}
+    sec_ctx = _slow(sector, "sec", 300, lambda: mse._sector_context(sector), {}) or {}
+    news = _slow(sym, "news", 600, lambda: mse._news(sym, company), ([], "UNAVAILABLE"))
+    news_rows, news_status = (news if isinstance(news, tuple) else (news, ""))
+
+    # ---- depth + option chain (only if the stock has F&O) ------------------------------------------------------------
+    inst = meta.get("instrument_key")
+    quote = safe("depth", lambda: mse._upstox_quote_depth(inst, access_token), {"status": "UNAVAILABLE"})
+    oc_raw = safe("option_chain", lambda: mse._upstox_stock_option_chain(inst, access_token, live_price), {"status": "UNAVAILABLE"})
+    oc_rows = (oc_raw or {}).get("rows") or []
+    df_oc = mse._stock_option_chain_for_sr(oc_raw)
+    has_oc = bool(oc_rows)
+    pcr = pcr_from_rows(oc_rows) if has_oc else 0.0
+    max_pain = max_pain_from_rows(oc_rows) if has_oc else 0.0
+    iv_skew = iv_skew_from_rows(oc_rows, live_price) if has_oc else None
+    atm_iv = atm_iv_from_rows(oc_rows, live_price) if has_oc else None
+    fii_footprint = mse._flow_footprint_from_quote(quote)
+    breadth_status = mse._breadth_status_from_sector(sec_ctx)
+    trend_word = "BULLISH" if live_price > df["EMA_20"].iloc[-1] > df["EMA_50"].iloc[-1] else (
+        "BEARISH" if live_price < df["EMA_20"].iloc[-1] < df["EMA_50"].iloc[-1] else "MIXED")
+    corr_note = mse._sector_correlation_note(trend_word, sec_ctx)
+
+    # ---- regime / CPR / liquidity ------------------------------------------------------------------------------------
+    regime = safe("regime", lambda: market_regime.detect_regime(df, live_vix=live_vix), {
+        "primary": "UNKNOWN", "volatility": "UNKNOWN", "structure": "UNKNOWN", "adx": None, "plus_di": None, "minus_di": None,
+        "atr_percentile": None, "vix": None, "expiry_regime": False})
+    regime_guidance = safe("regime_guidance", lambda: market_regime.regime_adjusted_guidance(regime), "Regime unavailable.")
+    is_choppy = False
+    # same chop test the Nifty dashboard uses (Bollinger width vs its 50-bar average)
+    try:
+        bbm = df["Close"].rolling(20).mean(); bbs = df["Close"].rolling(20).std()
+        bbw = (4 * bbs) / bbm
+        avg_w, cur_w = bbw.rolling(50).mean().iloc[-1], bbw.iloc[-1]
+        is_choppy = bool(cur_w < avg_w * 0.75) if pd.notna(avg_w) and avg_w > 0 else False
+    except Exception:
+        pass
+
+    pivots = safe("pivots", lambda: cpr_pivot.calculate_pivots(df), {"status": "UNAVAILABLE"})
+    cpr_pos = safe("cpr_pos", lambda: cpr_pivot.cpr_position(live_price, pivots), "N/A")
+    orb = safe("orb", lambda: cpr_pivot.opening_range(df), {"status": "UNAVAILABLE"})
+    liquidity_map = safe("liquidity", lambda: liquidity_engine.build_liquidity_map(df, live_price, atr=atr), {"status": "UNAVAILABLE", "levels": []})
+    nearest_liq = safe("nearest_liq", lambda: liquidity_engine.nearest_liquidity_target(liquidity_map, live_price), "N/A")
+
+    # ---- institutional scoring engine (same weights as Nifty: 20/25/15/40) ----------------------------------------------
+    ai = None
+    if ai_engine is not None:
+        ai = safe("ai_engine", lambda: ai_engine.analyze(
+            live_price=live_price, df=df, df_option_chain=df_oc, smc_data=smc_event, sentiment_score=sentiment_score,
+            global_avg_change=global_avg_change, fii_footprint=fii_footprint, breadth_status=breadth_status,
+            is_choppy=is_choppy, banknifty_correlation_note=corr_note), None)
+    atr_ai = float((ai or {}).get("tech_metrics", {}).get("atr") or atr)
+
+    # ---- S/R location engine + Early Warning + ladder (price-scaled) -------------------------------------------------
+    lock_s, lock_r = f"ew_lock_s_{sym}", f"ew_lock_r_{sym}"
+    with support_resistance.round_number_scale(step * 2, step):
+        level_prediction = safe("early_warning", lambda: support_resistance.predict_level_reaction(
+            df=df, live_price=live_price, atr=atr_ai, fvg_list=fvg, ob_list=ob, trend_bias=(ai or {}).get("tech_score", 0.0),
+            df_option_chain=df_oc, locked_support=state.get(lock_s), locked_resistance=state.get(lock_r)),
+            {"status": "NO_DATA", "factors": [], "nearest_support": None, "nearest_resistance": None})
+        sr_context = safe("sr_context", lambda: support_resistance.build_comprehensive_sr_context(
+            df=df, live_price=live_price, atr=atr_ai, df_option_chain=df_oc, fvg_list=fvg, ob_list=ob,
+            liquidity_map=liquidity_map, pivots=pivots), {"location": "UNKNOWN"})
+        ladder = safe("ladder", lambda: support_resistance.predict_round_number_ladder(
+            df=df, live_price=live_price, atr=atr_ai, fvg_list=fvg, ob_list=ob, trend_bias=(ai or {}).get("tech_score", 0.0),
+            df_option_chain=df_oc, step=step, global_avg_change=global_avg_change, fii_footprint=fii_footprint,
+            overall_pcr=pcr if has_oc else None), {"supports": [], "resistances": [], "step": step})
+    try:
+        if level_prediction.get("nearest_support") is not None:
+            state[lock_s] = float(level_prediction["nearest_support"])
+        if level_prediction.get("nearest_resistance") is not None:
+            state[lock_r] = float(level_prediction["nearest_resistance"])
+    except Exception:
+        pass
+    if ai is not None:
+        ai["level_prediction"], ai["comprehensive_sr"], ai["level_ladder"] = level_prediction, sr_context, ladder
+
+    # ---- signal text (identical rules to the Nifty header row) ---------------------------------------------------------
+    bias_text = (ai or {}).get("bias_text", "")
+    signal_code = 1 if "BULLISH" in bias_text else (-1 if "BEARISH" in bias_text else 0)
+    final_signal_text = (ai or {}).get("signal_type", "N/A") if signal_code != 0 else "NO TRADE (waiting for stronger directional setup)"
+
+    # ---- sniper -------------------------------------------------------------------------------------------------------
+    cpr_info = safe("cpr_info", lambda: sniper_setup.calculate_pdh_pdl_cpr(df), None)
+    sniper = safe("sniper", lambda: sniper_setup.generate_sniper_setup(
+        live_price=live_price, live_vwap=float(df["VWAP"].iloc[-1]), cpr_info=cpr_info, fvg=fvg, ob=ob, df_option_chain=df_oc,
+        atr=atr_ai, candle_pattern=candle, poc_level=poc, volume_is_real=vol_real), None)
+
+    # ---- stock-only trade history (never mixed with Nifty / other stocks) ----------------------------------------------
+    closed = safe("closed_trades", lambda: database.fetch_all_closed_trades(symbol=sym), [])
+    entry = (ai or {}).get("entry_price", live_price)
+    sl = (ai or {}).get("stop_loss", live_price - atr)
+    pos = safe("position", lambda: position_sizing.calculate_position_size(
+        capital=capital, risk_per_trade_pct=risk_pct, entry_price=entry, stop_loss_price=sl, lot_size=1), {"status": "UNAVAILABLE"})
+    risk_state = safe("risk", lambda: risk_engine.evaluate_risk_state(closed, capital=capital), {"status": "UNAVAILABLE", "block_reasons": []})
+    backtest = safe("backtest", lambda: backtest_engine.generate_backtest_report(closed), {"status": "UNAVAILABLE"})
+    mc = safe("monte_carlo", lambda: monte_carlo.run_monte_carlo(closed), {"status": "UNAVAILABLE"})
+    drift = safe("drift", lambda: drift_detection.check_for_drift(closed), {"status": "NOT_ENOUGH_DATA"})
+
+    mtf = safe("mtf", lambda: build_mtf(access_token, meta, df), {"status": "DATA_UNAVAILABLE", "reason": "mtf failed", "timeframes": {}})
+    t_total = round((time.time() - t_start), 1)
+    return {
+        "status": "OK", "version": PIPELINE_VERSION, "symbol": sym, "company": company, "meta": meta, "isin": meta.get("isin"),
+        "df": df, "data_source": src, "live_price": live_price, "ltp_used": bool(ltp), "atr": atr_ai, "step": step,
+        "volume_is_real": vol_real, "poc": poc, "vwap": float(df["VWAP"].iloc[-1]),
+        "market": mkt, "freshness": fresh, "last_candle": df.index[-1],
+        "fvg": fvg, "ob": ob, "sweeps": sweeps, "market_structure": structure, "smc_event": smc_event, "candle": candle,
+        "ai": ai, "bias_text": bias_text, "signal_code": signal_code, "final_signal_text": final_signal_text,
+        "level_prediction": level_prediction, "sr_context": sr_context, "ladder": ladder,
+        "regime": regime, "regime_guidance": regime_guidance, "is_choppy": is_choppy,
+        "pivots": pivots, "cpr_pos": cpr_pos, "orb": orb, "liquidity_map": liquidity_map, "nearest_liquidity": nearest_liq,
+        "sniper": sniper, "quote": quote, "order_flow": order_flow_from_quote(quote),
+        "option_chain_raw": oc_raw, "option_rows": oc_rows, "has_option_chain": has_oc, "pcr": pcr, "max_pain": max_pain,
+        "iv_skew": iv_skew, "atm_iv": atm_iv, "fii_footprint": fii_footprint,
+        "sector": sector, "sector_context": sec_ctx, "nifty_context": nifty_ctx, "breadth_status": breadth_status, "corr_note": corr_note,
+        "fundamentals": fund, "news": news_rows, "news_status": news_status,
+        "mtf": mtf, "position_size": pos, "risk_state": risk_state, "backtest": backtest, "monte_carlo": mc, "drift": drift,
+        "trade_count": len(closed), "capital": capital, "risk_pct": risk_pct,
+        "timings": steps, "total_s": t_total, "errors": errors,
+    }
+# @@END stock_pipeline
+
+# @@MODULE stock_engine
+"""
+stock_engine.py -- PHASE 2: the Nifty decision flow, run on ONE stock's own data.
+
+    Named Strategy Library (41)  ->  walk-forward ML  ->  Consensus Engine  ->  AI Trade Decision Engine (self-learning)
+        -> Gemini final review (strategy + AI must agree first)  ->  trade (Entry / SL / Target in Rs, shares not options)
+        -> gate log / shadow trades / Telegram / live-tick stop watcher
+
+It is the SAME flow as app.py lines ~1270-1650 (Nifty), executed by the stock's private engine copy (stock_family.py), so the stock's learning,
+caches and trades never touch Nifty or another stock.  Nothing here is called for Nifty.  Never raises: every step records its error in
+p2["errors"] and the page shows the section empty with a warning instead of breaking.
+"""
+import threading
+import time
+
+import pandas as pd
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+import safe_io
+import database
+import position_sizing
+import market_data
+import multi_stock_engine as mse
+import consensus_engine
+import stock_family
+import stock_store
+
+ENGINE_VERSION = "stock-phase2-v1"
+_WATCH = {"thread": None}
+_WATCH_LOCK = threading.Lock()
+_FAMILY_META = {}          # symbol -> instrument_key (for the live-tick watcher)
+
+
+# ------------------------------------------------------------------------------------------------------------------ dashboard context
+def build_dashboard_context(ctx, extra, strategy_result, ml_results):
+    """Same section names the Nifty dashboard hands to the decision engine / Gemini / chat (so the engine's context audit and extractors work)."""
+    ai = ctx.get("ai") or {}
+    df_gm, df_sent = extra.get("df_gm"), extra.get("df_sent")
+    dc = {
+        "Market Status": f"{(ctx.get('market') or {}).get('label')} | last candle {ctx.get('last_candle')}",
+        "Data Freshness": (f"STALE/FROZEN -- {(ctx.get('freshness') or {}).get('note')}" if (ctx.get("freshness") or {}).get("is_stale") else "Live / fresh"),
+        "Stock Spot Price": f"{ctx['symbol']} Rs {ctx['live_price']:.2f} (source {ctx.get('data_source')})",
+        "Stock": f"{ctx['symbol']} -- {ctx.get('company')} | sector {ctx.get('sector')}",
+        "RAW Option Chain (all loaded strikes)": str(ctx.get("option_rows")) if ctx.get("has_option_chain") else "UNAVAILABLE -- no F&O option chain for this stock",
+        "RAW Sector Peers Breadth/Stock Data": str(ctx.get("sector_context")),
+        "RAW Global Market Table": (df_gm.to_string() if isinstance(df_gm, pd.DataFrame) and not df_gm.empty else "UNAVAILABLE"),
+        "RAW Global News/Sentiment Table": (df_sent.to_string() if isinstance(df_sent, pd.DataFrame) and not df_sent.empty else "UNAVAILABLE"),
+        "RAW Multi-Timeframe Structure": str(ctx.get("mtf")),
+        "RAW SMC Zones / FVG / OB / Sweeps": str({"fvg": ctx.get("fvg"), "ob": ctx.get("ob"), "sweeps": ctx.get("sweeps"), "event": ctx.get("smc_event")}),
+        "RAW Liquidity Map": str(ctx.get("liquidity_map")), "RAW S/R Ladder": str(ctx.get("ladder")),
+        "RAW Comprehensive S/R Zones": str(ctx.get("sr_context")), "RAW Regime Engine": str(ctx.get("regime")),
+        "RAW CPR/Pivots/Opening Range": str({"pivots": ctx.get("pivots"), "cpr_pos": ctx.get("cpr_pos"), "orb": ctx.get("orb")}),
+        "RAW Order Flow": ctx.get("order_flow"), "RAW ML Results": str(ml_results),
+        "RAW Backtest Report": str(ctx.get("backtest")), "RAW Monte Carlo Report": str(ctx.get("monte_carlo")),
+        "RAW Model Drift Report": str(ctx.get("drift")), "RAW Position Sizing": str(ctx.get("position_size")),
+        "RAW Risk Engine": str(ctx.get("risk_state")), "RAW Sniper Setup": str(ctx.get("sniper")),
+        "RAW Hybrid AI Analysis": str(ai),
+        "Fundamentals": str(ctx.get("fundamentals"))[:3000], "News": str(ctx.get("news"))[:3000],
+        "Strategy Ensemble": str(strategy_result),
+        "STRATEGY ENTRY POLICY": ("ENTRY requires: at least one named strategy currently formed + AI Self-Learning research in the SAME direction. "
+                                  "AI alone is research only; no strategy = no entry. This is a CASH-EQUITY trade in " + ctx["symbol"] + " (shares, no options)."),
+    }
+    return dc
+
+
+# ---------------------------------------------------------------------------------------------------------------------- notifications
+def _tg_ready():
+    try:
+        import trade_notify
+        return trade_notify, trade_notify.is_configured()
+    except Exception:
+        return None, False
+
+
+def notify_entry(sym, sid, d, qty=None, p2=None, ctx=None):
+    """Telegram entry alert (same channel/claim logic as Nifty): which stock, price, SL, target, RR, win chance, strategies, consensus, Gemini."""
+    tn, ok = _tg_ready()
+    if not ok or not sid:
+        return False
+    try:
+        key = f"stk-entry:{sym}:{sid}"
+        if not tn._claim(key):
+            return False
+        p2 = p2 or {}
+        sr = p2.get("strategy_result") or {}
+        cons = p2.get("consensus") or {}
+        gr = d.get("gemini_review") or {}
+        strat = ", ".join(sr.get("selected_strategies") or [])[:120]
+        lines = [f"<b>🤖 {tn._e(sym)} -- {tn._e(d.get('direction'))} (cash equity)</b>",
+                 f"Price/Entry: Rs {tn._f(d.get('underlying_entry'))}",
+                 f"SL: Rs {tn._f(d.get('stop_loss'))} | Target: Rs {tn._f(d.get('target'))}",
+                 f"RR: {tn._e(d.get('risk_reward'))} | Win chance: {tn._e(d.get('confidence_pct'))}%"]
+        if qty:
+            lines.append(f"Qty (1% risk): {qty}")
+        if strat:
+            lines.append(f"Strategy: {tn._e(strat)} (score {tn._e(sr.get('score'))})")
+        if cons.get("ok"):
+            lines.append(f"Consensus: BUY {tn._e(cons.get('buy'))} / SELL {tn._e(cons.get('sell'))} / NEUTRAL {tn._e(cons.get('neutral'))}")
+        lines.append(f"Gemini: {tn._e(gr.get('status'))} -- {tn._e(str(gr.get('reason') or '')[:220])}")
+        tn._send_async(key, "\n".join(lines))
+        return True
+    except Exception:
+        logger.exception("stock notify_entry failed (ignored)")
+        return False
+
+
+def _exit_hook_for(sym):
+    def _hook(row, outcome, exit_price):
+        tn, ok = _tg_ready()
+        if not ok or not row or not outcome:
+            return False
+        try:
+            key = f"stk-exit:{sym}:{row.get('id') or row.get('timestamp')}"
+            if not tn._claim(key):
+                return False
+            tn._send_async(key, f"<b>{tn._e(sym)} -- trade closed: {tn._e(outcome)}</b>\n{tn._e(row.get('direction'))} | entry Rs "
+                                f"{tn._f(row.get('underlying_entry'))} -> exit Rs {tn._f(exit_price)}")
+            return True
+        except Exception:
+            return False
+    return _hook
+
+
+# --------------------------------------------------------------------------------------------------------------- live-tick SL / target watcher
+def ensure_watcher():
+    """One daemon thread: every ~3 s check every loaded stock's OPEN trade against its live LTP (SL / target on the live tick, never on
+    candle close) -- the stock twin of tick_guard.  Idempotent."""
+    with _WATCH_LOCK:
+        t = _WATCH["thread"]
+        if t is not None and t.is_alive():
+            return False
+        t = threading.Thread(target=_watch_loop, name="stock-tick-guard", daemon=True)
+        _WATCH["thread"] = t
+        t.start()
+        return True
+
+
+def _watch_loop():
+    import market_status
+    import upstox_auth
+    last_shadow = 0.0
+    while True:
+        try:
+            time.sleep(3.0)
+            if market_status.get_market_status().get("state") != "OPEN":
+                time.sleep(20)
+                continue
+            token = upstox_auth._stored_token()
+            if not token:
+                continue
+            for sym in stock_family.loaded_symbols():
+                key = _FAMILY_META.get(sym)
+                fam = stock_family.get_family(sym)
+                if not key or not fam.trade_learning.get_open_setup():
+                    continue
+                ltp = market_data._fetch_upstox_ltp(token, key)
+                if not ltp:
+                    continue
+                before = fam.trade_learning.get_open_setup()
+                fam.trade_learning.resolve_tick(float(ltp))
+                if before and not fam.trade_learning.get_open_setup():
+                    stock_store.safe_mirror(fam)
+                if time.time() - last_shadow >= 10:
+                    last_shadow = time.time()
+                    try:
+                        fam.shadow_trades.resolve(float(ltp), None)
+                    except Exception:
+                        logger.exception("stock tick shadow resolve failed (ignored)")
+        except Exception:
+            logger.exception("stock tick watcher error (ignored)")
+            time.sleep(5)
+
+
+# ------------------------------------------------------------------------------------------------------------------------------ main
+def run(ctx, state, gemini_keys, extra=None):
+    """Locked per stock: the dashboard and the watchlist robot never run the same stock's engine at the same moment."""
+    try:
+        lock = stock_family.get_family(ctx["symbol"]).lock
+    except Exception:
+        return _run(ctx, state, gemini_keys, extra)
+    with lock:
+        return _run(ctx, state, gemini_keys, extra)
+
+
+def _run(ctx, state, gemini_keys, extra=None):
+    """Phase-2 flow for the loaded stock.  `state` = st.session_state (per-stock keys), `extra` = {'df_gm','df_sent','gavg','vix'}.
+    Returns p2 dict (also what the dashboard renders).  Never raises."""
+    extra = extra or {}
+    p2 = {"status": "OK", "version": ENGINE_VERSION, "errors": [], "timings": []}
+    sym = ctx["symbol"]
+
+    def step(name, fn, default=None, timeout=None):
+        t0 = time.time()
+        try:
+            if timeout:
+                return safe_io.guarded(f"stk2_{name}_{sym}", fn, timeout=timeout, default=default)
+            return fn()
+        except Exception as e:
+            logger.exception("stock phase2 step %s failed (%s)", name, sym)
+            p2["errors"].append(f"{name}: {type(e).__name__}: {e}")
+            return default
+        finally:
+            p2["timings"].append((name, round((time.time() - t0) * 1000)))
+
+    try:
+        fam = stock_family.get_family(sym)
+    except Exception as e:
+        logger.exception("stock family build failed")
+        p2.update(status="ERROR", errors=[f"engine copy build failed: {type(e).__name__}: {e}"])
+        return p2
+    p2["family"] = fam
+    df, price, atr = ctx["df"], float(ctx["live_price"]), float(ctx["atr"] or 0.0)
+    fam.scale(price, atr)
+    _FAMILY_META[sym] = ctx["meta"].get("instrument_key")
+    try:
+        fam.trade_learning.set_exit_hook(_exit_hook_for(sym))
+    except Exception:
+        pass
+    ensure_watcher()
+    atd, tl = fam.ai_trade_decision, fam.trade_learning
+    ai = ctx.get("ai") or {}
+    df_oc = mse._stock_option_chain_for_sr(ctx.get("option_chain_raw")) if ctx.get("has_option_chain") else None
+    closed = step("closed_trades", lambda: database.fetch_all_closed_trades(symbol=sym), [])
+
+    # ---- 2.1 strategy engine (41 strategies) ----------------------------------------------------------------------------------------
+    strategy_result = step("strategy_engine", lambda: fam.strategy_engine.analyze(
+        df, sr_context=ctx.get("sr_context"), level_prediction=ctx.get("level_prediction"), order_flow=ctx.get("order_flow"),
+        mtf=ctx.get("mtf"), ai_analysis=ai, trade_history=closed, option_chain=df_oc, option_chain_live=bool(ctx.get("has_option_chain"))),
+        {"status": "ERROR", "has_setup": False, "direction": "WAIT", "score": 0.0, "strategies": {}})
+    p2["strategy_result"] = strategy_result
+
+    # ---- 2.2 per-stock walk-forward ML (own cache because the engine copy is the stock's own) ----------------------------------------
+    ml = step("ml", lambda: fam.ml_engine.train_and_backtest(df, extra.get("vix")), {"model_ready": False}, timeout=25) or {"model_ready": False}
+    p2["ml_results"] = ml
+
+    # ---- 3.3 peer-stocks breadth (one batched Upstox call, cached 120 s) -> consensus + decision see adv/dec ------------------------------
+    def _peers():
+        import stock_peers, upstox_auth
+        sd = strategy_result.get("direction")
+        return stock_peers.fetch(sym, ctx.get("sector"), upstox_auth._stored_token(), sd if sd in ("BUY", "SELL") else None)
+    peers = step("peers", _peers, {"status": "UNAVAILABLE", "reason": "Peers engine error"}, timeout=12) or {"status": "UNAVAILABLE"}
+    ctx["peers"], ctx["extra"] = peers, extra
+    if peers.get("status") == "AVAILABLE":
+        ctx["adv"], ctx["dec"] = peers["adv"], peers["dec"]
+
+    # ---- 2.3 consensus engine ---------------------------------------------------------------------------------------------------------
+    def _cons():
+        c = consensus_engine.build(dict(
+            live_price=price, atr=atr, df=df, live_poc=ctx.get("poc"), cpr_pos=ctx.get("cpr_pos"), orb=ctx.get("orb"), candle=ctx.get("candle"),
+            smc_event=ctx.get("smc_event"), mtf=ctx.get("mtf"), sr_context=ctx.get("sr_context"), level_prediction=ctx.get("level_prediction"),
+            regime=ctx.get("regime"), current_pcr=(ctx.get("pcr") or None), oc=df_oc, oc_live=bool(ctx.get("has_option_chain")),
+            max_pain=(ctx.get("max_pain") or None), fii_footprint=ctx.get("fii_footprint"), iv_skew=ctx.get("iv_skew"), live_vix=extra.get("vix"),
+            order_flow=ctx.get("order_flow"), df_global=extra.get("df_gm"), df_global_sent=extra.get("df_sent"),
+            ai_analysis=ai, strategy_result=strategy_result, ml_results=ml, sector_breadth=ctx.get("sector_breadth"),
+            adv=ctx.get("adv"), dec=ctx.get("dec")))
+        return c
+    cons = step("consensus", _cons, {"ok": False}, timeout=20) or {"ok": False}
+    hist = state.setdefault(f"_consensus_hist_{sym}", [])
+    try:
+        consensus_engine.record(hist, cons)
+    except Exception:
+        pass
+    p2["consensus"], p2["consensus_hist"] = cons, hist
+
+    # ---- 2.4 AI Trade Decision Engine -------------------------------------------------------------------------------------------------
+    dc = build_dashboard_context(ctx, extra, strategy_result, ml)
+    if cons.get("ok"):
+        dc["Consensus Engine (factor count BUY/SELL/NEUTRAL)"] = cons.get("summary_text", "")
+    p2["dashboard_context"] = dc
+    step("resolve_open", lambda: tl.resolve_open_setups(price, df=df))
+    step("shadow_resolve", lambda: fam.shadow_trades.resolve(price, df))
+    open_setup = step("get_open", tl.get_open_setup)
+    p2["open_setup"] = open_setup
+    risk = ctx.get("risk_state") or {}
+    blocks = [str(x) for x in (risk.get("block_reasons") or [])]
+    cool = ('20 min', '20-minute', '20 minute', 'pause', 'cooldown', 'lagatar', 'consecutive')
+    cooldown_only = bool(blocks) and all(any(w in b.lower() for w in cool) for b in blocks)
+    risk_ok = risk.get("status") in (None, "OK_TO_TRADE", "UNAVAILABLE") or cooldown_only
+    p2["risk_ok"], p2["risk_blocks"] = risk_ok, blocks
+    decision, review = None, {"status": "NOT_NEEDED", "approved": False, "reason": "No qualifying deterministic setup yet."}
+    if open_setup or not risk_ok:
+        p2.update(decision=None, gemini_review=review)
+        return _finish(p2, fam, ctx, state)
+
+    eq = step("entry_quality", lambda: {"BUY": fam.entry_quality.assess_entry(df, "BUY", atr), "SELL": fam.entry_quality.assess_entry(df, "SELL", atr)}, None)
+    from stock_news import news_sentiment_label  # local helper (Phase 3.5 upgrades the source; same output shape)
+    decision = step("decision", lambda: atd.generate_trade_decision(
+        live_price=price, level_prediction=ctx.get("level_prediction"), atr=atr, max_pain=(ctx.get("max_pain") or None),
+        signal_code=ctx.get("signal_code", 0), ml_agrees=bool(ml.get("model_ready") and ml.get("latest_signal", 0) == ctx.get("signal_code", 0)),
+        banknifty_correlation_note=ctx.get("corr_note"), breadth_advances=ctx.get("adv"), breadth_declines=ctx.get("dec"),
+        global_avg_change=extra.get("gavg"), live_vix=extra.get("vix"), india_news_sentiment=None, level_ladder=ctx.get("ladder"),
+        sr_context=ctx.get("sr_context"), sniper_bias=((ctx.get("sniper") or {}).get("setup_bias")), is_choppy=ctx.get("is_choppy", False),
+        dashboard_context=dc, global_research=ctx.get("global_research"),
+        nifty50_news_sentiment=news_sentiment_label(ctx.get("news")), nifty50_fundamentals_bias=ctx.get("fundamentals_bias"),
+        strategy_result=strategy_result, raw_option_chain=df_oc, entry_quality=eq, pcr_velocity=None,
+        sector_breadth=ctx.get("sector_breadth"), live_poc=ctx.get("poc"), fii_footprint=ctx.get("fii_footprint"), iv_skew=ctx.get("iv_skew"),
+        iv_percentile=None, drift_report=ctx.get("drift"), monte_carlo_report=ctx.get("monte_carlo")),
+        {"has_setup": False, "reason": "Decision engine error (see engine warnings)."}) or {"has_setup": False, "reason": "No decision."}
+    if isinstance(decision.get("strategy_engine"), dict) and decision["strategy_engine"].get("rebased_from"):
+        p2["strategy_result"] = strategy_result = decision["strategy_engine"]
+        dc["Strategy Ensemble"] = str(strategy_result)
+
+    # ---- 2.5 Gemini final review (same rules as Nifty: Gemini may reject, never create) --------------------------------------------
+    if not decision.get("has_setup") and decision.get("candidate"):
+        step("shadow_log", lambda: fam.shadow_trades.log(decision["candidate"], atd.classify_block(decision.get("reason"))))
+    if decision.get("has_setup") and strategy_result.get("has_setup"):
+        formed = strategy_result.get("formed_at") or str(df.index[-1])
+        sig = (str(df.index[-1]), str(decision.get("direction")))
+        cache = state.setdefault(f"_gemini_cache_{sym}", {})
+        hit = cache.get(sig)
+        ttl = 45 if (hit and hit[1].get("status") == "UNAVAILABLE") else 300 if (hit and hit[1].get("status") == "REJECTED") else 600
+        if hit and time.time() - hit[0] < ttl:
+            review = hit[1]
+        else:
+            review = step("gemini", lambda: atd.gemini_review_async(
+                sig, gemini_keys, dc, strategy_result, decision.get("direction"), live_price=price, strategy_formed_at=formed,
+                decision=dict(decision)), {"status": "UNAVAILABLE", "reason": "Gemini call failed"})
+            if review.get("status") != "PENDING":
+                cache[sig] = (time.time(), review)
+                atd.review_job_forget(sig)
+                for old in list(cache)[:-20]:
+                    cache.pop(old, None)
+        att = review.get("attempts") or []
+        quota_only = bool(att) and all(str(a).strip().endswith("429") for a in att)
+        if review.get("status") == "UNAVAILABLE" and atd.GEMINI_FAIL_OPEN and quota_only:
+            fb = atd.local_fallback_review(decision, review)
+            fb["gemini_error"] = review.get("reason")
+            review = fb
+        elif review.get("status") == "UNAVAILABLE":
+            review = dict(review, reason="Gemini abhi jawab nahi de paya (timeout/server problem), dobara try hoga: " + str(review.get("reason") or "")[:160])
+        pre = dict(decision)
+        decision = atd.apply_gemini_verdict(decision, review)
+        if not decision.get("has_setup") and review.get("status") in ("REJECTED", "LOCAL_FALLBACK_BLOCKED"):
+            step("shadow_log2", lambda: fam.shadow_trades.log(
+                {"direction": pre.get("direction"), "underlying_entry": pre.get("underlying_entry"), "stop_loss": pre.get("stop_loss"),
+                 "target": pre.get("target"), "factor_flags": pre.get("factor_flags")},
+                "Gemini rejected" if review.get("status") == "REJECTED" else "Local fallback blocked"))
+    else:
+        decision["gemini_review"] = review
+    p2["decision"], p2["gemini_review"] = decision, review
+    dc["AI TRADE DECISION (final)"] = str({k: decision.get(k) for k in ("has_setup", "direction", "underlying_entry", "stop_loss", "target", "risk_reward",
+                                                                       "confidence_pct", "reason", "gemini_review") if k in decision})[:4000]
+
+    # ---- gate log (per candle, on disk, stock's own file) -------------------------------------------------------------------------------
+    gkey = "TRADE TAKEN" if decision.get("has_setup") else atd.classify_block(decision.get("reason"))
+    p2["gate"] = gkey
+    gc = state.setdefault(f"_gate_counts_{sym}", {})
+    bk = (str(df.index[-1]), gkey)
+    if state.get(f"_gate_last_{sym}") != bk:
+        gc[gkey] = gc.get(gkey, 0) + 1
+        state[f"_gate_last_{sym}"] = bk
+    step("gate_log", lambda: fam.gate_log.record(
+        df.index[-1], price, gkey, reason=decision.get("reason") or "", direction=(decision.get("direction") or strategy_result.get("direction") or ""),
+        source=str(getattr(df, "attrs", {}).get("market_source", "")),
+        detail=f"buy={strategy_result.get('buy_score')} sell={strategy_result.get('sell_score')} live={(strategy_result.get('live_state') or {}).get('score')}"))
+
+    # ---- log the trade (equity: shares) + Telegram ---------------------------------------------------------------------------------------
+    if decision.get("has_setup"):
+        sid = step("log_setup", lambda: tl.log_setup(decision["direction"], decision["strike"], "EQ", decision["underlying_entry"],
+                                                     decision["stop_loss"], decision["target"], decision["confidence_pct"], decision["factor_flags"]))
+        p2["logged_id"] = sid
+        qty = step("position", lambda: position_sizing.calculate_position_size(
+            capital=ctx.get("capital", 100000.0), risk_per_trade_pct=ctx.get("risk_pct", 1.0), entry_price=decision["underlying_entry"],
+            stop_loss_price=decision["stop_loss"], lot_size=1), {"status": "UNAVAILABLE"})
+        p2["position"] = qty
+        if sid:
+            notify_entry(sym, sid, decision, qty=(qty or {}).get("quantity") or (qty or {}).get("lots"), p2=p2, ctx=ctx)
+            stock_store.safe_mirror(fam)
+    return _finish(p2, fam, ctx, state)
+
+
+def _finish(p2, fam, ctx, state):
+    try:
+        p2["open_setup"] = fam.trade_learning.get_open_setup()
+        p2["storage"] = fam.trade_learning.get_storage_status()
+    except Exception:
+        pass
+    try:
+        stock_store.safe_mirror(fam)
+    except Exception:
+        pass
+    return p2
+# @@END stock_engine
+
+# @@MODULE stock_phase2_ui
+"""
+stock_phase2_ui.py -- draws the Phase-2 sections of the stock dashboard.  Same widgets, same wording, same order as the Nifty page
+(app.py ~1282-1650); only 'Nifty / strike / CE-PE / points' become 'stock / Rs / shares'.
+"""
+import time
+
+import pandas as pd
+import streamlit as st
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+import consensus_engine
+
+
+def _rs(v, d=2):
+    try:
+        return f"₹{float(v):,.{d}f}"
+    except Exception:
+        return "N/A"
+
+
+def consensus(ctx):
+    """Top-of-page Consensus Engine line (same spot as Nifty)."""
+    p2 = ctx.get("p2") or {}
+    cons = p2.get("consensus") or {}
+    if not cons.get("ok"):
+        st.info("🧩 **Consensus Engine** -- abhi factors ka data poora nahi (data load ho raha hai ya engine ne error diya, neeche Engine warnings dekho).")
+        return
+    try:
+        consensus_engine.render(st, cons, p2.get("consensus_hist") or [])
+    except Exception:
+        logger.exception("consensus render failed (ignored)")
+        st.info("🧩 Consensus Engine render nahi ho paya (ignored).")
+
+
+def model_calibration(ctx):
+    ml = (ctx.get("p2") or {}).get("ml_results") or {}
+    if not ml.get("model_ready"):
+        st.caption("Walk-forward ML is stock ke liye abhi ready nahi (kam candles / training chal rahi hai) -- calibration tab dikhega.")
+        return
+    st.write(f"Raw ensemble confidence: {ml.get('latest_confidence', 0.0) * 100:.1f}%")
+    if ml.get("calibrated_confidence") is not None:
+        st.write(f"Calibrated confidence: {ml['calibrated_confidence'] * 100:.1f}% (real probability of being correct, "
+                 f"based on how reliable this exact confidence level has been across this stock's past walk-forward predictions)")
+    st.caption(ml.get("calibration_note", ""))
+    st.caption(f"Walk-forward accuracy: {ml.get('Accuracy')} | win rate: {ml.get('Win Rate')} | sample: {ml.get('Sample Size')}")
+
+
+def strategy_library(ctx):
+    p2 = ctx.get("p2") or {}
+    sr = p2.get("strategy_result") or {}
+    rows = []
+    for k, v in (sr.get("strategies") or {}).items():
+        wf = v.get("walk_forward") or {}
+        rows.append({
+            "Strategy": v.get("name", k), "Type": v.get("type", "directional"), "Live Setup": v.get("signal", "NONE"),
+            "Current Score": v.get("current_score"),
+            "Live Check": ("" if v.get("signal", "NONE") == "NONE" else ("OK" if v.get("live_valid", True) else "BLOCKED") +
+                           ((" - " + v.get("live_note")) if v.get("live_note") else "")),
+            "Win Rate": (f"{wf.get('win_rate')}%" if wf.get("win_rate") is not None else "N/A"), "Samples": wf.get("samples", 0),
+            "Expectancy": wf.get("expectancy"), "Profit Factor": wf.get("profit_factor"),
+            "Regime Fit": "YES" if v.get("regime_fit") else "NO", "Data Source": v.get("data_source", "LIVE_UPSTOX_PRICE_DATA")})
+    rows.sort(key=lambda r: (r["Live Setup"] == "NONE", -(r["Current Score"] or 0)))
+    ranked = sr.get("ranked_active") or []
+    if ranked:
+        st.success("🧩 Abhi LIVE strategies (best pehle): " + " | ".join(f"{r['name']} {r['direction']} {r['score']}" for r in ranked[:5]))
+    ls = sr.get("live_state") or {}
+    if ls.get("ok"):
+        st.caption(f"📈 Live price action: **{ls.get('bias')}** ({ls.get('score'):+.0f}) | Consensus BUY {sr.get('buy_consensus')} "
+                   f"({sr.get('buy_live_count')} live) vs SELL {sr.get('sell_consensus')} ({sr.get('sell_live_count')} live) | "
+                   f"{sr.get('blocked_count', 0)} stale/against-the-move signal(s) blocked")
+    if rows:
+        with st.expander(f"🧩 Named Strategy Library — {len(rows)} strategies scanned, {len(ranked)} live", expanded=False):
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            st.caption("Win rate sirf resolved historical samples se aata hai (is stock ke apne candles par, stock ke ATR-scaled SL ke saath). "
+                       "Naya strategy/history insufficient ho to N/A dikhaya jata hai; fake accuracy nahi.")
+    else:
+        with st.expander("🧩 Named Strategy Library — data nahi", expanded=False):
+            st.info("Strategy engine ne is stock par abhi koi result nahi diya (Engine warnings dekho).")
+
+
+def decision(ctx):
+    """AI Trade Decision Engine (Self-Learning) -- the stock twin of the Nifty section."""
+    p2 = ctx.get("p2") or {}
+    sym = ctx["symbol"]
+    st.subheader("🧠 AI Trade Decision Engine (Self-Learning)")
+    st.caption("AI engine independent research/confirmation layer hai. Entry tabhi possible hai jab Named Strategy Library me kam-se-kam ek genuine live "
+               "strategy setup bane aur AI research SAME direction me ho, aur Gemini final review approve kare. Ye cash-equity trade hai "
+               f"({sym} ke shares, options nahi). Is stock ki learning alag hai -- Nifty ya kisi aur stock se mix nahi.")
+    if p2.get("status") == "ERROR" or "family" not in p2:
+        st.warning("Is stock ka engine-copy build nahi ho paya: " + " | ".join(p2.get("errors") or ["unknown error"]))
+        return
+    stg = p2.get("storage")
+    if stg:
+        (st.caption if stg[0] else st.warning)(f"💾 {sym}: " + str(stg[1]) + " (Supabase me `stock_ai_setups` par mirror hota hai -- restart ke baad wapas aata hai.)")
+    op = p2.get("open_setup")
+    dec = p2.get("decision")
+    if op:
+        st.warning(f"🛡️ **AI Engine ka OPEN setup already track ho raha hai** | {op['direction']} {sym} | Entry: {_rs(op['underlying_entry'])} | "
+                   f"SL: {_rs(op['stop_loss'])} | Target: {_rs(op['target'])} | Confidence tab: {op['confidence_pct']}%")
+        st.caption("SL / target live price tick par check hote hain (har ~3 sec), candle close par nahi. Koi trailing / breakeven SL nahi.")
+        return
+    if not p2.get("risk_ok", True):
+        st.warning("🛡️ **Risk Engine blocked a new trade:** " + " | ".join(p2.get("risk_blocks") or ["risk limit reached"]))
+        return
+    if not dec:
+        st.info("⏳ Decision engine ne abhi koi result nahi diya (Engine warnings dekho).")
+        return
+    if not dec.get("has_setup"):
+        st.info(f"⏳ **Abhi koi genuine setup nahi hai.** {dec.get('reason')}")
+        _gemini_line(dec)
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Direction", f"{dec['direction']} ({sym} shares)")
+    c2.metric("Entry", _rs(dec["underlying_entry"]))
+    c3.metric("Win chance (calibrated)", f"{dec['confidence_pct']}%", delta=f"EV {dec.get('expectancy_r', 0):+.2f}R @ RR {dec.get('risk_reward', 0)}")
+    st.write(f"**Entry:** {_rs(dec['underlying_entry'])} | **Stop-Loss:** {_rs(dec['stop_loss'])} | **Target:** {_rs(dec['target'])}")
+    pos = p2.get("position") or {}
+    if pos.get("status") not in (None, "UNAVAILABLE") and (pos.get("quantity") or pos.get("lots")):
+        st.caption(f"📦 Position size ({ctx.get('risk_pct')}% risk of ₹{ctx.get('capital'):,.0f}): **{pos.get('quantity') or pos.get('lots')} shares**")
+    st.caption(f"Checklist: {dec['factors_true']}/{dec['factors_total']} factors aligned | Nearest level {_rs(dec.get('level_price'))} ({dec.get('level_pct')}%)")
+    st.caption(f"📊 {dec['confidence_note']}")
+    eq = dec.get("entry_quality") or {}
+    if eq.get("summary"):
+        st.caption(("⚠️ " if eq.get("chase_flags") else "✅ ") + "Entry quality: " + str(eq["summary"]))
+    mm = dec.get("macro_model") or {}
+    if mm.get("note"):
+        st.caption(("✅ " if mm.get("verdict") in ("ALIGNED", "STRONG_ALIGNED") else "⚠️ " if "OPPOSED" in str(mm.get("verdict")) else "➖ ")
+                   + "Dono models: Model A (structure+strategy) trade deta hai | " + str(mm["note"])
+                   + (" | MOMENTUM LANE (dono models agree)" if dec.get("momentum_lane") else "")
+                   + (" | TURNING-POINT REACTION (rejection at S/R)" if dec.get("reaction_entry") else ""))
+    for key, icon in (("target_note", "🎯 "), ("learning_note", "🧠 Learned from past trades: "), ("repeat_mistake_note", "🔁 ")):
+        if dec.get(key):
+            st.caption(icon + str(dec[key]))
+    if (dec.get("oi_buildup") or {}).get("available"):
+        st.caption(("⚠️ " if dec["oi_buildup"].get("against") else "✅ ") + "OI flow: " + str(dec["oi_buildup"].get("label")))
+    if (dec.get("event_risk") or {}).get("level") == "CAUTION":
+        st.caption("📅 Event caution: " + str(dec["event_risk"].get("reason")))
+    if dec.get("probe"):
+        st.warning("🧪 " + str(dec.get("probe_note")))
+    sr = dec.get("strategy_engine") or {}
+    if sr.get("has_setup"):
+        st.success(f"🧩 Strategy Ensemble: {sr.get('direction')} {sr.get('score')}/100 | {', '.join(sr.get('selected_strategies') or [])} | Regime: {sr.get('regime', 'UNKNOWN')}")
+    _gemini_line(dec)
+    st.caption("⚠️ Analytical signal, guarantee nahi — strategy + AI same direction + Gemini approval required for a fresh candidate.")
+    if p2.get("logged_id"):
+        st.success(f"✅ Automatically logged (id {p2['logged_id']}) — tracking ho raha hai, outcome se seekhega (sirf {sym} ki learning me).")
+
+
+def _gemini_line(dec):
+    gr = dec.get("gemini_review") or {}
+    s = gr.get("status")
+    if s == "APPROVED":
+        st.success(f"🧠 Gemini Final Review ({'with Google Search' if gr.get('search_used') else 'no search'}): APPROVED {gr.get('direction')} | {str(gr.get('reason', ''))[:900]}")
+    elif s == "LOCAL_FALLBACK_APPROVED":
+        st.info(f"🧠 Gemini unreachable -> strict local review APPROVED | {str(gr.get('reason', ''))[:900]}")
+    elif s in ("REJECTED", "NO_TRADE", "LOCAL_FALLBACK_BLOCKED"):
+        st.warning(f"🧠 Final Review: NO TRADE | {str(gr.get('reason', ''))[:900]}")
+    elif s == "UNAVAILABLE":
+        st.caption(f"🧠 Gemini abhi available nahi: {str(gr.get('reason', ''))[:300]}")
+    elif s == "PENDING":
+        st.caption("🧠 Gemini review background me chal raha hai -- agle refresh (30 sec) me verdict aayega.")
+
+
+def gemini_report(ctx):
+    """Har trade ke peeche Gemini ka report (expander, same as Nifty)."""
+    p2 = ctx.get("p2") or {}
+    gr = (p2.get("gemini_review") or {})
+    with st.expander("🧾 Har trade ke peeche Gemini ka report", expanded=False):
+        if not gr or gr.get("status") == "NOT_NEEDED":
+            st.caption("Abhi koi candidate setup Gemini ko nahi gaya (strategy + AI same direction hone par hi review hota hai).")
+            return
+        st.write(f"**Verdict:** {gr.get('status')} | **Direction:** {gr.get('direction')} | **Confidence:** {gr.get('confidence')}")
+        st.write(str(gr.get("reason", ""))[:2000])
+        if gr.get("risk_flags"):
+            st.caption("Risk flags: " + ", ".join(map(str, gr["risk_flags"])))
+        if gr.get("model"):
+            st.caption(f"Model: {gr.get('model')} | Google Search: {'ON' if gr.get('search_used') else 'off'}")
+
+
+def deep_report(ctx, ai_engine, gscore, gavg):
+    with st.expander("🦅 Multi-Factor Hybrid AI Deep Reasoning Report", expanded=False):
+        ai = ctx.get("ai")
+        if not ai or ai_engine is None:
+            st.info("AI engine ka analysis abhi available nahi.")
+            return
+        try:
+            txt = ai_engine.generate_llm_reasoning(live_price=ctx["live_price"], meta_summary=ai, sentiment_score=gscore,
+                                                   global_avg_change=gavg, use_ai=False)
+            st.caption("📐 Calculated report (no Gemini used here) -- ask the chat box below for a live AI-written read anytime.")
+            st.markdown(txt)
+        except Exception:
+            logger.exception("deep report failed (ignored)")
+            st.info("Deep Reasoning Report abhi nahi ban paya.")
+# @@END stock_phase2_ui
+
+# @@MODULE stock_phase3_ui
+"""
+stock_phase3_ui.py -- PHASE 3 panels of the stock dashboard (same widgets/wording/order as Nifty, app.py ~1636-1790), reading ONLY the stock's
+private engine copy (stock_family.py).
+
+Market Brain price scale: Nifty's brain labels "+25 / +50 pt" moves.  For a stock the SAME brain is fed a price-normalised copy of the candles
+(factor k fixed per stock, saved in stock_data/<SYM>/scale.json so stored snapshots stay comparable) so "25 / 50" mean ~0.2 % / ~0.4 % of the
+stock price.  Volume / RSI are never scaled.
+"""
+import json
+import os
+
+import pandas as pd
+import streamlit as st
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+_REF = 12500.0       # scaled price level: 25 pts = 0.2 %, 50 pts = 0.4 %
+
+
+def _scale_factor(fam, price):
+    path = os.path.join(fam.dir, "scale.json")
+    try:
+        with open(path) as fh:
+            k = float(json.load(fh)["k"])
+            if k > 0:
+                return k
+    except Exception:
+        pass
+    k = _REF / float(price)
+    try:
+        with open(path, "w") as fh:
+            json.dump({"k": k, "ref_price": float(price)}, fh)
+    except Exception:
+        pass
+    return k
+
+
+def scaled_df(df, k):
+    d = df.copy()
+    for c in d.columns:
+        if c in ("Volume", "RSI") or not pd.api.types.is_numeric_dtype(d[c]):
+            continue
+        d[c] = d[c] * k
+    d.attrs = dict(getattr(df, "attrs", {}) or {})
+    return d
+
+
+def market_brain(ctx):
+    p2 = ctx.get("p2") or {}
+    fam = p2.get("family")
+    st.subheader("🧬 Market Brain (roz market se seekhne wala dimaag)")
+    if fam is None:
+        st.info("Market Brain tab chalega jab is stock ka engine-copy ban jaye.")
+        return
+    try:
+        k = _scale_factor(fam, ctx["live_price"])
+        st.caption(f"{ctx['symbol']} ke liye brain price-normalised hai: '25 pt' ≈ ₹{25 / k:,.2f} ({25 / k / ctx['live_price'] * 100:.2f}%), "
+                   f"'50 pt' ≈ ₹{50 / k:,.2f} ({50 / k / ctx['live_price'] * 100:.2f}%). Seekhna sirf is stock ka hai.")
+        peers = ctx.get("peers") or {}
+        ns = {"market_source": getattr(ctx["df"], "attrs", {}).get("market_source", ""), "live_price": ctx["live_price"] * k,
+              "live_vix": (ctx.get("extra") or {}).get("vix"), "advances": peers.get("adv"), "declines": peers.get("dec"),
+              "avg_market_change": (ctx.get("extra") or {}).get("gavg"), "current_pcr": ctx.get("pcr") or None,
+              "strategy_result": p2.get("strategy_result"), "_decision": p2.get("decision")}
+        fam.market_brain.run(st, scaled_df(ctx["df"], k), ns)
+    except Exception:
+        logger.exception("stock market brain failed (ignored)")
+        st.info("Market Brain abhi nahi chal paya (ignored).")
+
+
+def shadow_gate_timeline_track(ctx, state):
+    fam = (ctx.get("p2") or {}).get("family")
+    if fam is None:
+        return
+    sym, df = ctx["symbol"], ctx["df"]
+    tl, sh, gl, td = fam.trade_learning, fam.shadow_trades, fam.gate_log, fam.trade_diagnostics
+
+    with st.expander("🕶️ Shadow trades -- jo setups block hue, unka result (bina paisa lagaye seekhna)", expanded=False):
+        try:
+            s = sh.summary()
+            rows = [{"Gate jisne roka": g, "Result mila": e["n"], "Win hota": e["wins"], "Loss hota": e["losses"], "Win %": e["win_rate"],
+                     "Matlab": ("block sahi tha" if (e["win_rate"] is not None and e["win_rate"] < 40)
+                                else "gate zyada sakht ho sakta hai" if (e["win_rate"] is not None and e["n"] >= 8 and e["win_rate"] >= 55)
+                                else "abhi data kam")} for g, e in sorted(s["by_gate"].items(), key=lambda kv: -kv[1]["n"])]
+            st.caption(f"{sym} ke block hue setups virtually track hote hain (same SL/target rules); real trade nahi. Storage: stock_data/{sym}/")
+            if rows:
+                st.dataframe(rows, hide_index=True, width="stretch")
+            st.caption(f"Abhi {s['open']} shadow trade chal rahe hain | total logged: {s['total']}")
+        except Exception:
+            st.caption("Shadow data abhi available nahi.")
+
+    with st.expander("🚧 Kaun sa gate kitni baar roka (is session me, per 5-min candle)", expanded=False):
+        gc = state.get(f"_gate_counts_{sym}") or {}
+        if gc:
+            st.dataframe([{"Gate": k, "Candles": v} for k, v in sorted(gc.items(), key=lambda kv: -kv[1])], hide_index=True, width="stretch")
+            st.caption("Agar ek hi gate (Gemini ke alawa) bahut zyada rok raha hai, wahi tune karne ki jagah hai.")
+        else:
+            st.caption("Abhi data nahi -- thodi der chalne do.")
+
+    with st.expander("📜 Aaj ka engine timeline (disk pe saved -- reload se nahi mitta)", expanded=False):
+        try:
+            today = str(df.index[-1])[:10]
+            note, sm = gl.coverage_note(today), gl.summary(today)
+            dd = df[df.index.astype(str).str[:10] == today]
+            rng = float(dd["High"].max() - dd["Low"].min()) if len(dd) else 0.0
+            chg = float(dd["Close"].iloc[-1] - dd["Open"].iloc[0]) if len(dd) else 0.0
+            st.write(f"**Aaj ki range:** ₹{rng:,.2f} | **Open se ab tak:** ₹{chg:+,.2f} | "
+                     f"**Engine ne dekhi candles:** {len({r['candle'] for r in sm['rows']})} | **Trade liye:** {sm['taken']}")
+            if note:
+                st.warning("⚠️ " + note)
+            try:
+                for mm in gl.missed_moves(today):
+                    g = ", ".join(f"{a} x{n}" for a, n in mm["gates"]) or "koi gate record nahi (engine chal nahi raha tha?)"
+                    msg = (f"**{'UP' if mm['dir'] == 'BUY' else 'DOWN'} move ₹{mm['pts']:.2f}** ({mm['start'].strftime('%H:%M')} -> "
+                           f"{mm['end'].strftime('%H:%M')}): " + ("trade liya gaya." if mm["taken"] else f"trade NAHI bana. {mm['dir']} ko in gates ne roka: {g}"))
+                    (st.success if mm["taken"] else st.error)(msg)
+            except Exception:
+                logger.exception("stock missed-move audit failed (ignored)")
+            if sm["by_gate"]:
+                st.dataframe([{"Gate": k, "Candles": v} for k, v in sorted(sm["by_gate"].items(), key=lambda kv: -kv[1])], hide_index=True, width="stretch")
+                st.dataframe([{"Candle": r["candle"][11:16], "Price": r["price"], "Gate": r["gate"], "Dir": r["direction"],
+                               "Detail": (r["detail"] or "")[:60], "Reason": (r["reason"] or "")[:140]} for r in sm["rows"][-60:]][::-1],
+                             hide_index=True, width="stretch")
+            else:
+                st.caption("Aaj ka record abhi khali hai -- engine ka pehla candle record hote hi yahan dikhega.")
+        except Exception:
+            logger.exception("stock timeline failed (ignored)")
+            st.caption("Timeline abhi available nahi.")
+
+    with st.expander("📈 Engine ka real track record + factor reliability", expanded=False):
+        try:
+            tr = tl.get_overall_track_record()
+            if tr["sample_size"] == 0:
+                st.caption(f"{sym} ka abhi koi resolved trade nahi hai -- fake number nahi dikhaya jayega.")
+            else:
+                a, b, c = st.columns(3)
+                a.metric("Resolved Trades", tr["sample_size"]); b.metric("Win Rate", f"{tr['win_rate']}%"); c.metric("Wins / Losses", f"{tr['wins']} / {tr['losses']}")
+                if tr.get("win_rate_incl_expired") is not None:
+                    st.caption(f"Honest win rate incl. clearly-red/green time-expired trades: {tr['win_rate_incl_expired']}% ({tr['sample_incl_expired']} trades)")
+                if tr["expired"] > 0:
+                    st.caption(f"({tr['expired']} setups time-expired -- na clean win, na clean loss)")
+            try:
+                lrs = td.loss_reason_summary(tl._labelled_rows_full())
+            except Exception:
+                lrs = []
+            if lrs:
+                st.markdown("**Haar ke kaaran:**")
+                st.dataframe(pd.DataFrame([{"Kaaran": r["reason"], "Haare": r["losses"], "Is condition wale trades": r["trades_with_tag"], "Win %": r["win_rate"]}
+                                           for r in lrs[:8]]), width="stretch", hide_index=True)
+            st.markdown("**Recent AI Setups (kab liya tha, real log):**")
+            rec = tl.get_recent_setups(limit=20)
+            if not rec:
+                st.caption("Abhi koi setup log nahi hua -- genuine setup milte hi automatically yahan aayega.")
+            else:
+                st.dataframe([{"When": s["timestamp"], "Direction": f"{s['direction']} (shares)", "Entry": f"₹{s['entry']:,.2f}", "SL": f"₹{s['stop_loss']:,.2f}",
+                               "Target": f"₹{s['target']:,.2f}", "Confidence": f"{s['confidence_pct']}%", "Status": s["status"],
+                               "Gemini": ("✅ Gemini approve" if (s.get("gemini") or {}).get("status") == "APPROVED" or (s.get("gemini") or {}).get("reviewer") == "GEMINI"
+                                          else "⚠️ local fallback" if s.get("gemini") else "—"),
+                               "Exit": f"₹{s['exit_price']:,.2f} @ {s['exit_timestamp']}" if s["exit_price"] else "-"} for s in rec], hide_index=True, width="stretch")
+                for x in [r for r in rec if r.get("gemini")][:10]:
+                    g = x["gemini"]
+                    st.caption(f"{x['timestamp']} {x['direction']} [{x['status']}] · {g.get('model') or '-'} · {str(g.get('reason') or '')[:300]}")
+            st.markdown("**Factor Reliability (is stock ke apne resolved trades se):**")
+            rel = tl.get_factor_reliability()
+            st.dataframe([{"Factor": r["label"], "Wins When True": r.get("wins_when_true", 0), "Losses When True": r.get("losses_when_true", 0),
+                           "True Samples": r.get("samples_when_true", 0),
+                           "Win Rate When True": f"{r['win_rate_when_true']}%" if r["win_rate_when_true"] is not None else "Not enough data yet"}
+                          for r in rel.values()], hide_index=True, width="stretch")
+        except Exception:
+            logger.exception("stock track record failed (ignored)")
+            st.caption("Track record abhi available nahi.")
+
+
+def peers_table(ctx):
+    pr = ctx.get("peers") or {}
+    if pr.get("status") != "AVAILABLE":
+        st.caption("Peers breadth: " + (pr.get("reason") or "data nahi") + " (honestly unavailable -- fake data nahi).")
+        return
+    a, b, c, d = st.columns(4)
+    a.metric("Advances", pr["adv"]); b.metric("Declines", pr["dec"]); c.metric("Unchanged", pr["unch"]); d.metric("Avg change", f"{pr['avg_change']:+.2f}%")
+    st.caption(f"Peers: {pr['group']} ke Nifty-50 heavyweights ({pr['fetched']} fetched).")
+    if pr.get("warning"):
+        st.warning("⚠️ " + pr["warning"])
+    st.dataframe(pr["rows"], hide_index=True, width="stretch")
+# @@END stock_phase3_ui
+
+# @@MODULE stock_watchlist
+"""
+stock_watchlist.py -- PHASE 4: the ROBOT WATCHLIST.
+
+The user adds NSE symbols (no limit; 5-10 is the sweet spot) to a persistent watchlist.  A single daemon thread inside the app process then runs the
+FULL stock engine for every watchlist stock whenever the market is OPEN -- with the browser/phone closed -- exactly the work the dashboard does when
+you load that stock:
+
+    candles + all research  ->  41 strategies  ->  ML  ->  Consensus  ->  AI Trade Decision (self-learning)  ->  Gemini final review
+        ->  trade lock (Entry / SL / Target)  ->  live-tick SL/target watcher  ->  WIN / LOSS / EXPIRED recorded  ->  the stock's own learning
+        ->  Telegram: entry alert (stock, price, SL, target, why) and exit alert
+
+Learning is per stock (stock_family.py) so every cycle makes THAT stock's engine, gates and Market Brain better; nothing is shared with Nifty.
+Nifty 50 keeps running exactly as before (its own robot tab, keep_app_awake.yml).  This thread lives in the same Streamlit process, so it is alive
+whenever that robot tab keeps the app awake.  The watchlist is saved to disk and mirrored to Supabase (`stock_watchlist`) so a restart brings it back.
+"""
+import json
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+ROOT = os.environ.get("STOCK_DATA_DIR", "stock_data")
+PATH = os.path.join(ROOT, "watchlist.json")
+TABLE = "stock_watchlist"
+CYCLE_GAP = 60.0            # a stock is refreshed at most once a minute (candles are 5-min, ticks are handled by the tick watcher)
+WORKERS = 3                 # stocks processed in parallel
+POST_CLOSE_UNTIL = (15, 50)  # one last pass after the close so the day's candles get labelled
+_LOCK = threading.RLock()
+_STATUS = {}
+_STATES = {}
+_RUNNER = {"thread": None, "ai": None, "keys": [], "synced": False}
+_GLOBAL = {"t": 0.0, "v": None}
+
+
+# ------------------------------------------------------------------------------------------------------------------ shared per-stock state
+def shared_state(symbol):
+    """ONE state dict per stock, shared by the dashboard and the robot (Gemini cache, gate counts, consensus history, early-warning lock), so the
+    two never repeat a Gemini call or double-count a candle."""
+    import stock_family
+    key = stock_family.safe_name(symbol)
+    with _LOCK:
+        return _STATES.setdefault(key, {})
+
+
+# ------------------------------------------------------------------------------------------------------------------------- persistence
+def _supabase():
+    try:
+        import stock_store
+        url, hdr = stock_store._cfg()
+        if url:
+            return url.rsplit("/", 1)[0] + "/" + TABLE, hdr
+    except Exception:
+        pass
+    return None, None
+
+
+def _load_local():
+    try:
+        with open(PATH, "r", encoding="utf-8") as fh:
+            return [str(s).upper() for s in (json.load(fh).get("symbols") or [])]
+    except Exception:
+        return []
+
+
+def _save_local(symbols):
+    try:
+        os.makedirs(ROOT, exist_ok=True)
+        with open(PATH, "w", encoding="utf-8") as fh:
+            json.dump({"symbols": symbols}, fh)
+    except Exception:
+        logger.exception("watchlist save failed (ignored)")
+
+
+def _mirror(symbols):
+    url, hdr = _supabase()
+    if not url:
+        return
+    try:
+        r = requests.get(f"{url}?select=symbol&limit=2000", headers=hdr, timeout=8)
+        r.raise_for_status()
+        remote = {x["symbol"] for x in (r.json() or [])}
+        for s in set(symbols) - remote:
+            requests.post(url, headers=hdr, json={"symbol": s}, timeout=8).raise_for_status()
+        for s in remote - set(symbols):
+            requests.delete(f"{url}?symbol=eq.{s}", headers=hdr, timeout=8).raise_for_status()
+    except Exception:
+        logger.exception("watchlist mirror failed (ignored)")
+
+
+def _restore():
+    """Fresh container (local file gone): bring the watchlist back from Supabase once."""
+    if _RUNNER["synced"]:
+        return
+    _RUNNER["synced"] = True
+    if _load_local():
+        return
+    url, hdr = _supabase()
+    if not url:
+        return
+    try:
+        r = requests.get(f"{url}?select=symbol&order=symbol.asc&limit=2000", headers=hdr, timeout=8)
+        r.raise_for_status()
+        syms = [x["symbol"] for x in (r.json() or [])]
+        if syms:
+            _save_local(syms)
+    except Exception:
+        logger.exception("watchlist restore failed (ignored)")
+
+
+def list_symbols():
+    _restore()
+    with _LOCK:
+        return _load_local()
+
+
+def add(raw):
+    """-> (ok, message).  Accepts any NSE symbol / company text; resolved against the NSE list."""
+    import stock_universe
+    sym = stock_universe.clean_symbol(raw)
+    if not sym:
+        return False, "Symbol khali hai."
+    meta = stock_universe.resolve(sym) or {}
+    sym = (meta.get("symbol") or sym).upper()
+    with _LOCK:
+        cur = _load_local()
+        if sym in cur:
+            return False, f"{sym} pehle se watchlist me hai."
+        cur.append(sym)
+        _save_local(cur)
+    threading.Thread(target=_mirror, args=(cur,), daemon=True).start()
+    return True, f"{sym} watchlist me add ho gaya" + ("" if meta.get("known") else " (NSE list me exact nahi mila -- spelling check kar lena)") + "."
+
+
+def remove(sym):
+    with _LOCK:
+        cur = [s for s in _load_local() if s != str(sym).upper()]
+        _save_local(cur)
+    threading.Thread(target=_mirror, args=(cur,), daemon=True).start()
+    _STATUS.pop(str(sym).upper(), None)
+
+
+def status():
+    with _LOCK:
+        return {k: dict(v) for k, v in _STATUS.items()}
+
+
+# ----------------------------------------------------------------------------------------------------------------------------- the robot
+def _market_state():
+    import market_status
+    try:
+        return market_status.get_market_status()
+    except Exception:
+        return {"state": "UNKNOWN"}
+
+
+def _global_bundle():
+    """Global markets / VIX / global news -- fetched once for ALL stocks, cached 5 min."""
+    if _GLOBAL["v"] is not None and time.time() - _GLOBAL["t"] < 300:
+        return _GLOBAL["v"]
+    import pandas as pd
+    import safe_io, global_markets, global_news
+    df_gm = safe_io.guarded("wl_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
+    gscore, gavg = safe_io.guarded("wl_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
+    vix = safe_io.guarded("wl_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
+    sp = safe_io.guarded("wl_global_news", global_news.get_global_market_sentiment, timeout=10, default=(pd.DataFrame(), ""))
+    df_sent = sp[0] if isinstance(sp, tuple) else pd.DataFrame()
+    _GLOBAL["v"], _GLOBAL["t"] = (df_gm, gscore, gavg, vix, df_sent), time.time()
+    return _GLOBAL["v"]
+
+
+def run_once(sym, token=None):
+    """One full headless pass for one stock.  Returns the status row.  Never raises."""
+    import stock_pipeline, stock_engine, stock_family, stock_phase3_ui
+    row = {"symbol": sym, "last_run": time.strftime("%H:%M:%S"), "ok": False, "gate": "", "direction": "", "open": "", "error": "", "ms": 0}
+    t0 = time.time()
+    try:
+        token = token or __import__("upstox_auth")._stored_token()
+        df_gm, gscore, gavg, vix, df_sent = _global_bundle()
+        state = shared_state(sym)
+        ctx = stock_pipeline.build_context(sym, token, _RUNNER["ai"], global_avg_change=gavg or 0.0, sentiment_score=gscore, live_vix=vix, state=state)
+        if ctx.get("status") != "OK":
+            row["error"] = str(ctx.get("message") or ctx.get("status"))[:160]
+            return row
+        p2 = stock_engine.run(ctx, state, list(_RUNNER["keys"] or []), extra={"df_gm": df_gm, "df_sent": df_sent, "gavg": gavg, "vix": vix})
+        ctx["p2"] = p2
+        # Market Brain: record this candle + label old ones (cheap part only; the heavy forecaster is drawn when the stock is opened)
+        try:
+            fam = p2.get("family")
+            if fam is not None and "UNAVAILABLE" not in str(ctx["df"].attrs.get("market_source", "")):
+                k = stock_phase3_ui._scale_factor(fam, ctx["live_price"])
+                sd = stock_phase3_ui.scaled_df(ctx["df"], k)
+                d = fam.market_memory.prep(sd)
+                if d is not None:
+                    fam.market_memory.record(sd, fam.market_memory.build_extras({"live_price": ctx["live_price"] * k, "live_vix": vix, "advances": (ctx.get("peers") or {}).get("adv"),
+                                                                                  "declines": (ctx.get("peers") or {}).get("dec"), "strategy_result": p2.get("strategy_result")}))
+        except Exception:
+            logger.exception("watchlist brain record failed (ignored)")
+        dec = p2.get("decision") or {}
+        op = p2.get("open_setup")
+        row.update(ok=True, gate=str(p2.get("gate") or ("OPEN TRADE" if op else "")), direction=str(dec.get("direction") or ((p2.get("strategy_result") or {}).get("direction") or "")),
+                   open=(f"{op['direction']} @ ₹{op['underlying_entry']:.2f}" if op else ""), error="; ".join((p2.get("errors") or [])[:2])[:160],
+                   candle=str(ctx.get("last_candle")))
+    except Exception as e:
+        logger.exception("watchlist run failed for %s (ignored)", sym)
+        row["error"] = f"{type(e).__name__}: {e}"[:160]
+    finally:
+        row["ms"] = round((time.time() - t0) * 1000)
+        with _LOCK:
+            _STATUS[sym] = row
+    return row
+
+
+def _loop():
+    done_after_close = {}
+    pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="wl")
+    while True:
+        try:
+            time.sleep(5)
+            syms = list_symbols()
+            if not syms:
+                time.sleep(20)
+                continue
+            mk = _market_state()
+            state = mk.get("state")
+            now = mk.get("now_ist")
+            after_close = False
+            if state != "OPEN":
+                try:
+                    after_close = (now.hour, now.minute) <= POST_CLOSE_UNTIL and now.weekday() < 5 and now.hour >= 15
+                except Exception:
+                    after_close = False
+                if not after_close:
+                    time.sleep(30)
+                    continue
+            due = []
+            for s in syms:
+                last = (_STATUS.get(s) or {}).get("_t", 0.0)
+                if after_close and done_after_close.get(s) == str(now.date()):
+                    continue
+                if time.time() - last >= CYCLE_GAP:
+                    due.append(s)
+            token = None
+            try:
+                token = __import__("upstox_auth")._stored_token()
+            except Exception:
+                pass
+            futs = []
+            for s in due:
+                futs.append((s, pool.submit(run_once, s, token)))
+            for s, f in futs:
+                try:
+                    f.result(timeout=170)
+                except Exception:
+                    logger.exception("watchlist job timeout %s (ignored)", s)
+                with _LOCK:
+                    _STATUS.setdefault(s, {})["_t"] = time.time()
+                if after_close:
+                    done_after_close[s] = str(now.date())
+        except Exception:
+            logger.exception("watchlist loop error (ignored)")
+            time.sleep(10)
+
+
+def ensure_runner(ai_engine=None, gemini_keys=None):
+    """Start the one robot thread (idempotent).  Called from app.py on every script run."""
+    with _LOCK:
+        if ai_engine is not None:
+            _RUNNER["ai"] = ai_engine
+        if gemini_keys is not None:
+            _RUNNER["keys"] = list(gemini_keys)
+        t = _RUNNER["thread"]
+        if t is not None and t.is_alive():
+            return False
+        t = threading.Thread(target=_loop, name="stock-watchlist-robot", daemon=True)
+        _RUNNER["thread"] = t
+        t.start()
+        try:
+            import stock_engine
+            stock_engine.ensure_watcher()
+        except Exception:
+            pass
+        return True
+
+
+# ------------------------------------------------------------------------------------------------------------------------------------ UI
+def sidebar_panel():
+    """⭐ Robot Watchlist in the sidebar: add by name, remove, live status of every stock, one-tap Load."""
+    import streamlit as st
+    syms = list_symbols()
+    with st.expander(f"⭐ Robot Watchlist ({len(syms)} stocks) -- market me khud trade", expanded=False):
+        st.caption("Yahan jo stocks add karoge unki poori research + AI Trade Decision + Gemini review market OPEN hote hi khud chalega (app band ho tab bhi, "
+                   "jab tak GitHub robot tab app jagaye rakhe). Trade lock, SL/target, win/loss sab record hota hai aur har stock apni learning se behtar hota hai. "
+                   "Telegram par har trade ka alert aata hai.")
+        c1, c2 = st.columns([3, 1])
+        txt = c1.text_input("Stock naam / symbol", key="wl_add_text", placeholder="RELIANCE, TCS ... (comma se kai ek saath)", label_visibility="collapsed")
+        if c2.button("➕ Add", key="wl_add_btn", width="stretch") and txt.strip():
+            for part in [p for p in txt.replace("\n", ",").split(",") if p.strip()]:
+                ok, msg = add(part)
+                (st.success if ok else st.warning)(msg)
+            syms = list_symbols()
+        stat = status()
+        if not syms:
+            st.info("Watchlist khali hai. Upar stock ka naam daal kar Add dabao.")
+        for s in syms:
+            r = stat.get(s) or {}
+            a, b, c = st.columns([3, 1, 1])
+            line = f"**{s}**" + (f" · {r.get('open')}" if r.get("open") else (f" · {r.get('gate')}" if r.get("gate") else " · pehla run baaki"))
+            if r.get("error") and not r.get("ok"):
+                line += " ⚠️"
+            a.markdown(line)
+            if b.button("Load", key=f"wl_load_{s}", width="stretch"):
+                st.session_state["active_symbol"] = s
+                st.rerun()
+            if c.button("🗑", key=f"wl_del_{s}", width="stretch"):
+                remove(s)
+                st.rerun()
+        if stat:
+            import pandas as pd
+            st.dataframe(pd.DataFrame([{"Stock": s, "Last run": v.get("last_run"), "OK": "✅" if v.get("ok") else "⚠️", "Gate / trade": v.get("open") or v.get("gate"),
+                                        "Dir": v.get("direction"), "ms": v.get("ms"), "Error": v.get("error")} for s, v in sorted(stat.items())]),
+                         hide_index=True, width="stretch")
+        alive = (_RUNNER["thread"] is not None and _RUNNER["thread"].is_alive())
+        st.caption(("🟢 Robot thread chal raha hai" if alive else "🔴 Robot thread band") + " · market OPEN me har stock ~1 min me refresh · "
+                   "Nifty 50 apne purane robot se chalta rahega.")
+# @@END stock_watchlist
+
+# @@MODULE stock_dashboard
+"""
+stock_dashboard.py -- draws the selected stock's dashboard in EXACTLY the section order, headings, colours and widgets of the Nifty 50
+dashboard (app.py `_live_dashboard`).  Only the data changes: where Nifty shows Nifty data, this shows the stock's own data.
+
+Sections whose engines arrive in PHASE 2 / PHASE 3 are already in their final place (same position as on the Nifty page) and say so,
+so the layout never changes later -- only the placeholder turns into the live engine.
+
+Public API:  render(symbol, ai_engine, helpers)      helpers = {"fundamentals": fn, "news": fn, "metric": fn}  (renderers living in app.py)
+"""
+import html as _html
+import time
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+import safe_io
+import upstox_auth
+import market_status
+import global_markets
+import global_news
+import stock_pipeline
+import stock_engine
+import stock_phase2_ui
+import stock_phase3_ui
+import stock_watchlist
+
+PHASE2_NOTE = "🛠️ **Phase 2 mein activate hoga** -- is section ki jagah final hai (Nifty wali jagah par), engine agle phase mein judega."
+PHASE3_NOTE = "🛠️ **Phase 3 mein activate hoga** -- is section ki jagah final hai (Nifty wali jagah par), engine agle phase mein judega."
+
+
+def _rs(v, d=2):
+    try:
+        return f"₹{float(v):,.{d}f}"
+    except Exception:
+        return "N/A"
+
+
+def render_stock_hero(symbol, company=""):
+    """Same animated hero as Nifty -- only the title text is the stock's (the demo price card is decoration, as on the Nifty page)."""
+    try:
+        import streamlit.components.v1 as components
+        import ui_theme
+        h = ui_theme._HERO_HTML
+        sym = _html.escape(symbol)
+        h = h.replace("NIFTY 50", sym).replace("NIFTY &middot; AI PULSE", f"{sym} &middot; AI PULSE")
+        components.html(h, height=460, scrolling=False)
+    except Exception:
+        logger.exception("stock hero failed")
+        st.title(f"⚡ {symbol} AI Trading Terminal")
+
+
+def _is_live():
+    try:
+        return market_status.get_market_status()["state"] in ("OPEN", "PRE_OPEN")
+    except Exception:
+        return True
+
+
+# --------------------------------------------------------------------------------------------------------------- body
+def _chat_context(ctx):
+    """Compact, JSON-safe copy of the stock context for the AI chat box (no DataFrames)."""
+    skip = {"df", "market", "last_candle", "timings", "meta"}
+    out = {}
+    for k, v in ctx.items():
+        if k in skip:
+            continue
+        out[k] = v
+    out["last_candle"] = str(ctx.get("last_candle"))
+    try:
+        out["recent_candles"] = ctx["df"].tail(12)[["Open", "High", "Low", "Close", "Volume"]].round(2).reset_index().astype(str).to_dict("records")
+    except Exception:
+        pass
+    return out
+
+
+def _body(symbol, ai_engine, helpers):
+    sp = safe_io.Stepper(st.empty())
+    sp.step("Broker login + stock candles")
+    token = upstox_auth.get_upstox_access_token()
+    if "access_token" not in st.session_state:
+        st.session_state.access_token = token
+
+    sp.step("Global news + markets")
+    df_gm = safe_io.guarded("stk_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
+    gscore, gavg = safe_io.guarded("stk_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
+    vix = safe_io.guarded("stk_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
+    sent_pair = safe_io.guarded("stk_global_news", global_news.get_global_market_sentiment, timeout=10, default=(pd.DataFrame(), "Global headline unavailable right now."))
+    df_sent, top_headline = sent_pair if isinstance(sent_pair, tuple) else (pd.DataFrame(), "")
+
+    sp.step(f"{symbol} research engines")
+    capital = float(st.session_state.get("risk_capital", 100000.0))
+    risk_pct = float(st.session_state.get("risk_pct", 1.0))
+    ctx = stock_pipeline.build_context(symbol, token, ai_engine, capital=capital, risk_pct=risk_pct, global_avg_change=gavg or 0.0,
+                                       sentiment_score=gscore, live_vix=vix, state=stock_watchlist.shared_state(symbol))
+    if ctx.get("status") != "OK":
+        st.error(ctx.get("message") or f"{symbol} ka data abhi available nahi hai.")
+        sp.done()
+        return
+    sp.step("Strategy -> Consensus -> AI decision -> Gemini")
+    try:
+        ctx["p2"] = stock_engine.run(ctx, stock_watchlist.shared_state(symbol), list((helpers or {}).get("gemini_keys") or []),
+                                     extra={"df_gm": df_gm, "df_sent": df_sent, "gavg": gavg, "vix": vix})
+    except Exception as e:
+        logger.exception("stock phase2 failed (ignored)")
+        ctx["p2"] = {"status": "ERROR", "errors": [f"{type(e).__name__}: {e}"]}
+        ctx["errors"] = list(ctx.get("errors") or []) + [f"phase2: {type(e).__name__}: {e}"]
+    ctx["errors"] = list(ctx.get("errors") or []) + list((ctx["p2"] or {}).get("errors") or [])
+    sp.step("Drawing dashboard")
+
+    df, price, ai = ctx["df"], ctx["live_price"], ctx.get("ai") or {}
+    sym = ctx["symbol"]
+    mkt, fresh = ctx["market"], ctx["freshness"]
+
+    # ------------------------------------------------------------------ top status (same banner logic as Nifty)
+    status_line = f"{mkt['label']} | IST Time: {mkt['now_ist'].strftime('%d-%b-%Y %H:%M:%S')} | Last Candle: {ctx['last_candle'].strftime('%d-%b-%Y %H:%M:%S')}"
+    if fresh["is_stale"]:
+        st.error(f"⚠️ **DATA STALE/FROZEN** — {fresh['note']} | {status_line}")
+    elif mkt["state"] == "OPEN":
+        st.success(f"{status_line} ✅ Data looks fresh")
+    else:
+        st.info(f"{status_line} — market band hai, ye last traded price hai, live tick nahi.")
+    src = ctx["data_source"]
+    if src != "UPSTOX_LIVE":
+        st.warning(f"⚠️ **{sym}** ka data Upstox se nahi aaya -- **{'Yahoo (non-tradable, delayed)' if 'YAHOO' in src else src}** chal raha hai. "
+                   "Sidebar me Upstox login karo (live feed) -- tab hi tradable/live numbers aate hain.")
+    if not ctx["meta"].get("known"):
+        st.caption(f"ℹ️ '{sym}' NSE list me exact nahi mila -- jo data mila wahi dikha rahe hain; spelling check kar lo.")
+
+    # consensus engine line -- Phase 2
+    stock_phase2_ui.consensus(ctx)
+
+    sr = ctx["sr_context"] or {}
+    ns, nr = (sr.get("nearest_support") or {}), (sr.get("nearest_resistance") or {})
+    st.caption(f"🧭 S/R Location: {sr.get('location', 'UNKNOWN')} | Support: {ns.get('low')}–{ns.get('high')} | Resistance: {nr.get('low')}–{nr.get('high')}")
+
+    # ------------------------------------------------------------------ core metrics
+    c1, c2, c3 = st.columns(3)
+    c1.metric(label=f"Real-Time Live {sym} Price (LTP)", value=f"₹ {price:,.2f}")
+    c2.metric(label="Institutional Confluence Signal", value=ctx["final_signal_text"])
+    c3.metric(label="AI Confluence Score (live heuristic)", value=f"{ai.get('confidence_pct', 0)}%")
+    st.caption(f"🏢 {ctx['company']} · Sector: {ctx['sector']} · ISIN: {ctx.get('isin') or 'N/A'} · Market source: **{src}** · "
+               f"Ladder step: ₹{ctx['step']:g} (stock ke price ke hisaab se)")
+
+    # ------------------------------------------------------------------ Early Warning
+    lp = ctx["level_prediction"] or {}
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("🎯 Early Warning: Support/Resistance Approach Predictor (ICT)")
+    st.caption("Ye level ko TOUCH hone se pehle fire hota hai — support/resistance ke paas pahunchte hi break ya "
+               "bounce hone ka % chance dikhata hai, taaki lagging confirmation signal ka wait na karna pade.")
+    if lp.get("status") == "APPROACHING_LEVEL":
+        lw1, lw2, lw3 = st.columns(3)
+        lw1.metric(label=f"Approaching {lp['level_type']}", value=_rs(lp["level_price"]), delta=f"{lp['distance_pts']:.2f} away")
+        lw2.metric(label="Break-Through Probability", value=f"{lp['break_pct']}%")
+        lw3.metric(label="Bounce / Reject Probability", value=f"{lp['bounce_pct']}%")
+        sp_ = lp.get("level_strength_pct")
+        if sp_ is not None:
+            lab = "STRONG" if sp_ >= 75 else ("MODERATE" if sp_ >= 55 else "WEAK")
+            st.caption(f"🛡️ **Structural Level Strength: {sp_:.1f}% ({lab})** | Break/Hold % is a live model estimate, not a 100% guarantee.")
+            if lp.get("level_strength_reasons"):
+                st.caption("Level evidence: " + "; ".join(lp["level_strength_reasons"]))
+        msg = f"**Early Read:** {lp['directional_bias']} — {lp['level_type']} {_rs(lp['level_price'])} ke paas confluence factors is direction ko favor kar rahe hain."
+        (st.success if "🟢" in lp["directional_bias"] else st.error)(msg)
+        with st.expander("🔍 Confluence Factors (ICT + Momentum + Volume)", expanded=False):
+            for f in lp.get("factors", []):
+                st.write(f"- {f}")
+    else:
+        a, b = lp.get("nearest_support"), lp.get("nearest_resistance")
+        st.info("Price abhi kisi key support/resistance ke approach-zone me nahi hai. "
+                f"Nearest Support: {_rs(a) if a is not None else 'N/A'} | Nearest Resistance: {_rs(b) if b is not None else 'N/A'}")
+
+    # ------------------------------------------------------------------ Phase 1 expander
+    regime, pivots, orb, lm = ctx["regime"], ctx["pivots"], ctx["orb"], ctx["liquidity_map"] or {}
+    with st.expander("🧭 Market Regime + CPR/Pivot + Liquidity Map (Phase 1)", expanded=False):
+        st.markdown(f"**Regime:** {regime.get('primary')} | **Volatility:** {regime.get('volatility')} | **Structure:** {regime.get('structure')}"
+                    + (" | 📅 Expiry-day heuristic ON" if regime.get("expiry_regime") else ""))
+        if regime.get("adx") is not None:
+            st.caption(f"ADX {regime['adx']} (+DI {regime.get('plus_di')} / -DI {regime.get('minus_di')}) | "
+                       f"ATR percentile {regime.get('atr_percentile')} | VIX {regime.get('vix')}")
+        st.write(ctx["regime_guidance"])
+        st.markdown("---")
+        if pivots.get("status") == "OK":
+            st.markdown(f"**Today's Pivot:** {_rs(pivots['pivot'])} | **CPR:** {_rs(pivots['bc'])} – {_rs(pivots['tc'])} "
+                        f"({pivots['cpr_label']}) | **Position:** {ctx['cpr_pos']}")
+            st.caption(f"R1 {pivots['r1']:,.2f} | R2 {pivots['r2']:,.2f} | R3 {pivots['r3']:,.2f}  ·  S1 {pivots['s1']:,.2f} | "
+                       f"S2 {pivots['s2']:,.2f} | S3 {pivots['s3']:,.2f}  ·  PDH {pivots['pdh']:,.2f} | PDL {pivots['pdl']:,.2f} | PDC {pivots['pdc']:,.2f}")
+        else:
+            st.caption("Pivots: not enough prior-day data yet.")
+        if orb.get("status") == "OK":
+            st.markdown(f"**Opening Range ({orb['orb_minutes']}m):** {_rs(orb['orb_low'])} – {_rs(orb['orb_high'])} → {orb['read']}")
+        st.markdown("---")
+        st.markdown(f"**Liquidity:** {ctx['nearest_liquidity']}")
+        if lm.get("status") == "OK" and lm.get("levels"):
+            for lv in lm["levels"][:6]:
+                st.write(f"- {lv['name']}: {_rs(lv['price'])} ({lv['distance_pts']:.2f} away, {lv['side']})")
+        if lm.get("equal_highs"):
+            st.caption("Equal Highs (resting sell-side liquidity): " + ", ".join(f"{_rs(e['level'])} ({e['touches']}x)" for e in lm["equal_highs"][:3]))
+        if lm.get("equal_lows"):
+            st.caption("Equal Lows (resting buy-side liquidity): " + ", ".join(f"{_rs(e['level'])} ({e['touches']}x)" for e in lm["equal_lows"][:3]))
+
+    # ------------------------------------------------------------------ Phase 2 expander
+    with st.expander("🔬 Deep Option Chain + Sector Breadth + Model Calibration (Phase 2)", expanded=False):
+        st.markdown("**IV Skew & Percentile**")
+        if not ctx["has_option_chain"]:
+            st.caption(f"{sym} ka option chain nahi mila (stock F&O me listed nahi ya Upstox ne data nahi diya) -- ye hissa khaali chhoda gaya hai.")
+        else:
+            iv = ctx["iv_skew"]
+            if iv:
+                st.write(f"Downside ({_rs(iv['downside_strike'], 0)}) IV: {iv['downside_iv']}% | Upside ({_rs(iv['upside_strike'], 0)}) IV: {iv['upside_iv']}% | Skew: {iv['skew']}")
+                st.caption(iv["read"])
+            else:
+                st.caption("IV skew unavailable right now (IV data missing in the chain).")
+            if ctx["atm_iv"] is not None:
+                st.write(f"Current ATM IV: {ctx['atm_iv']}%")
+                st.caption("1-year IV percentile is built for Nifty (India VIX history); a per-stock IV history arrives with Phase 3 storage.")
+        st.markdown("---")
+        st.markdown("**Sector Breadth**")
+        sc = ctx["sector_context"] or {}
+        if sc.get("status") == "AVAILABLE" and sc.get("change_pct") is not None:
+            st.write(f"Sector: **{ctx['sector']}** → index {sc.get('index')} {sc['change_pct']:+.2f}% today")
+            st.caption(ctx["breadth_status"] + " · Peer-stocks breadth table (poore sector ke stocks) Phase 3 mein judega.")
+        else:
+            st.caption("Sector index data abhi available nahi (sector map me is stock ka sector nahi / network).")
+        st.markdown("---")
+        st.markdown("**Model Confidence Calibration**")
+        stock_phase2_ui.model_calibration(ctx)
+
+    # ------------------------------------------------------------------ Phase 3 expander
+    with st.expander("📉 Order Flow + Real Backtest + Monte Carlo + Drift Detection (Phase 3)", expanded=False):
+        st.markdown(f"**Order Book Imbalance (Live, {sym} Depth)**")
+        of = ctx["order_flow"]
+        if of["status"] == "OK":
+            st.write(f"{of['pressure']} — Imbalance: {of['imbalance_pct']:+.1f}%")
+            st.caption(f"Resting Buy Qty: {of['total_buy_qty']:,} | Resting Sell Qty: {of['total_sell_qty']:,} | "
+                       f"Best Bid: ₹{of['best_bid']} | Best Ask: ₹{of['best_ask']} | Spread: {of['spread']}")
+            st.caption("Real top-5 Order Book Imbalance (OBI) from live Upstox depth of THIS stock — not tick-by-tick CVD.")
+        else:
+            st.caption(f"Order flow unavailable: {of.get('reason')}")
+        st.markdown("---")
+        st.markdown(f"**Real Backtest Report** ({sym}'s own logged trades only — {ctx['trade_count']} resolved so far; never mixed with Nifty / other stocks)")
+        bt = ctx["backtest"]
+        if bt.get("status") == "OK":
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Win Rate", f"{bt['win_rate_pct']}%"); b1.metric("Profit Factor", bt["profit_factor"])
+            b2.metric("Expectancy/Trade", f"{bt['expectancy_pts_per_trade']} pts"); b2.metric("Avg R-Multiple", bt["avg_r_multiple"])
+            b3.metric("Max Drawdown", f"{bt['max_drawdown_pts']} pts"); b3.metric("Longest Losing Streak", bt["longest_losing_streak"])
+            st.write(f"Gross P&L: {bt['gross_pnl_pts']} pts | Illustrative Net P&L: {bt['illustrative_net_pnl_pts']} pts")
+            st.caption(bt.get("illustrative_cost_note", ""))
+            st.write(f"Sharpe-like: {bt['sharpe_like_ratio']} | Sortino-like: {bt['sortino_like_ratio']}")
+            if bt.get("avg_mfe_pts") is not None:
+                st.write(f"Avg MFE: {bt['avg_mfe_pts']} pts | Avg MAE: {bt['avg_mae_pts']} pts")
+        else:
+            st.caption(bt.get("note", f"Not enough {sym} trade history yet -- Phase 2 ka AI engine trades log karega, tab ye bharega."))
+        st.markdown("---")
+        st.markdown("**Monte Carlo Analysis** (bootstrap of this stock's real R-multiples)")
+        mc = ctx["monte_carlo"]
+        if mc.get("status") == "OK":
+            m1, m2 = st.columns(2)
+            m1.metric("Median Max Drawdown", f"{mc['max_drawdown_r_median']} R"); m1.metric("Worst-Case (95th pct) Drawdown", f"{mc['max_drawdown_r_p95_worst_case']} R")
+            m2.metric("Median Losing Streak", mc["losing_streak_median"]); m2.metric("Risk of Ruin", f"{mc['risk_of_ruin_pct_of_sims']}%")
+        else:
+            st.caption(mc.get("note", "Monte Carlo unavailable."))
+        st.markdown("---")
+        st.markdown("**Model Drift Detection**")
+        dr = ctx["drift"]
+        st.write(f"Status: {dr.get('status')}")
+        if dr.get("status") != "NOT_ENOUGH_DATA":
+            st.write(f"Baseline Win Rate: {dr.get('baseline_win_rate_pct')}% | Recent ({dr.get('rolling_window')}-trade) Win Rate: {dr.get('recent_win_rate_pct')}%")
+            for r in dr.get("drift_reasons", []):
+                st.caption(f"⚠️ {r}")
+        else:
+            st.caption(dr.get("note", ""))
+
+    # ------------------------------------------------------------------ Phase 4 expander
+    with st.expander("🧮 Multi-Timeframe Structure + Position Sizing + Risk Engine (Phase 4)", expanded=False):
+        st.markdown(f"**Multi-Timeframe Structure** ({ctx['mtf'].get('source', 'candles')})")
+        mtf = ctx["mtf"]
+        if mtf.get("status") == "OK":
+            rows = []
+            for lbl in ["1D", "4H", "1H", "30M", "15M", "5M"]:
+                r = mtf["timeframes"].get(lbl, {})
+                if r.get("status") == "OK":
+                    rows.append({"Timeframe": lbl, "Trend": r["trend"], "Structure": r.get("structure_event"), "Last Close": r["last_close"]})
+            if rows:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            st.write(f"**{mtf['classification']}**")
+        else:
+            st.caption(f"Multi-timeframe structure unavailable: {mtf.get('reason', 'unknown')}")
+        st.markdown("---")
+        st.markdown("**Position Sizing Calculator** (shares -- stock cash segment, 1 share = 1 unit)")
+        p1, p2 = st.columns(2)
+        p1.number_input("Trading Capital (₹)", min_value=1000.0, value=float(st.session_state.get("risk_capital", 100000.0)), step=1000.0, key="risk_capital")
+        p2.number_input("Risk per Trade (%)", min_value=0.1, max_value=10.0, value=float(st.session_state.get("risk_pct", 1.0)), step=0.1, key="risk_pct")
+        ps = ctx["position_size"]
+        if ps.get("status") == "OK":
+            st.write(f"Shares: **{ps['quantity']}** | SL Distance: ₹{ps['sl_distance_pts']} | Risk: ₹{ps['actual_risk_rs']:,.0f} "
+                     f"({ps['actual_risk_pct_of_capital']}% of capital)")
+            for w in ps.get("warnings", []):
+                st.caption(f"⚠️ {w}")
+        else:
+            st.caption(ps.get("reason", "Position sizing unavailable."))
+        st.markdown("---")
+        st.markdown(f"**Risk Engine** ({sym}'s own logged trades)")
+        rs = ctx["risk_state"]
+        st.write(f"Status: **{rs.get('status')}**")
+        if rs.get("today_trade_count") is not None:
+            st.write(f"Today: {rs['today_trade_count']} trades | {rs['today_pnl_pts']} pts | Consecutive losses: {rs.get('consecutive_losses')}")
+        for r in rs.get("block_reasons", []):
+            st.caption(f"🛑 {r}")
+
+    # ------------------------------------------------------------------ Ladder + Reversal
+    ladder = ctx["ladder"] or {}
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander(f"📐 Full Support/Resistance Ladder Calculator (har ₹{ctx['step']:g} level)", expanded=False):
+        st.caption(f"Har ₹{ctx['step']:g} round-number level (double step 'major' maana jaata hai) ke liye break-through % aur bounce/reject % — "
+                   "same OI/PCR + ICT + volume + price-action model jo upar Early Warning me use hota hai, bus yahan HAR level ke liye.")
+        lr, ls = st.columns(2)
+        for col, key, title in ((lr, "resistances", f"**🔴 Resistances above {_rs(price)}**"), (ls, "supports", f"**🟢 Supports below {_rs(price)}**")):
+            with col:
+                st.markdown(title)
+                items = ladder.get(key) or []
+                if items:
+                    st.dataframe([{"Level": _rs(r["level_price"]), "Away": f"{r['distance_pts']:.2f}", "Break %": f"{r['break_pct']}%",
+                                   "Bounce %": f"{r['bounce_pct']}%", "Read": r["directional_bias"].replace(" 🟢", "").replace(" 🔴", "")} for r in items],
+                                 hide_index=True, width="stretch")
+                else:
+                    st.caption("Ladder data abhi available nahi hai.")
+        st.caption("💡 Break % = us level ke toot-ne (continuation) ka chance | Bounce % = wahin se palatne (reversal) ka chance.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander("🔄 Reversal Zone Predictor (market kahan se ghoomega)", expanded=False):
+        st.caption("Abhi ka trend continue rahega ya palatega -- agle likely reversal zones, same Ladder data se.")
+        MIN_PCT, code = 60.0, ctx["signal_code"]
+        if code == 1:
+            st.markdown("**📈 Abhi UP trend hai — agar ye continue na ho, toh niche diye levels par palat (DOWN) sakta hai:**")
+            cands = [r for r in (ladder.get("resistances") or []) if r["bounce_pct"] >= MIN_PCT]
+            for r in cands[:3]:
+                st.warning(f"{_rs(r['level_price'])} ({r['distance_pts']:.2f} door) -> **{r['bounce_pct']}% chance reversal (DOWN)** yahan se")
+            if not cands:
+                st.caption("Abhi koi resistance level itni strong reversal reading nahi de raha (60%+ nahi mila).")
+        elif code == -1:
+            st.markdown("**📉 Abhi DOWN trend hai — agar ye continue na ho, toh niche diye levels par palat (UP/BUY) sakta hai:**")
+            cands = [s for s in (ladder.get("supports") or []) if s["bounce_pct"] >= MIN_PCT]
+            for s in cands[:3]:
+                st.success(f"{_rs(s['level_price'])} ({s['distance_pts']:.2f} door) -> **{s['bounce_pct']}% chance reversal (UP/BUY)** yahan se")
+            if not cands:
+                st.caption("Abhi koi support level itni strong reversal reading nahi de raha (60%+ nahi mila).")
+        else:
+            st.caption("Abhi koi clear trend direction nahi hai (neutral/choppy) -- reversal zones tabhi meaningful hote hain jab trend chal raha ho.")
+        st.caption("⚠️ Ye bhi probability hai, guarantee nahi.")
+
+    # ------------------------------------------------------------------ Phase 2 engines (final place = same as Nifty)
+    st.markdown("<br>", unsafe_allow_html=True)
+    stock_phase2_ui.strategy_library(ctx)
+    st.markdown("<br>", unsafe_allow_html=True)
+    stock_phase2_ui.decision(ctx)
+    stock_phase2_ui.gemini_report(ctx)
+    st.markdown("<br>", unsafe_allow_html=True)
+    stock_phase3_ui.market_brain(ctx)
+    stock_phase3_ui.shadow_gate_timeline_track(ctx, stock_watchlist.shared_state(sym))
+    stock_phase2_ui.deep_report(ctx, ai_engine, gscore, gavg)
+
+    # ------------------------------------------------------------------ Order flow chart
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("📊 Institutional Order Flow Chart (VWAP & Volume Profile)")
+    cdf = df.tail(100)
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=cdf.index, open=cdf["Open"], high=cdf["High"], low=cdf["Low"], close=cdf["Close"], name=sym,
+                                 increasing_line_color="#26A69A", decreasing_line_color="#EF5350"))
+    fig.add_trace(go.Scatter(x=cdf.index, y=cdf["EMA_20"], mode="lines", name="EMA 20", line=dict(color="#2962FF", width=1)))
+    fig.add_trace(go.Scatter(x=cdf.index, y=cdf["VWAP"], mode="lines", name="VWAP (Smart Money Avg)", line=dict(color="#E040FB", width=2.5, dash="dot")))
+    fig.add_hline(y=ctx["poc"], line_width=2, line_dash="solid", line_color="#FFEA00", annotation_text=f"POC Level (Max Vol): {ctx['poc']:.2f}", annotation_position="top right")
+    fig.update_layout(xaxis_title="Time", yaxis_title="Price (₹)", template="plotly_dark", height=600, xaxis_rangeslider_visible=False,
+                      margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig, width="stretch")
+    vw, poc = ctx["vwap"], ctx["poc"]
+    cv1, cv2 = st.columns(2)
+    cv1.info(f"**VWAP Trend:** Price is {'BULLISH 🟢' if price > vw else 'BEARISH 🔴'} (VWAP: {_rs(vw)})")
+    cv2.info(f"**Smart Money POC:** {'PRICE IS ABOVE MAX VOLUME 🟢' if price > poc else 'PRICE IS BELOW MAX VOLUME 🔴'} (POC: {_rs(poc)})")
+    st.caption("Volume basis: " + (f"real traded volume of {sym} (equities have real volume -- no proxy needed)" if ctx["volume_is_real"]
+                                    else "price-based proxy — no real volume returned by the data source right now"))
+
+    # ------------------------------------------------------------------ Sniper
+    sniper = ctx["sniper"]
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("🎯 Sniper Setup (SMC + Option Chain OI + PDH/PDL/CPR Confluence)")
+    if sniper:
+        {"Bullish": st.success, "Bearish": st.error, "Neutral": st.warning}.get(sniper["setup_bias"], st.info)(f"**Setup Bias:** {sniper['setup_bias']}")
+        st.markdown(f"**Key Levels (Sniper Zone):** {sniper['key_levels']}")
+        st.caption(sniper["cpr_note"])
+        st.markdown(("⚠️ " if sniper.get("pattern_conflict") else "") + f"**Price Action Confluence:** {sniper['price_action_confluence']}")
+        (st.success if sniper["oi_confirms"] else st.warning)(f"**Data Validation (Option Chain):** {sniper['oi_validation']}")
+        st.info(f"**Execution Trigger:** {sniper['execution_trigger']}")
+        tp = sniper.get("trade_plan")
+        if tp:
+            st.markdown(f"**Trade Plan:** Entry {_rs(tp['entry'])} | Target {_rs(tp['target'])} | Stop Loss {_rs(tp['sl'])}")
+        else:
+            st.markdown("**Trade Plan:** No trade -- bias, price action, and option chain OI don't all agree yet. "
+                        "Sniper Setup only produces a plan when every layer confirms (real confluence, not a guess).")
+    else:
+        st.info("Sniper Setup needs at least 2 trading days of candle history to compute PDH/PDL/CPR -- not enough data yet.")
+
+    # ------------------------------------------------------------------ F&O footprint / Max pain
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("🏛️ Institutional F&O Footprint & Max Pain Analytics")
+    m1, m2 = st.columns(2)
+    mp = ctx["max_pain"]
+    m1.metric(label="🎯 Calculated Max Pain Strike", value=_rs(mp) if mp > 0 else "N/A")
+    m2.metric(label="📊 Option Chain PCR", value=f"{ctx['pcr']:.2f}" if ctx["has_option_chain"] else "N/A")
+    fp = ctx["fii_footprint"]
+    (st.success if "BULLISH" in fp else st.error if "BEARISH" in fp else st.warning)(f"**🏦 Institutional Flow Bias (stock order-book):** {fp}")
+    if mp > 0:
+        st.info(f"**Max Pain Gravity Note:** Live price ({_rs(price)}) is currently **{'above' if price > mp else 'below'}** Max Pain ({_rs(mp)}). "
+                f"Expiry pull is {'upward unless heavy selling triggers' if price > mp else 'downward'}. (Nearest 17 strikes se calculate.)")
+    elif not ctx["has_option_chain"]:
+        st.caption(f"{sym} ka option chain nahi mila (F&O me listed nahi / data nahi) -- ye section khaali chhoda gaya hai, Nifty ka chain udhaar nahi liya.")
+
+    # ------------------------------------------------------------------ Sector / market breadth (Nifty: "Internal Breadth & Heavyweights")
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander(f"📈 {ctx['sector']} Sector & Market Breadth Tracker", expanded=False):
+        sc, nc = ctx["sector_context"] or {}, ctx["nifty_context"] or {}
+        b1, b2 = st.columns(2)
+        b1.metric(f"{ctx['sector']} sector index", f"{sc['change_pct']:+.2f}%" if sc.get("change_pct") is not None else "N/A")
+        b2.metric("Nifty 50 (benchmark)", f"{nc['nifty_change_pct']:+.2f}%" if nc.get("nifty_change_pct") is not None else "N/A")
+        st.info(f"**Breadth Status:** {ctx['breadth_status']}")
+        stock_phase3_ui.peers_table(ctx)
+
+    # ------------------------------------------------------------------ Correlated indices
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader(f"🏦 Nifty 50, {ctx['sector']} Index & Correlated Indices")
+    sc, nc = ctx["sector_context"] or {}, ctx["nifty_context"] or {}
+    i1, i2 = st.columns(2)
+    if nc.get("nifty_last") is not None:
+        i1.metric(f"NIFTY 50 ({nc.get('source')})", f"₹{nc['nifty_last']:,.2f}", delta=f"{nc['nifty_change_pct']:.2f}%" if nc.get("nifty_change_pct") is not None else None)
+    else:
+        i1.metric("NIFTY 50", "N/A")
+    if sc.get("last") is not None:
+        i2.metric(f"{ctx['sector']} index ({sc.get('index')})", f"₹{sc['last']:,.2f}", delta=f"{sc['change_pct']:.2f}%" if sc.get("change_pct") is not None else None)
+    else:
+        i2.metric(f"{ctx['sector']} index", "N/A")
+    cn = ctx["corr_note"]
+    if cn:
+        (st.warning if "DIVERGENCE" in cn.upper() else st.success if "CONFIRMED" in cn.upper() else st.info)(f"**Sector ⇄ {sym} Correlation:** {cn}")
+
+    # ------------------------------------------------------------------ Indicators + option chain
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("🧱 Advanced Technical Indicators Table")
+    cols = [c for c in ["Close", "Volume", "VWAP", "POC_Level", "EMA_20", "EMA_50", "MACD", "ATR", "RSI"] if c in df.columns]
+    with st.expander("📈 View Live Indicators Grid", expanded=False):
+        st.dataframe(df[cols].tail(10), width="stretch")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander(f"⛓️ {sym} Option Chain (Greeks & PCR)", expanded=False):
+        if ctx["has_option_chain"]:
+            raw = ctx["option_chain_raw"]
+            st.success(f"🟢 **Source: LIVE** — {raw.get('source')} · Expiry {raw.get('expiry')} · nearest 17 strikes.")
+            odf = pd.DataFrame(ctx["option_rows"])
+            try:
+                st.dataframe(odf.style.background_gradient(subset=["PCR"], cmap="RdYlGn"), width="stretch")
+            except Exception:
+                st.dataframe(odf, width="stretch")
+        else:
+            st.info(f"{sym} ka option chain nahi mila -- ya to ye stock F&O segment me listed nahi hai, ya Upstox login/data nahi hai. Khaali chhoda gaya, simulated data nahi dikhaya.")
+
+    # ------------------------------------------------------------------ SMC
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("🏦 Smart Money Concepts & Market Structure (BOS / CHoCH)")
+    ms, ev = ctx["market_structure"], ctx["smc_event"]
+    if ms:
+        trig = ms[0]["Trigger Level"]
+        (st.success if "Bullish" in ev else st.error if "Bearish" in ev else st.info)(f"**Market Structure Status:** {ev} | **Trigger Level:** {trig}")
+    s1, s2, s3 = st.columns(3)
+    for col, title, data, empty in ((s1, "##### 📌 Fair Value Gaps (FVG)", ctx["fvg"], "No active FVG detected."),
+                                     (s2, "##### 🧱 Order Blocks (OB)", ctx["ob"], "No active Order Blocks detected."),
+                                     (s3, "##### 🌊 Liquidity Sweeps", ctx["sweeps"], "No active Sweeps detected.")):
+        with col:
+            st.markdown(title)
+            st.table(pd.DataFrame(data)) if data else st.info(empty)
+
+    # ------------------------------------------------------------------ News / fundamentals / global
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander(f"🗞️ {sym} News", expanded=False):
+        helpers["news"](ctx["news"])
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander(f"📊 {sym} Fundamentals", expanded=False):
+        helpers["fundamentals"](ctx["fundamentals"])
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander("🌐 Global Market Sentiment & Regional Live News", expanded=False):
+        st.info(f"**⚡ World's Strongest News Highlight (Live Today):**\n\n*{top_headline}*")
+        try:
+            st.dataframe(df_sent.style.background_gradient(subset=["Positive News", "Negative News"], cmap="Blues"), width="stretch")
+        except Exception:
+            st.dataframe(df_sent, width="stretch")
+    st.markdown("<br>", unsafe_allow_html=True)
+    with st.expander("🌍 Global Major Stock Markets & Macro Live Tracker", expanded=False):
+        g1, g2 = st.columns(2)
+        g1.metric(label="🎯 Automatic Global Sentiment Score", value=gscore)
+        g2.metric(label="📈 Average Global Change (%)", value=f"{gavg}%")
+        try:
+            st.dataframe(df_gm, column_config={"Logo": st.column_config.ImageColumn("Flag / Icon", width="small")}, hide_index=True, width="stretch")
+        except Exception:
+            st.dataframe(df_gm, width="stretch")
+
+    if ctx["errors"]:
+        with st.expander("🔧 Engine warnings (debug)", expanded=False):
+            for e in ctx["errors"]:
+                st.code(e, language=None)
+
+    # chat box context + fresh-run bookkeeping
+    dc = st.session_state.setdefault("dashboard_context", {})
+    dc["selected_stock_analysis"] = _chat_context(ctx)
+    p2 = ctx.get("p2") or {}
+    dc[f"Strategy Ensemble {sym}"] = str(p2.get("strategy_result"))[:3000]
+    dc[f"Consensus {sym}"] = str((p2.get("consensus") or {}).get("summary_text", ""))
+    dc[f"AI TRADE DECISION {sym}"] = str(p2.get("decision"))[:3000]
+    dc[f"Gemini report {sym}"] = str(p2.get("gemini_review"))[:3000]
+    dc["research_target"] = sym
+    st.session_state["_last_global_avg_change"], st.session_state["_last_sentiment_score"], st.session_state["_last_live_vix"] = gavg, gscore, vix
+    sp.done()
+
+
+def render(symbol, ai_engine, helpers):
+    """Draws the stock dashboard as its own self-refreshing fragment (30 s while NSE is open, 180 s when closed) -- same as Nifty."""
+    every = 30 if _is_live() else 180
+
+    @st.fragment(run_every=every)
+    def _frag():
+        try:
+            _body(symbol, ai_engine, helpers)
+        except Exception as e:
+            logger.exception("stock dashboard crashed")
+            st.error(f"Stock dashboard error: {type(e).__name__}: {e}")
+
+    _frag()
+# @@END stock_dashboard

@@ -52,6 +52,9 @@ import trade_notify
 from ai_chat import render_ai_chat
 import ui_theme
 import live_chart
+import stock_universe          # Phase 1: every NSE stock + search
+import stock_watchlist         # Phase 4: robot watchlist (background stocks)
+import stock_dashboard         # Phase 1: stock dashboard in the Nifty layout
 
 # Page Configuration
 st.set_page_config(page_title="Nifty 50 Real-Time AI Predictor", page_icon="⚡", layout="wide")
@@ -135,7 +138,7 @@ trade_learning.configure_supabase(
 )
 
 ui_theme.inject_theme()   # premium dark-glass look + animations
-ui_theme.render_hero()    # animated hero banner (presentation only)
+# (hero banner is drawn right after the sidebar below, so it already knows which stock is active)
 
 # -------------------------------------------------------------
 # 🔎 SELECT YOUR STOCK -- primary sidebar entry point (works the moment
@@ -148,12 +151,17 @@ ui_theme.render_hero()    # animated hero banner (presentation only)
 # -------------------------------------------------------------
 with st.sidebar:
     st.markdown("### 🔎 Select Your Stock")
-    _sidebar_symbol_raw = st.text_input(
-        "Select your stocks",
-        placeholder="e.g. RELIANCE, TCS, HDFCBANK",
-        key="sidebar_stock_input",
-        help="Koi bhi NSE stock ka naam/symbol daalo — poora dashboard usi stock ka ban jaayega, ekdum Nifty 50 wale jaisa hi.",
-    ).strip().upper()
+    # Phase 1: searchable list of EVERY NSE stock (type a few letters of the symbol OR the company name), plus a free-text
+    # box for anything not in the list.  Same Load Stock / Nifty 50 buttons as before.
+    _stk_pairs = stock_universe.option_labels()
+    _stk_label_to_sym = dict(_stk_pairs)
+    _stk_pick = st.selectbox(
+        "Select your stocks", options=[l for l, _ in _stk_pairs], index=None, key="sidebar_stock_pick",
+        placeholder="Stock ka naam / symbol type karo (RELIANCE, TCS, Tata...)",
+        help=f"{len(_stk_pairs)} NSE stocks. Type karte hi list filter hoti hai -- symbol ya company naam dono chalte hain.")
+    _stk_typed = st.text_input("ya seedha symbol likho", placeholder="e.g. RELIANCE, TCS, HDFCBANK, M&M", key="sidebar_stock_input",
+                               help="Agar stock upar list me na mile to yahan NSE symbol likh do.")
+    _sidebar_symbol_raw = stock_universe.clean_symbol(_stk_typed) or _stk_label_to_sym.get(_stk_pick, "")
     _sb_col1, _sb_col2 = st.columns(2)
     with _sb_col1:
         if st.button("Load Stock", key="sidebar_load_stock_btn", width="stretch") and _sidebar_symbol_raw:
@@ -166,8 +174,18 @@ with st.sidebar:
         st.success(f"Active dashboard: **{st.session_state['active_symbol']}**")
     else:
         st.caption("Abhi Nifty 50 dashboard dikh raha hai.")
+    st.caption(f"📚 {len(_stk_pairs)} NSE stocks · {stock_universe.universe_source()}")
+    try:
+        stock_watchlist.ensure_runner(ai_engine, GEMINI_API_KEYS)     # one background robot thread (idempotent)
+        stock_watchlist.sidebar_panel()
+    except Exception:
+        logger.exception("watchlist panel failed (ignored)")
 
 ACTIVE_SYMBOL = st.session_state.get("active_symbol") or None
+if ACTIVE_SYMBOL:
+    stock_dashboard.render_stock_hero(stock_universe.clean_symbol(ACTIVE_SYMBOL))   # same hero, stock's name
+else:
+    ui_theme.render_hero()    # animated hero banner (presentation only)
 
 # -------------------------------------------------------------
 # LIVE DASHBOARD -- runs as an independent st.fragment that refreshes
@@ -2108,7 +2126,7 @@ if not ACTIVE_SYMBOL:
     _LIVE_CHART_ON = live_chart.render()   # own fast refresh; False -> old chart is used
     _live_dashboard()
 else:
-    st.info(f"📌 Abhi **{ACTIVE_SYMBOL}** dashboard active hai (neeche dekho). Nifty 50 index dashboard par wapas jaane ke liye sidebar mein '⬅ Nifty 50' dabao.")
+    st.info(f"📌 Abhi **{ACTIVE_SYMBOL}** ka poora dashboard active hai (neeche dekho). Nifty 50 index dashboard par wapas jaane ke liye sidebar mein '⬅ Nifty 50' dabao.")
 
 # -------------------------------------------------------------
 # INTERACTIVE AI CHAT -- deliberately OUTSIDE the fragment above, so the
@@ -2556,10 +2574,18 @@ def _render_stock_dashboard(symbol):
 
 if ACTIVE_SYMBOL:
     try:
-        _render_stock_dashboard(ACTIVE_SYMBOL)
+        # Phase 1: the selected stock gets the SAME dashboard layout/engines as Nifty 50 (see stock_dashboard.py / stock_pipeline.py).
+        stock_dashboard.render(ACTIVE_SYMBOL, ai_engine, {
+            "fundamentals": _render_fundamentals_cards, "news": _render_stock_news, "metric": _research_metric,
+            "gemini_keys": GEMINI_API_KEYS})
     except Exception as _stock_ui_err:
-        logger.exception("Full stock dashboard failed")
+        logger.exception("Stock dashboard failed -- falling back to the older tabbed stock view")
         st.error(f"Stock dashboard error: {_stock_ui_err}")
+        try:
+            _render_stock_dashboard(ACTIVE_SYMBOL)
+        except Exception as _stock_ui_err2:
+            logger.exception("Fallback stock dashboard failed too")
+            st.error(f"Fallback stock dashboard error: {_stock_ui_err2}")
 else:
     st.subheader("📊 Select Your Stock")
     st.caption("👈 Sidebar mein koi bhi NSE stock ka naam daal kar **Load Stock** dabao — poora dashboard "

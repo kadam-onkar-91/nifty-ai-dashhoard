@@ -13,7 +13,7 @@ import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_BUNDLES = ("core_infra", "data_feeds", "analytics", "strategies", "trade_core", "ai_brain", "market_intel", "multi_asset", "tests_all")
+_BUNDLES = ("core_infra", "data_feeds", "analytics", "strategies", "trade_core", "ai_brain", "market_intel", "multi_asset", "stock_suite", "tests_all")
 _MARK, _END = "# @@MODULE ", "# @@END "
 
 _INDEX = {}   # module name -> (bundle path, first source line index, end line index)

@@ -231,3 +231,30 @@ do $$ begin
   end if;
 end $$;
 -- ===== END SUPABASE_MARKET_BRAIN_MIGRATION.sql =====
+
+
+-- ===== Stock dashboard + Robot Watchlist (additive, safe to re-run) =====
+-- Additive only (safe to run many times). Nifty tables are NOT touched.
+CREATE TABLE IF NOT EXISTS stock_ai_setups (
+  id BIGSERIAL PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  timestamp TEXT,
+  direction TEXT,
+  entry DOUBLE PRECISION,
+  stop_loss DOUBLE PRECISION,
+  target DOUBLE PRECISION,
+  confidence_pct DOUBLE PRECISION,
+  factors_json TEXT,
+  status TEXT DEFAULT 'OPEN',
+  exit_price DOUBLE PRECISION,
+  exit_timestamp TEXT
+);
+ALTER TABLE stock_ai_setups ADD COLUMN IF NOT EXISTS exit_price DOUBLE PRECISION;
+ALTER TABLE stock_ai_setups ADD COLUMN IF NOT EXISTS exit_timestamp TEXT;
+CREATE INDEX IF NOT EXISTS idx_stock_ai_setups_symbol_ts ON stock_ai_setups (symbol, timestamp);
+
+-- Robot watchlist (Phase 4)
+CREATE TABLE IF NOT EXISTS stock_watchlist (
+  symbol TEXT PRIMARY KEY,
+  added_at TIMESTAMPTZ DEFAULT now()
+);

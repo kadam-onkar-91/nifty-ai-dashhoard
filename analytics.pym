@@ -499,6 +499,27 @@ def _htf_structure_bias(df, atr, resample_rule='15min', bars=8):
         return None
 
 
+import threading as _threading_rs
+_RN_SCALE = _threading_rs.local()      # per-thread price scale for round-number logic (Nifty default = 100/50 pts; stocks set their own)
+
+
+class round_number_scale:
+    """Context manager: `with support_resistance.round_number_scale(major, minor):` makes the round-number confluence
+    check use a scale suited to the instrument (e.g. Rs 5/10 for a Rs 400 stock) instead of Nifty's 100/50 points.
+    Outside the block (and for Nifty) nothing changes."""
+    def __init__(self, major, minor):
+        self.major, self.minor = float(major), float(minor)
+
+    def __enter__(self):
+        self._prev = getattr(_RN_SCALE, "v", None)
+        _RN_SCALE.v = (self.major, self.minor)
+        return self
+
+    def __exit__(self, *a):
+        _RN_SCALE.v = self._prev
+        return False
+
+
 def _round_number_confluence(level_price):
     """
     NEW — Round numbers (multiples of 100, and to a lesser extent 50) act
@@ -510,11 +531,14 @@ def _round_number_confluence(level_price):
     """
     if level_price is None:
         return None
-    nearest_100 = round(level_price / 100) * 100
-    nearest_50 = round(level_price / 50) * 50
-    if abs(level_price - nearest_100) <= 15:
+    _sc = getattr(_RN_SCALE, "v", None)
+    big, small = _sc if _sc else (100.0, 50.0)
+    tol_big, tol_small = big * 0.15, small * 0.16      # Nifty: 15 pts / 8 pts (unchanged)
+    nearest_100 = round(level_price / big) * big
+    nearest_50 = round(level_price / small) * small
+    if abs(level_price - nearest_100) <= tol_big:
         return 'major', nearest_100
-    if abs(level_price - nearest_50) <= 8:
+    if abs(level_price - nearest_50) <= tol_small:
         return 'minor', nearest_50
     return None
 

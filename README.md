@@ -601,3 +601,23 @@ cut repeated/avoidable losses. Measure it on your own resolved trades.
 - Bad-form penalty expires after FORM_STALE_HOURS (30h); probes stay on under bad form but only at strong OI walls.
 - Tests: `python -m unittest tests_level_verdict` (7 tests). tests.py still has one older synthetic test
   (`test_fall_then_stall_produces_a_trade`, no OI/zones supplied) that also failed BEFORE these changes.
+
+## Stock dashboard -- Phase 1 / 2 / 3 (final)
+* **Phase 1** -- search any NSE stock, load full Nifty-style dashboard (live price, S/R, regime, CPR, order flow, MTF, option chain if F&O).
+* **Phase 2** -- `stock_family.py` gives every stock a private copy of the Nifty engines (strategies, ML, AI Trade Decision, learning, shadow trades,
+  gate log). `stock_engine.py` runs strategy -> consensus -> AI decision -> Gemini final review -> trade (₹, shares). SL/target are checked on the
+  live tick (`stock-tick-guard` thread). Nifty files/DB are never touched.
+* **Phase 3** -- Market Brain per stock (`stock_phase3_ui.py`, price-normalised so "25/50 pt" = ~0.2%/0.4%), shadow trades, gate log, timeline,
+  track record, peer-stocks breadth (`stock_peers.py`, one batched Upstox call, Nifty-50 heavyweights of the same sector).
+* Storage: `stock_data/<SYMBOL>/` (SQLite) + Supabase mirror `stock_ai_setups` (run the stock section at the end of `schema.sql` once).
+* Tests: `python -m unittest tests_stock_phase2 tests_stock_phase3`.
+* Not done (honestly): real broker auto-orders (off by design), stock-wise IV history, peer-comparison fundamentals, sector-specific global drivers.
+
+## Phase 4 -- Robot Watchlist (stocks jo khud trade lete hain)
+* Sidebar -> **⭐ Robot Watchlist**: stock ka naam daalo (comma se kai ek saath), koi limit nahi (5-10 best). Remove / Load ek tap me.
+* `stock_watchlist.py` ka ek background thread market OPEN hote hi har stock par poora engine chalata hai (research -> 41 strategies -> consensus ->
+  AI Trade Decision -> Gemini review -> trade lock -> SL/target live tick -> WIN/LOSS record -> us stock ki learning). Har stock ~1 min me, 3 parallel.
+* Telegram: har naye trade par alert (stock, price, SL, target, RR, win chance, strategy, consensus, Gemini reason) + exit alert.
+* Nifty 50 apne purane robot (`keep_app_awake.yml`) se chalta hai -- usme koi change nahi. Watchlist usi app process me chalti hai, isliye GitHub robot tab ON rakho.
+* Watchlist Supabase `stock_watchlist` me mirror hoti hai (run the stock section at the end of `schema.sql`), restart ke baad wapas aati hai.
+* Tests: `python -m unittest tests_stock_phase4`.
