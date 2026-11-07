@@ -357,10 +357,189 @@ def status(force=False):
 
 def safe_mirror(fam):
     try:
+        _learn_kick(fam)
+    except Exception:
+        logger.exception("stock learning kick failed (ignored)")
+    try:
         return mirror(fam)
     except Exception:
         logger.exception("stock mirror failed (ignored)")
         return 0
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------
+# PERMANENT LEARNING: everything the stock's engines learn besides the trades themselves (shadow trades, market memory / pattern outcomes,
+# autopsy, post-mortems, gate log ...) lives in two small SQLite files that a Streamlit Cloud restart wipes.  They are saved (gzip, one row per
+# file) to Supabase table `stock_learning_blobs` and put back when the stock's engines are built again after a restart.
+# Trades keep their own table (`stock_ai_setups`, above).  Best-effort: any failure is logged and ignored, trading never depends on it.
+# ----------------------------------------------------------------------------------------------------------------------------------
+import base64
+import gzip
+import hashlib
+import json as _json
+import re as _re
+import sqlite3 as _sqlite3
+
+LEARN_TABLE = "stock_learning_blobs"
+LEARN_GAP_S = 300.0              # at most one save per stock per 5 minutes (unless forced, e.g. after the close)
+LEARN_MAX_ROWS = 20000           # newest rows kept per table
+LEARN_MAX_BYTES = 6_000_000      # one compressed blob must stay below this (rows are halved until it fits)
+_LEARN_SKIP = {"ai_trade_setups", "sqlite_sequence", "telegram_sent"}
+_LEARN_LAST, _LEARN_HASH, _LEARN_BUSY = {}, {}, set()
+_LEARN_WARNED = {"x": False}
+
+
+def _learn_cfg():
+    url, hdr = _cfg()
+    if not url:
+        return None, None
+    return url.rsplit("/", 1)[0] + "/" + LEARN_TABLE, hdr
+
+
+def _learn_files(fam):
+    return {"learning": fam.mods["trade_learning"].DB_NAME, "gate": fam.mods["gate_log"].DB_PATH}
+
+
+def _dump_db(path, max_rows):
+    import os
+    out = {}
+    if not os.path.exists(path):
+        return out
+    conn = _sqlite3.connect(path, timeout=5)
+    try:
+        for name, sql in conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL").fetchall():
+            if name in _LEARN_SKIP or name.startswith("sqlite_"):
+                continue
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{name}")').fetchall()]
+            rows = conn.execute(f'SELECT * FROM "{name}" ORDER BY rowid DESC LIMIT ?', (max_rows,)).fetchall()
+            rows.reverse()
+            idx = [r[0] for r in conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL", (name,)).fetchall()]
+            out[name] = {"sql": sql, "idx": idx, "cols": cols, "rows": [list(r) for r in rows]}
+    finally:
+        conn.close()
+    return out
+
+
+def _pack(tables):
+    raw = _json.dumps(tables, default=str, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(gzip.compress(raw, 6)).decode("ascii"), hashlib.sha1(raw).hexdigest()
+
+
+def _unpack(payload):
+    return _json.loads(gzip.decompress(base64.b64decode(payload)).decode("utf-8"))
+
+
+def mirror_learning(fam, force=False):
+    """Save this stock's learning files to Supabase.  -> number of files uploaded."""
+    url, hdr = _learn_cfg()
+    if not url:
+        return 0
+    with _LOCK:
+        if not force and time.time() - _LEARN_LAST.get(fam.symbol, 0.0) < LEARN_GAP_S:
+            return 0
+        if fam.symbol in _LEARN_BUSY:
+            return 0
+        _LEARN_BUSY.add(fam.symbol)
+        _LEARN_LAST[fam.symbol] = time.time()
+    n = 0
+    try:
+        for name, path in _learn_files(fam).items():
+            cap = LEARN_MAX_ROWS
+            while True:
+                tables = _dump_db(path, cap)
+                payload, digest = _pack(tables)
+                if len(payload) <= LEARN_MAX_BYTES or cap <= 1000:
+                    break
+                cap //= 2
+            if not tables or len(payload) > LEARN_MAX_BYTES:
+                continue
+            if _LEARN_HASH.get((fam.symbol, name)) == digest:
+                continue                                      # nothing changed since the last save
+            row = {"symbol": fam.symbol, "name": name, "payload": payload, "rows": sum(len(t["rows"]) for t in tables.values()),
+                   "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+            r = requests.post(f"{url}?on_conflict=symbol,name", headers=dict(hdr, Prefer="resolution=merge-duplicates,return=minimal"), json=[row], timeout=15)
+            r.raise_for_status()
+            _LEARN_HASH[(fam.symbol, name)] = digest
+            n += 1
+    except Exception as e:
+        if not _LEARN_WARNED["x"]:
+            _LEARN_WARNED["x"] = True
+            logger.warning("stock learning save failed (ignored; run the stock_learning_blobs block of schema.sql if the table is missing): %s", e)
+    finally:
+        with _LOCK:
+            _LEARN_BUSY.discard(fam.symbol)
+    return n
+
+
+def _learn_kick(fam, force=False):
+    """Fire-and-forget save in a background thread (never slows a refresh)."""
+    if not _learn_cfg()[0]:
+        return
+    if not force and time.time() - _LEARN_LAST.get(fam.symbol, 0.0) < LEARN_GAP_S:
+        return
+    threading.Thread(target=mirror_learning, args=(fam, force), daemon=True, name="stk-learn-save").start()
+
+
+def _if_not_exists(sql):
+    return _re.sub(r"^\s*CREATE\s+(UNIQUE\s+)?(TABLE|INDEX)\s+(IF\s+NOT\s+EXISTS\s+)?", lambda m: f"CREATE {m.group(1) or ''}{m.group(2)} IF NOT EXISTS ",
+                   sql, flags=_re.I)
+
+
+def restore_learning(fam):
+    """Fresh container: put the stock's saved learning back into its (empty) local files.  A table that already has local rows is never touched."""
+    url, hdr = _learn_cfg()
+    if not url:
+        return 0
+    r = requests.get(f"{url}?symbol=eq.{fam.symbol}&select=name,payload&limit=10", headers=hdr, timeout=10)
+    r.raise_for_status()
+    files, back = _learn_files(fam), 0
+    for blob in (r.json() or []):
+        path = files.get(blob.get("name"))
+        if not path:
+            continue
+        tables = _unpack(blob["payload"])
+        conn = _sqlite3.connect(path, timeout=5)
+        try:
+            for tname, t in tables.items():
+                conn.execute(_if_not_exists(t["sql"]))
+                if conn.execute(f'SELECT COUNT(1) FROM "{tname}"').fetchone()[0]:
+                    continue
+                cols = t["cols"]
+                q = f'INSERT OR REPLACE INTO "{tname}" ({",".join(chr(34) + c + chr(34) for c in cols)}) VALUES ({",".join("?" * len(cols))})'
+                conn.executemany(q, t["rows"])
+                back += len(t["rows"])
+                for isql in t.get("idx") or []:
+                    try:
+                        conn.execute(_if_not_exists(isql))
+                    except Exception:
+                        pass
+            conn.commit()
+        finally:
+            conn.close()
+    return back
+
+
+def learning_status():
+    """(ok, message) for the permanent-learning table, cached 90 s."""
+    now = time.time()
+    c = _LEARN_WARNED.setdefault("st", (0.0, None))
+    if c[1] is not None and now - c[0] < 90:
+        return c[1]
+    url, hdr = _learn_cfg()
+    if not url:
+        val = (False, "Supabase configure nahi -- learning sirf is session tak.")
+    else:
+        try:
+            r = requests.get(f"{url}?select=symbol,name,rows,updated_at&order=updated_at.desc&limit=50", headers=hdr, timeout=6)
+            if r.ok:
+                syms = {x["symbol"] for x in (r.json() or [])}
+                val = (True, f"Learning permanent hai ({len(syms)} stock saved).")
+            else:
+                val = (False, f"`{LEARN_TABLE}` table nahi mila (HTTP {r.status_code}) -- schema.sql ka stock_learning_blobs block run karo.")
+        except Exception as e:
+            val = (False, f"Supabase se baat nahi ho payi: {type(e).__name__}")
+    _LEARN_WARNED["st"] = (now, val)
+    return val
 # @@END stock_store
 
 # @@MODULE stock_news
@@ -643,8 +822,9 @@ class Family:
         atd._oi_walls = _walls
         self.scale(100.0, 1.0)
         try:
-            from stock_store import restore
+            from stock_store import restore, restore_learning
             restore(self)
+            restore_learning(self)
         except Exception:
             logger.exception("stock restore failed (ignored)")
 
@@ -1410,6 +1590,34 @@ def _run(ctx, state, gemini_keys, extra=None):
     ctx["peers"], ctx["extra"] = peers, extra
     if peers.get("status") == "AVAILABLE":
         ctx["adv"], ctx["dec"] = peers["adv"], peers["dec"]
+        # same "sector breadth" input the Nifty decision gets (per-sector advances/declines), built from this stock's peers
+        try:
+            import market_breadth
+            _pb = pd.DataFrame(peers["rows"]).rename(columns={"Change %": "Change (%)"})
+            _pb = pd.concat([_pb, pd.DataFrame([{"Symbol": sym, "Change (%)": ctx.get("own_change_pct", 0.0)}])]) if ctx.get("own_change_pct") is not None else _pb
+            ctx["sector_breadth"] = market_breadth.get_sector_breadth(_pb)
+        except Exception:
+            logger.exception("stock sector_breadth failed (ignored)")
+    # Same extra decision inputs the Nifty gate chain gets (global research, India news, fundamentals tilt) -- before this they were left empty for stocks
+    try:
+        import global_research as _gr
+        df_gm_, df_sent_ = extra.get("df_gm"), extra.get("df_sent")
+        _india = None
+        if isinstance(df_sent_, pd.DataFrame) and not df_sent_.empty and "Region / Country" in df_sent_.columns:
+            _r = df_sent_[df_sent_["Region / Country"].astype(str).str.contains("India", na=False)]
+            if not _r.empty:
+                _india = str(_r.iloc[0]["Net Sentiment"])
+        ctx["india_news_sentiment"] = _india
+        ctx["global_research"] = _gr.build_global_research(df_gm_, df_sent_, _india)
+    except Exception:
+        logger.exception("stock global_research failed (ignored)")
+    try:
+        _f = ctx.get("fundamentals") or {}
+        _agg = {"status": "AVAILABLE" if _f.get("status") == "AVAILABLE" else "UNAVAILABLE", "earningsGrowth_mean": _f.get("earningsGrowth"),
+                "revenueGrowth_mean": _f.get("revenueGrowth"), "returnOnEquity_mean": _f.get("returnOnEquity")}
+        ctx["fundamentals_bias"] = (mse.get_nifty50_fundamentals_bias(_agg) or {}).get("label")
+    except Exception:
+        logger.exception("stock fundamentals bias failed (ignored)")
 
     # ---- 2.3 consensus engine ---------------------------------------------------------------------------------------------------------
     def _cons():
@@ -1456,7 +1664,7 @@ def _run(ctx, state, gemini_keys, extra=None):
         live_price=price, level_prediction=ctx.get("level_prediction"), atr=atr, max_pain=(ctx.get("max_pain") or None),
         signal_code=ctx.get("signal_code", 0), ml_agrees=bool(ml.get("model_ready") and ml.get("latest_signal", 0) == ctx.get("signal_code", 0)),
         banknifty_correlation_note=ctx.get("corr_note"), breadth_advances=ctx.get("adv"), breadth_declines=ctx.get("dec"),
-        global_avg_change=extra.get("gavg"), live_vix=extra.get("vix"), india_news_sentiment=None, level_ladder=ctx.get("ladder"),
+        global_avg_change=extra.get("gavg"), live_vix=extra.get("vix"), india_news_sentiment=ctx.get("india_news_sentiment"), level_ladder=ctx.get("ladder"),
         sr_context=ctx.get("sr_context"), sniper_bias=((ctx.get("sniper") or {}).get("setup_bias")), is_choppy=ctx.get("is_choppy", False),
         dashboard_context=dc, global_research=ctx.get("global_research"),
         nifty50_news_sentiment=news_sentiment_label(ctx.get("news")), nifty50_fundamentals_bias=ctx.get("fundamentals_bias"),
@@ -1912,6 +2120,16 @@ def shadow_gate_timeline_track(ctx, state):
                                "Gemini": ("✅ Gemini approve" if (s.get("gemini") or {}).get("status") == "APPROVED" or (s.get("gemini") or {}).get("reviewer") == "GEMINI"
                                           else "⚠️ local fallback" if s.get("gemini") else "—"),
                                "Exit": f"₹{s['exit_price']:,.2f} @ {s['exit_timestamp']}" if s["exit_price"] else "-"} for s in rec], hide_index=True, width="stretch")
+                with st.expander("📜 Is stock ke saare trades dikhao (poori history)", expanded=False):
+                    try:
+                        allr = tl.get_recent_setups(limit=1000)
+                        st.caption(f"Total {len(allr)} trades (naya sabse upar).")
+                        st.dataframe([{"When": s["timestamp"], "Direction": s["direction"], "Entry": f"₹{s['entry']:,.2f}", "SL": f"₹{s['stop_loss']:,.2f}",
+                                       "Target": f"₹{s['target']:,.2f}", "Confidence": f"{s['confidence_pct']}%", "Status": s["status"],
+                                       "Exit": f"₹{s['exit_price']:,.2f} @ {s['exit_timestamp']}" if s["exit_price"] else "-"} for s in allr],
+                                     hide_index=True, width="stretch", height=480)
+                    except Exception:
+                        logger.exception("stock all-trades table failed (ignored)")
                 for x in [r for r in rec if r.get("gemini")][:10]:
                     g = x["gemini"]
                     st.caption(f"{x['timestamp']} {x['direction']} [{x['status']}] · {g.get('model') or '-'} · {str(g.get('reason') or '')[:300]}")
@@ -2174,6 +2392,13 @@ def run_once(sym, token=None):
             logger.exception("watchlist brain record failed (ignored)")
         dec = p2.get("decision") or {}
         op = p2.get("open_setup")
+        try:
+            if _market_state().get("state") != "OPEN":          # last pass of the day -> save the learning right now
+                import stock_store
+                if p2.get("family") is not None:
+                    stock_store._learn_kick(p2["family"], force=True)
+        except Exception:
+            pass
         row.update(ok=True, gate=str(p2.get("gate") or ("OPEN TRADE" if op else "")), direction=str(dec.get("direction") or ((p2.get("strategy_result") or {}).get("direction") or "")),
                    open=(f"{op['direction']} @ ₹{op['underlying_entry']:.2f}" if op else ""), error="; ".join((p2.get("errors") or [])[:2])[:160],
                    candle=str(ctx.get("last_candle")))
@@ -2275,9 +2500,8 @@ def sidebar_panel():
         st.caption("Yahan jo stocks add karoge unki poori research + AI Trade Decision + Gemini review market OPEN hote hi khud chalega (app band ho tab bhi, "
                    "jab tak GitHub robot tab app jagaye rakhe). Har stock har 30 second me naye data se dobara chalta hai (Nifty 50 jaisa). Trade lock, SL/target, win/loss sab record hota hai aur har stock apni learning se behtar hota hai. "
                    "Telegram par har trade ka alert aata hai.")
-        c1, c2 = st.columns([3, 1])
-        txt = c1.text_input("Stock naam / symbol", key="wl_add_text", placeholder="RELIANCE, TCS ... (comma se kai ek saath)", label_visibility="collapsed")
-        if c2.button("➕ Add", key="wl_add_btn", width="stretch") and txt.strip():
+        txt = st.text_input("Stock naam / symbol", key="wl_add_text", placeholder="RELIANCE, TCS, INFY (comma se kai ek saath)", label_visibility="collapsed")
+        if st.button("➕ Watchlist me add karo", key="wl_add_btn", width="stretch") and txt.strip():
             for part in [p for p in txt.replace("\n", ",").split(",") if p.strip()]:
                 ok, msg = add(part)
                 (st.success if ok else st.warning)(msg)
@@ -2303,6 +2527,12 @@ def sidebar_panel():
             st.dataframe(pd.DataFrame([{"Stock": s, "Last run": v.get("last_run"), "OK": "✅" if v.get("ok") else "⚠️", "Gate / trade": v.get("open") or v.get("gate"),
                                         "Dir": v.get("direction"), "ms": v.get("ms"), "Error": v.get("error")} for s, v in sorted(stat.items())]),
                          hide_index=True, width="stretch")
+        try:
+            import stock_store
+            _lok, _lmsg = stock_store.learning_status()
+            (st.caption if _lok else st.warning)(("🧠 " if _lok else "⚠️ ") + _lmsg)
+        except Exception:
+            pass
         alive = (_RUNNER["thread"] is not None and _RUNNER["thread"].is_alive())
         st.caption(("🟢 Robot thread chal raha hai" if alive else "🔴 Robot thread band") + " · market OPEN me har stock har 30 sec me refresh · "
                    "Nifty 50 apne purane robot se chalta rahega.")

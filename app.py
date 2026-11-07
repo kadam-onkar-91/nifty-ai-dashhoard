@@ -172,6 +172,18 @@ with st.sidebar:
             st.session_state["active_symbol"] = None
     if st.session_state.get("active_symbol"):
         st.success(f"Active dashboard: **{st.session_state['active_symbol']}**")
+        try:                                     # one-click add / remove of the stock that is open right now
+            _wl_sym = stock_universe.clean_symbol(st.session_state["active_symbol"])
+            if _wl_sym in stock_watchlist.list_symbols():
+                if st.button(f"🗑 {_wl_sym} ko Robot Watchlist se hatao", key="wl_toggle_btn", width="stretch"):
+                    stock_watchlist.remove(_wl_sym)
+                    st.rerun()
+            elif st.button(f"⭐ {_wl_sym} ko Robot Watchlist me add karo", key="wl_toggle_btn", width="stretch"):
+                _ok, _msg = stock_watchlist.add(_wl_sym)
+                (st.success if _ok else st.warning)(_msg)
+                st.rerun()
+        except Exception:
+            logger.exception("watchlist toggle failed (ignored)")
     else:
         st.caption("Abhi Nifty 50 dashboard dikh raha hai.")
     st.caption(f"📚 {len(_stk_pairs)} NSE stocks · {stock_universe.universe_source()}")
@@ -1758,6 +1770,22 @@ def _live_dashboard():
                     "Exit": f"₹{s['exit_price']:,.2f} @ {s['exit_timestamp']}" if s['exit_price'] else "-"
                 } for s in _recent_setups]
                 st.dataframe(_setup_rows, hide_index=True, width="stretch")
+
+            if _recent_setups:
+                st.caption(f"Upar sirf latest {len(_recent_setups)} trades dikhte hain; Resolved Trades / Win Rate ka count poore Supabase history se aata hai.")
+                with st.expander(f"📜 Saare trades dikhao (Buy + Sell, poori history)", expanded=False):
+                    try:
+                        _all_setups = trade_learning.get_recent_setups(limit=1000)
+                        st.caption(f"Total {len(_all_setups)} trades (naya sabse upar).")
+                        st.dataframe([{
+                            "When": s['timestamp'], "Direction": f"{s['direction']} {s['strike']}{s['option_type']}",
+                            "Entry": f"₹{s['entry']:,.2f}", "SL": f"₹{s['stop_loss']:,.2f}", "Target": f"₹{s['target']:,.2f}",
+                            "Confidence": f"{s['confidence_pct']}%", "Status": s['status'],
+                            "Exit": f"₹{s['exit_price']:,.2f} @ {s['exit_timestamp']}" if s['exit_price'] else "-"} for s in _all_setups],
+                            hide_index=True, width="stretch", height=480)
+                    except Exception:
+                        logger.exception("all-trades table failed (ignored)")
+                        st.caption("Poori list abhi load nahi ho payi.")
 
             _with_g = [x for x in (_recent_setups or []) if x.get('gemini')]
             if _with_g:

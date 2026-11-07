@@ -258,3 +258,14 @@ CREATE TABLE IF NOT EXISTS stock_watchlist (
   symbol TEXT PRIMARY KEY,
   added_at TIMESTAMPTZ DEFAULT now()
 );
+
+
+-- Permanent per-stock learning (shadow trades, market memory, autopsy, gate log ...).  Additive; safe to run more than once.
+create table if not exists public.stock_learning_blobs (
+  symbol text not null,
+  name text not null,
+  payload text not null,
+  rows integer,
+  updated_at text,
+  primary key (symbol, name)
+);

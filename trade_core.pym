@@ -409,21 +409,32 @@ def _sb_recent(limit):
     return out
 
 
+def _sb_fetch_all(url, page=1000, max_pages=60):
+    """Supabase/PostgREST returns at most 1000 rows per request and cuts the rest silently -> read page by page, so the trade count, win rate
+    and learning keep using EVERY trade after the history grows past 1000.  Same result as before while there are fewer than 1000 rows."""
+    out = []
+    for i in range(max_pages):
+        hdr = dict(_supabase_headers(), **{"Range-Unit": "items", "Range": f"{i * page}-{(i + 1) * page - 1}"})
+        resp = requests.get(url, headers=hdr, timeout=10)
+        resp.raise_for_status()
+        part = resp.json()
+        out.extend(part)
+        if len(part) < page:
+            break
+    return out
+
+
 @_sb_read_cached
 def _sb_resolved_factors_status():
     url = f"{_supabase_url}/rest/v1/{TABLE}?status=in.(WIN,LOSS,EXPIRED)&order=id.asc&select=factors_json,status"
-    resp = requests.get(url, headers=_supabase_headers(), timeout=10)
-    resp.raise_for_status()
-    return [(r["factors_json"], r["status"]) for r in resp.json()]
+    return [(r["factors_json"], r["status"]) for r in _sb_fetch_all(url)]
 
 
 @_sb_read_cached
 def _sb_status_counts():
-    url = f"{_supabase_url}/rest/v1/{TABLE}?select=status"
-    resp = requests.get(url, headers=_supabase_headers(), timeout=10)
-    resp.raise_for_status()
+    url = f"{_supabase_url}/rest/v1/{TABLE}?select=status&order=id.asc"
     counts = {"WIN": 0, "LOSS": 0, "EXPIRED": 0}
-    for r in resp.json():
+    for r in _sb_fetch_all(url):
         if r["status"] in counts:
             counts[r["status"]] += 1
     return counts
