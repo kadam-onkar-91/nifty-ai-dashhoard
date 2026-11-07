@@ -58,6 +58,32 @@ SECTOR_INDEX = {
     "Metal": "^CNXMETAL", "FMCG": "^CNXFMCG", "Energy": "^CNXENERGY",
     "Oil & Gas": "^CNXENERGY", "Realty": "^CNXREALTY", "Media": "^CNXMEDIA"
 }
+# Upstox live index keys for the same sectors (Upstox-first, Yahoo only as fallback)
+_SECTOR_UPSTOX = {"^NSEBANK": "NSE_INDEX|Nifty Bank", "^CNXIT": "NSE_INDEX|Nifty IT", "^CNXPHARMA": "NSE_INDEX|Nifty Pharma",
+                  "^CNXAUTO": "NSE_INDEX|Nifty Auto", "^CNXMETAL": "NSE_INDEX|Nifty Metal", "^CNXFMCG": "NSE_INDEX|Nifty FMCG",
+                  "^CNXENERGY": "NSE_INDEX|Nifty Energy", "^CNXREALTY": "NSE_INDEX|Nifty Realty", "^CNXMEDIA": "NSE_INDEX|Nifty Media",
+                  "^CNXFIN": "NSE_INDEX|Nifty Fin Service"}
+# keyword (lower-case, substring) -> yahoo index.  Handles Upstox/Yahoo sector words like "Technology", "Information Technology",
+# "Consumer Defensive", "Basic Materials", "Communication Services" etc. that the exact-name map above missed (that was the "N/A").
+_SECTOR_WORDS = (("information tech", "^CNXIT"), ("software", "^CNXIT"), ("technology", "^CNXIT"), ("it services", "^CNXIT"), ("it -", "^CNXIT"),
+                 ("bank", "^NSEBANK"), ("financ", "^CNXFIN"), ("insurance", "^CNXFIN"), ("nbfc", "^CNXFIN"),
+                 ("pharma", "^CNXPHARMA"), ("health", "^CNXPHARMA"), ("drug", "^CNXPHARMA"), ("hospital", "^CNXPHARMA"),
+                 ("auto", "^CNXAUTO"), ("metal", "^CNXMETAL"), ("steel", "^CNXMETAL"), ("mining", "^CNXMETAL"), ("basic material", "^CNXMETAL"),
+                 ("fmcg", "^CNXFMCG"), ("consumer defensive", "^CNXFMCG"), ("consumer goods", "^CNXFMCG"), ("food", "^CNXFMCG"),
+                 ("oil", "^CNXENERGY"), ("gas", "^CNXENERGY"), ("energy", "^CNXENERGY"), ("power", "^CNXENERGY"), ("utilit", "^CNXENERGY"),
+                 ("real estate", "^CNXREALTY"), ("realty", "^CNXREALTY"), ("media", "^CNXMEDIA"), ("communication", "^CNXMEDIA"), ("entertain", "^CNXMEDIA"))
+
+
+def _sector_yahoo_index(sector):
+    if not sector:
+        return None
+    if sector in SECTOR_INDEX:
+        return SECTOR_INDEX[sector]
+    low = str(sector).lower()
+    for word, idx in _SECTOR_WORDS:
+        if word in low:
+            return idx
+    return None
 
 
 def _instrument_map():
@@ -387,24 +413,78 @@ def get_nifty50_fundamentals_bias(fund=None):
     return {'label': label, 'score': score}
 
 
-def _index_context():
+def _upstox_index_live(instrument_key, access_token, yf_ticker=None):
+    """(ltp, change_pct) of an index straight from Upstox (live).  Change % uses the last COMPLETED day's close (Yahoo, cached);
+    if that is missing, Upstox's own net_change is used.  Returns None if Upstox gives nothing."""
+    if not access_token or not instrument_key:
+        return None
     try:
-        d=yf.download('^NSEI',period='5d',interval='1d',progress=False,auto_adjust=False)
-        if isinstance(d.columns,pd.MultiIndex): d.columns=d.columns.get_level_values(0)
-        c=d['Close'].dropna()
-        return {'nifty_last':float(c.iloc[-1]),'nifty_change_pct':float((c.iloc[-1]/c.iloc[-2]-1)*100) if len(c)>1 else None,'source':'Yahoo Finance'}
-    except Exception: return {'nifty_last':None,'nifty_change_pct':None,'source':'UNAVAILABLE'}
+        import urllib.parse
+        key = urllib.parse.quote(instrument_key, safe="|")
+        d = _upstox_json(f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={key}", access_token, timeout=6)
+        row = next(iter((d or {}).get("data", {}).values()), None)
+        if not row or row.get("last_price") in (None, 0):
+            return None
+        ltp = float(row["last_price"])
+        prev = None
+        try:
+            import data_feeds
+            prev = data_feeds._get_prev_close(yf_ticker) if yf_ticker else None
+        except Exception:
+            prev = None
+        if prev:
+            return round(ltp, 2), round((ltp - prev) / prev * 100, 2)
+        nc = row.get("net_change")
+        if nc is not None and ltp - float(nc) > 0:
+            return round(ltp, 2), round(float(nc) / (ltp - float(nc)) * 100, 2)
+        return round(ltp, 2), None
+    except Exception:
+        return None
 
 
-def _sector_context(sector):
-    idx=SECTOR_INDEX.get(sector)
-    if not idx: return {'status':'UNAVAILABLE','reason':'No mapped sector index'}
+def _yahoo_index_daily(ticker):
     try:
-        d=yf.download(idx,period='5d',interval='1d',progress=False,auto_adjust=False)
-        if isinstance(d.columns,pd.MultiIndex): d.columns=d.columns.get_level_values(0)
-        c=d['Close'].dropna()
-        return {'status':'AVAILABLE','index':idx,'last':float(c.iloc[-1]),'change_pct':float((c.iloc[-1]/c.iloc[-2]-1)*100) if len(c)>1 else None}
-    except Exception: return {'status':'UNAVAILABLE','index':idx}
+        d = yf.download(ticker, period='5d', interval='1d', progress=False, auto_adjust=False)
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = d.columns.get_level_values(0)
+        c = d['Close'].dropna()
+        return float(c.iloc[-1]), (float((c.iloc[-1] / c.iloc[-2] - 1) * 100) if len(c) > 1 else None)
+    except Exception:
+        return None
+
+
+def _index_context(access_token=None):
+    """Nifty 50 for the stock dashboard.  Upstox LIVE first (the same price the Nifty dashboard shows); Yahoo only as a labelled fallback."""
+    v = _upstox_index_live("NSE_INDEX|Nifty 50", access_token, "^NSEI")
+    if v:
+        return {'nifty_last': v[0], 'nifty_change_pct': v[1], 'source': 'Upstox Live'}
+    y = _yahoo_index_daily('^NSEI')
+    if y:
+        return {'nifty_last': y[0], 'nifty_change_pct': y[1], 'source': 'Yahoo Finance (delayed)'}
+    return {'nifty_last': None, 'nifty_change_pct': None, 'source': 'UNAVAILABLE'}
+
+
+def _banknifty_context(access_token=None):
+    v = _upstox_index_live("NSE_INDEX|Nifty Bank", access_token, "^NSEBANK")
+    if v:
+        return {'last': v[0], 'change_pct': v[1], 'source': 'Upstox Live'}
+    y = _yahoo_index_daily('^NSEBANK')
+    if y:
+        return {'last': y[0], 'change_pct': y[1], 'source': 'Yahoo Finance (delayed)'}
+    return {'last': None, 'change_pct': None, 'source': 'UNAVAILABLE'}
+
+
+def _sector_context(sector, access_token=None):
+    idx = _sector_yahoo_index(sector)
+    if not idx:
+        return {'status': 'UNAVAILABLE', 'reason': f'No mapped sector index for "{sector}"'}
+    v = _upstox_index_live(_SECTOR_UPSTOX.get(idx), access_token, idx)
+    if v:
+        return {'status': 'AVAILABLE', 'index': idx.lstrip('^'), 'last': v[0], 'change_pct': v[1], 'source': 'Upstox Live'}
+    y = _yahoo_index_daily(idx)
+    if y:
+        return {'status': 'AVAILABLE', 'index': idx.lstrip('^'), 'last': y[0], 'change_pct': y[1], 'source': 'Yahoo Finance (delayed)'}
+    return {'status': 'UNAVAILABLE', 'index': idx}
 
 
 def _upstox_json(url, access_token, params=None, timeout=8):
@@ -435,8 +515,15 @@ def _upstox_fundamentals(isin, access_token):
     }
     out = {"status": "AVAILABLE", "source": "Upstox Company Fundamentals", "isin": isin}
     got = 0
-    for name, url in endpoints.items():
-        data = _upstox_json(url, access_token, timeout=8)
+    # the 8 endpoints are fetched in PARALLEL (before: one by one, up to 8 x 8 s)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as _ex:
+        _futs = {name: _ex.submit(_upstox_json, url, access_token, None, 8) for name, url in endpoints.items()}
+    for name, fut in _futs.items():
+        try:
+            data = fut.result()
+        except Exception:
+            data = None
         if data and "data" in data:
             out[name] = data["data"]
             got += 1

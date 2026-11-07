@@ -328,6 +328,33 @@ def mirror(fam, min_gap=20.0):
     return n
 
 
+_STATUS = {"ts": 0.0, "val": None}
+
+
+def status(force=False):
+    """(is_persistent, message) for the STOCK trade store.  The stock's own trade_learning copy is intentionally local-only, so its built-in
+    'Persistent storage configure nahi hai' text is wrong for stocks -- this checks the real thing: Supabase reachable AND table
+    `stock_ai_setups` readable.  Cached 90 s; the message shows the real error if the table/columns/keys are wrong."""
+    now = time.time()
+    if not force and _STATUS["val"] is not None and now - _STATUS["ts"] < 90:
+        return _STATUS["val"]
+    url, hdr = _cfg()
+    if not url:
+        val = (False, "Supabase URL/KEY app me configure nahi hai (st.secrets: SUPABASE_URL / SUPABASE_KEY) -- stock trade history sirf is session ke liye hai.")
+    else:
+        try:
+            r = requests.get(f"{url}?select=id,symbol,timestamp,direction,entry,stop_loss,target,confidence_pct,factors_json,status,exit_price,exit_timestamp&limit=1",
+                             headers=hdr, timeout=6)
+            if r.ok:
+                val = (True, "Supabase se connected -- stock trade history permanent hai, app restart/redeploy se nahi mitegi.")
+            else:
+                val = (False, f"Supabase connected hai par `{TABLE}` table padh nahi paya (HTTP {r.status_code}): {r.text[:220]} -- schema.sql ka stock_ai_setups block dobara run karo.")
+        except Exception as e:
+            val = (False, f"Supabase se baat nahi ho payi: {type(e).__name__}: {str(e)[:160]}")
+    _STATUS["ts"], _STATUS["val"] = now, val
+    return val
+
+
 def safe_mirror(fam):
     try:
         return mirror(fam)
@@ -716,7 +743,7 @@ def nice_step(price):
     return float(min(nice, key=lambda n: abs(math.log(n / target))))
 
 
-def _slow(symbol, kind, ttl, fn, default=None):
+def _slow(symbol, kind, ttl, fn, default=None, timeout=12):
     now = time.time()
     k = (symbol, kind)
     with _SLOW_LOCK:
@@ -724,7 +751,7 @@ def _slow(symbol, kind, ttl, fn, default=None):
         if hit and now - hit[0] < ttl:
             return hit[1]
     try:
-        val = safe_io.guarded(f"stk_{kind}_{symbol}", fn, timeout=12, default=default)
+        val = safe_io.guarded(f"stk_{kind}_{symbol}", fn, timeout=timeout, default=default)
     except Exception:
         logger.exception("slow source %s failed", kind)
         val = default
@@ -961,18 +988,26 @@ def build_context(symbol, access_token, ai_engine, *, capital=100000.0, risk_pct
     candle = safe("candle", lambda: smart_money.detect_candlestick_pattern(df), None)
 
     # ---- sector / index / fundamentals / news (slow, cached) ---------------------------------------------------------
-    fund = _slow(sym, "fund", 3600, lambda: mse._fundamentals(sym, access_token=access_token, isin=meta.get("isin")), {}) or {}
+    # All the slow network sources run AT THE SAME TIME (before: one after the other = the long loading time).
+    from concurrent.futures import ThreadPoolExecutor
+    inst = meta.get("instrument_key")
+    _name_guess = meta.get("name") or sym
+    with ThreadPoolExecutor(max_workers=6) as _ex:
+        _f_fund = _ex.submit(lambda: _slow(sym, "fund", 3600, lambda: mse._fundamentals(sym, access_token=access_token, isin=meta.get("isin")), {}, timeout=30) or {})
+        _f_nifty = _ex.submit(lambda: _slow("NIFTY", "idx", 15, lambda: mse._index_context(access_token), {}) or {})
+        _f_bank = _ex.submit(lambda: _slow("BANKNIFTY", "idx", 15, lambda: mse._banknifty_context(access_token), {}) or {})
+        _f_news = _ex.submit(lambda: _slow(sym, "news", 600, lambda: mse._news(sym, _name_guess), ([], "UNAVAILABLE")))
+        _f_depth = _ex.submit(lambda: safe("depth", lambda: mse._upstox_quote_depth(inst, access_token), {"status": "UNAVAILABLE"}))
+        _f_oc = _ex.submit(lambda: safe("option_chain", lambda: mse._upstox_stock_option_chain(inst, access_token, live_price), {"status": "UNAVAILABLE"}))
+        fund = _f_fund.result()
+        nifty_ctx, bank_ctx, news = _f_nifty.result(), _f_bank.result(), _f_news.result()
+        quote, oc_raw = _f_depth.result(), _f_oc.result()
     company = meta.get("name") or fund.get("longName") or sym
     sector = fund.get("sector") or fund.get("industry") or "Unknown"
-    nifty_ctx = _slow("NIFTY", "idx", 120, mse._index_context, {}) or {}
-    sec_ctx = _slow(sector, "sec", 300, lambda: mse._sector_context(sector), {}) or {}
-    news = _slow(sym, "news", 600, lambda: mse._news(sym, company), ([], "UNAVAILABLE"))
+    sec_ctx = _slow(sector, "sec", 20, lambda: mse._sector_context(sector, access_token), {}) or {}
     news_rows, news_status = (news if isinstance(news, tuple) else (news, ""))
 
     # ---- depth + option chain (only if the stock has F&O) ------------------------------------------------------------
-    inst = meta.get("instrument_key")
-    quote = safe("depth", lambda: mse._upstox_quote_depth(inst, access_token), {"status": "UNAVAILABLE"})
-    oc_raw = safe("option_chain", lambda: mse._upstox_stock_option_chain(inst, access_token, live_price), {"status": "UNAVAILABLE"})
     oc_rows = (oc_raw or {}).get("rows") or []
     df_oc = mse._stock_option_chain_for_sr(oc_raw)
     has_oc = bool(oc_rows)
@@ -1077,7 +1112,7 @@ def build_context(symbol, access_token, ai_engine, *, capital=100000.0, risk_pct
         "sniper": sniper, "quote": quote, "order_flow": order_flow_from_quote(quote),
         "option_chain_raw": oc_raw, "option_rows": oc_rows, "has_option_chain": has_oc, "pcr": pcr, "max_pain": max_pain,
         "iv_skew": iv_skew, "atm_iv": atm_iv, "fii_footprint": fii_footprint,
-        "sector": sector, "sector_context": sec_ctx, "nifty_context": nifty_ctx, "breadth_status": breadth_status, "corr_note": corr_note,
+        "sector": sector, "sector_context": sec_ctx, "nifty_context": nifty_ctx, "banknifty_context": bank_ctx, "breadth_status": breadth_status, "corr_note": corr_note,
         "fundamentals": fund, "news": news_rows, "news_status": news_status,
         "mtf": mtf, "position_size": pos, "risk_state": risk_state, "backtest": backtest, "monte_carlo": mc, "drift": drift,
         "trade_count": len(closed), "capital": capital, "risk_pct": risk_pct,
@@ -1462,7 +1497,10 @@ def _run(ctx, state, gemini_keys, extra=None):
 def _finish(p2, fam, ctx, state):
     try:
         p2["open_setup"] = fam.trade_learning.get_open_setup()
-        p2["storage"] = fam.trade_learning.get_storage_status()
+    except Exception:
+        pass
+    try:
+        p2["storage"] = stock_store.status()
     except Exception:
         pass
     try:
@@ -1569,7 +1607,7 @@ def decision(ctx):
         return
     stg = p2.get("storage")
     if stg:
-        (st.caption if stg[0] else st.warning)(f"💾 {sym}: " + str(stg[1]) + " (Supabase me `stock_ai_setups` par mirror hota hai -- restart ke baad wapas aata hai.)")
+        (st.caption if stg[0] else st.warning)(f"💾 {sym}: " + str(stg[1]))
     op = p2.get("open_setup")
     dec = p2.get("decision")
     if op:
@@ -2281,10 +2319,14 @@ def _body(symbol, ai_engine, helpers):
         st.session_state.access_token = token
 
     sp.step("Global news + markets")
-    df_gm = safe_io.guarded("stk_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as _ex:
+        _f_news = _ex.submit(lambda: safe_io.guarded("stk_global_news", global_news.get_global_market_sentiment, timeout=10,
+                                                      default=(pd.DataFrame(), "Global headline unavailable right now.")))
+        df_gm = safe_io.guarded("stk_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
+        sent_pair = _f_news.result()
     gscore, gavg = safe_io.guarded("stk_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
     vix = safe_io.guarded("stk_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
-    sent_pair = safe_io.guarded("stk_global_news", global_news.get_global_market_sentiment, timeout=10, default=(pd.DataFrame(), "Global headline unavailable right now."))
     df_sent, top_headline = sent_pair if isinstance(sent_pair, tuple) else (pd.DataFrame(), "")
 
     sp.step(f"{symbol} research engines")
@@ -2562,15 +2604,22 @@ def _body(symbol, ai_engine, helpers):
     # ------------------------------------------------------------------ Order flow chart
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("📊 Institutional Order Flow Chart (VWAP & Volume Profile)")
-    cdf = df.tail(100)
+    cdf = df[~df.index.duplicated(keep="last")].tail(120)
+    try:
+        _xs = [t.strftime("%d-%b %H:%M") for t in pd.to_datetime(cdf.index)]      # category axis: every candle same width, no night/weekend gaps
+    except Exception:
+        _xs = [str(t) for t in cdf.index]
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=cdf.index, open=cdf["Open"], high=cdf["High"], low=cdf["Low"], close=cdf["Close"], name=sym,
+    fig.add_trace(go.Candlestick(x=_xs, open=cdf["Open"], high=cdf["High"], low=cdf["Low"], close=cdf["Close"], name=sym,
                                  increasing_line_color="#26A69A", decreasing_line_color="#EF5350"))
-    fig.add_trace(go.Scatter(x=cdf.index, y=cdf["EMA_20"], mode="lines", name="EMA 20", line=dict(color="#2962FF", width=1)))
-    fig.add_trace(go.Scatter(x=cdf.index, y=cdf["VWAP"], mode="lines", name="VWAP (Smart Money Avg)", line=dict(color="#E040FB", width=2.5, dash="dot")))
+    fig.add_trace(go.Scatter(x=_xs, y=cdf["EMA_20"], mode="lines", name="EMA 20", line=dict(color="#2962FF", width=1)))
+    fig.add_trace(go.Scatter(x=_xs, y=cdf["VWAP"], mode="lines", name="VWAP (Smart Money Avg)", line=dict(color="#E040FB", width=2.5, dash="dot")))
     fig.add_hline(y=ctx["poc"], line_width=2, line_dash="solid", line_color="#FFEA00", annotation_text=f"POC Level (Max Vol): {ctx['poc']:.2f}", annotation_position="top right")
+    _lo, _hi = float(cdf["Low"].min()), float(cdf["High"].max())
+    _pad = max((_hi - _lo) * 0.05, _hi * 0.001)
     fig.update_layout(xaxis_title="Time", yaxis_title="Price (₹)", template="plotly_dark", height=600, xaxis_rangeslider_visible=False,
-                      margin=dict(l=10, r=10, t=30, b=10))
+                      xaxis=dict(type="category", nticks=10, tickangle=-35), yaxis=dict(range=[_lo - _pad, _hi + _pad]),
+                      legend=dict(orientation="h", y=1.04, x=0), margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig, width="stretch")
     vw, poc = ctx["vwap"], ctx["poc"]
     cv1, cv2 = st.columns(2)
@@ -2626,19 +2675,34 @@ def _body(symbol, ai_engine, helpers):
 
     # ------------------------------------------------------------------ Correlated indices
     st.markdown("<br>", unsafe_allow_html=True)
-    st.subheader(f"🏦 Nifty 50, {ctx['sector']} Index & Correlated Indices")
-    sc, nc = ctx["sector_context"] or {}, ctx["nifty_context"] or {}
-    i1, i2 = st.columns(2)
+    st.subheader("🏦 Nifty 50, Bank Nifty & Correlated Indices")
+    sc, nc, bc = ctx["sector_context"] or {}, ctx["nifty_context"] or {}, ctx.get("banknifty_context") or {}
+    _has_sec = sc.get("last") is not None
+    icols = st.columns(3 if _has_sec else 2)
     if nc.get("nifty_last") is not None:
-        i1.metric(f"NIFTY 50 ({nc.get('source')})", f"₹{nc['nifty_last']:,.2f}", delta=f"{nc['nifty_change_pct']:.2f}%" if nc.get("nifty_change_pct") is not None else None)
+        icols[0].metric(f"NIFTY 50 ({nc.get('source')})", f"₹{nc['nifty_last']:,.2f}", delta=f"{nc['nifty_change_pct']:.2f}%" if nc.get("nifty_change_pct") is not None else None)
     else:
-        i1.metric("NIFTY 50", "N/A")
-    if sc.get("last") is not None:
-        i2.metric(f"{ctx['sector']} index ({sc.get('index')})", f"₹{sc['last']:,.2f}", delta=f"{sc['change_pct']:.2f}%" if sc.get("change_pct") is not None else None)
+        icols[0].metric("NIFTY 50", "N/A")
+    if bc.get("last") is not None:
+        icols[1].metric(f"BANK NIFTY ({bc.get('source')})", f"₹{bc['last']:,.2f}", delta=f"{bc['change_pct']:.2f}%" if bc.get("change_pct") is not None else None)
     else:
-        i2.metric(f"{ctx['sector']} index", "N/A")
+        icols[1].metric("BANK NIFTY", "N/A")
+    if _has_sec:
+        icols[2].metric(f"{ctx['sector']} index ({sc.get('index')}, {sc.get('source', '')})", f"₹{sc['last']:,.2f}", delta=f"{sc['change_pct']:.2f}%" if sc.get("change_pct") is not None else None)
+    # Bank Nifty <-> Nifty correlation (same rule as the Nifty dashboard)
+    _nch, _bch = nc.get("nifty_change_pct"), bc.get("change_pct")
+    if _nch is not None and _bch is not None:
+        _diff = _bch - _nch
+        if abs(_diff) < 0.15:
+            st.success("**Bank Nifty ⇄ Nifty 50 Correlation:** CONFIRMED — Bank Nifty and Nifty 50 are moving together (healthy participation).")
+        elif _diff <= -0.15 and _nch > 0:
+            st.warning("**Bank Nifty ⇄ Nifty 50 Correlation:** DIVERGENCE WARNING — Nifty is up but Bank Nifty is lagging/negative. Classic fake-breakout risk.")
+        elif _diff >= 0.15 and _nch < 0:
+            st.warning("**Bank Nifty ⇄ Nifty 50 Correlation:** DIVERGENCE WARNING — Nifty is down but Bank Nifty is holding up. Possible fake-breakdown risk.")
+        else:
+            st.info(f"**Bank Nifty ⇄ Nifty 50 Correlation:** Mild divergence ({_diff:+.2f} pts gap) — not a strong confirmation either way.")
     cn = ctx["corr_note"]
-    if cn:
+    if cn and _has_sec:
         (st.warning if "DIVERGENCE" in cn.upper() else st.success if "CONFIRMED" in cn.upper() else st.info)(f"**Sector ⇄ {sym} Correlation:** {cn}")
 
     # ------------------------------------------------------------------ Indicators + option chain
@@ -2707,7 +2771,16 @@ def _body(symbol, ai_engine, helpers):
 
     # chat box context + fresh-run bookkeeping
     dc = st.session_state.setdefault("dashboard_context", {})
+    for _k in [k for k in dc if k not in ("risk_capital",)]:      # drop leftovers of the Nifty page so the chat answers ONLY about this stock
+        dc.pop(_k, None)
     dc["selected_stock_analysis"] = _chat_context(ctx)
+    dc["IMPORTANT"] = (f"Selected stock = {sym} ({ctx['company']}). Answer every question about {sym} using ONLY the data below (its own price, "
+                       "levels, option chain, SMC, strategies, AI decision, Gemini review, news, fundamentals, Nifty/Bank Nifty/sector context). "
+                       "Do not use Nifty-50 index numbers as if they were this stock's.")
+    dc["Nifty 50 / Bank Nifty / sector (live)"] = str({"nifty": ctx.get("nifty_context"), "banknifty": ctx.get("banknifty_context"), "sector": ctx.get("sector_context")})
+    dc["Stock fundamentals"] = str(ctx.get("fundamentals"))[:3500]
+    dc["Stock news"] = str(ctx.get("news"))[:2500]
+    dc["Global sentiment"] = f"{gscore} | avg change {gavg}% | top headline: {top_headline}"
     p2 = ctx.get("p2") or {}
     dc[f"Strategy Ensemble {sym}"] = str(p2.get("strategy_result"))[:3000]
     dc[f"Consensus {sym}"] = str((p2.get("consensus") or {}).get("summary_text", ""))
