@@ -1657,6 +1657,11 @@ def _run(ctx, state, gemini_keys, extra=None):
     if open_setup or not risk_ok:
         p2.update(decision=None, gemini_review=review)
         return _finish(p2, fam, ctx, state)
+    if (ctx.get("market") or {}).get("state") != "OPEN":
+        # Market band: candles are the last session's -> no Gemini call, no trade, no shadow log until the market opens (same rule as Nifty).
+        review = {"status": "NOT_NEEDED", "approved": False, "reason": "Market closed -- review/trade market OPEN hone par."}
+        p2.update(decision=None, gemini_review=review, gate="MARKET CLOSED")
+        return _finish(p2, fam, ctx, state)
 
     eq = step("entry_quality", lambda: {"BUY": fam.entry_quality.assess_entry(df, "BUY", atr), "SELL": fam.entry_quality.assess_entry(df, "SELL", atr)}, None)
     from stock_news import news_sentiment_label  # local helper (Phase 3.5 upgrades the source; same output shape)

@@ -1486,7 +1486,16 @@ def _live_dashboard():
             # -------------------------------------------------------------
             _gemini_review = {"status": "NOT_NEEDED", "approved": False, "reason": "No qualifying deterministic setup yet."}
             _pre_ok = bool(_decision.get('has_setup'))
-            if not _pre_ok and _decision.get('candidate'):
+            # Market band (shaam/weekend/holiday): strategies still read the LAST session's candles, so a "setup" can exist on stale prices.
+            # No Gemini call, no trade, no Telegram alert and no shadow trade on stale data -- everything waits for the market to open.
+            try:
+                _mkt_open_for_trade = market_status.get_market_status().get("state") == "OPEN"
+            except Exception:
+                _mkt_open_for_trade = True
+            if _pre_ok and not _mkt_open_for_trade:
+                _decision = dict(_decision, has_setup=False, reason="Market abhi OPEN nahi hai -- Gemini review aur trade market khulne par hi hoga (band market ke purane candle par trade nahi).")
+                _gemini_review = {"status": "NOT_NEEDED", "approved": False, "reason": "Market closed -- review/trade market OPEN hone par."}
+            if not _pre_ok and _decision.get('candidate') and _mkt_open_for_trade:
                 try:
                     shadow_trades.log(_decision['candidate'], ai_trade_decision.classify_block(_decision.get('reason')))
                 except Exception:
