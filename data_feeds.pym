@@ -2239,12 +2239,16 @@ def enabled() -> bool:
 
 # ----------------------------------------------------------------------------- data
 @st.cache_data(ttl=CANDLE_TTL, show_spinner=False)
-def _history(token: str):
+def _history(token: str, instrument_key: str | None = None):
+    if instrument_key:        # a selected stock (same chart, that stock's own candles)
+        return market_data.fetch_candles_for_timeframe(token, "minutes", str(INTERVAL_MIN), days_back=6, instrument_key=instrument_key)
     return market_data.fetch_candles_for_timeframe(token, "minutes", str(INTERVAL_MIN), days_back=6)
 
 
 @st.cache_data(ttl=1, show_spinner=False)
-def _ltp(token: str):
+def _ltp(token: str, instrument_key: str | None = None):
+    if instrument_key:
+        return market_data._fetch_upstox_ltp(token, instrument_key)
     return market_data._fetch_upstox_ltp(token)
 
 
@@ -2297,14 +2301,14 @@ def _session_vwap(df: pd.DataFrame):
 
 
 # ----------------------------------------------------------------------------- figure
-def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None):
+def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None, name: str = "Nifty 50", is_stock: bool = False):
     d = df.tail(MAX_CANDLES)
     ema = d["Close"].ewm(span=20, adjust=False).mean()
     vwap, real_vol = _session_vwap(d)
 
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
-        x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name=f"Nifty 50 · {INTERVAL_MIN}m",
+        x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name=f"{name} · {INTERVAL_MIN}m",
         increasing=dict(line=dict(color=UP, width=1), fillcolor=UP),
         decreasing=dict(line=dict(color=DOWN, width=1), fillcolor=DOWN),
         whiskerwidth=0.4))
@@ -2316,7 +2320,7 @@ def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None):
 
     if poc:
         fig.add_hline(y=poc, line_width=1.2, line_color="#FFEA00", opacity=0.7,
-                      annotation_text=f"POC {poc:,.0f}", annotation_position="top left",
+                      annotation_text=(f"POC {poc:,.2f}" if is_stock else f"POC {poc:,.0f}"), annotation_position="top left",
                       annotation_font_color="#FFEA00")
     if ltp:
         last_up = d["Close"].iloc[-1] >= d["Open"].iloc[-1]
@@ -2327,11 +2331,11 @@ def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None):
 
     vis = d.tail(VISIBLE_CANDLES)
     lo, hi = float(vis["Low"].min()), float(vis["High"].max())
-    pad = max((hi - lo) * 0.08, 5.0)
+    pad = max((hi - lo) * 0.08, (hi * 0.0005) if is_stock else 5.0)
     x_end = d.index[-1] + pd.Timedelta(minutes=INTERVAL_MIN * 5)
 
     fig.update_layout(
-        template="plotly_dark", height=520, uirevision=f"nifty-live-{INTERVAL_MIN}m",
+        template="plotly_dark", height=520, uirevision=f"{name}-live-{INTERVAL_MIN}m",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=4, r=4, t=36, b=8), hovermode="x unified", dragmode="pan",
         xaxis_rangeslider_visible=False,
@@ -2344,7 +2348,7 @@ def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None):
             dict(bounds=[15.5, 9.25], pattern="hour"),    # overnight (NSE 09:15 - 15:30)
         ])
     fig.update_yaxes(range=[lo - pad, hi + pad], side="right", showgrid=True,
-                     gridcolor="rgba(255,255,255,.06)", tickformat=",.0f")
+                     gridcolor="rgba(255,255,255,.06)", tickformat=(",.2f" if is_stock else ",.0f"))
     return fig
 
 
@@ -2379,7 +2383,7 @@ def _header(ltp, prev_day_close, is_open):
 """, unsafe_allow_html=True)
 
 
-def _body(was_open: bool):
+def _body(was_open: bool, instrument_key: str | None = None, name: str = "Nifty 50"):
     state = market_status.get_market_status()["state"]
     is_open = state == "OPEN"
     if is_open != was_open:          # market just opened/closed -> re-pick refresh speed once
@@ -2395,7 +2399,7 @@ def _body(was_open: bool):
         st.info("⏳ Live chart: broker login hone ka wait... (dashboard login hote hi chalu ho jaayega)")
         return
 
-    hist = _history(token)
+    hist = _history(token, instrument_key)
     if hist is None or len(hist) == 0:
         st.warning("5-minute candles abhi broker se nahi mile -- thodi der mein dobara try hoga.")
         return
@@ -2403,11 +2407,12 @@ def _body(was_open: bool):
     df = _to_naive_ist(hist)
     ltp = None
     if is_open:
-        ltp = _ltp(token)
+        ltp = _ltp(token, instrument_key)
         if ltp:
             now_naive = pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None)
-            df, st.session_state["_lc_forming"] = apply_live_tick(
-                df, float(ltp), now_naive, st.session_state.get("_lc_forming"))
+            _fk = "_lc_forming" if not instrument_key else f"_lc_forming_{name}"
+            df, st.session_state[_fk] = apply_live_tick(
+                df, float(ltp), now_naive, st.session_state.get(_fk))
     if ltp is None:
         ltp = float(df["Close"].iloc[-1])
 
@@ -2417,8 +2422,8 @@ def _body(was_open: bool):
 
     _header(ltp, prev_day_close, is_open)
     st.plotly_chart(
-        build_figure(df, ltp, st.session_state.get("_live_poc")),
-        width="stretch", key="live_candle_chart",
+        build_figure(df, ltp, st.session_state.get("_live_poc" if not instrument_key else f"_live_poc_{name}"), name=name, is_stock=bool(instrument_key)),
+        width="stretch", key="live_candle_chart" if not instrument_key else f"live_candle_chart_{name}",
         config={"displaylogo": False, "scrollZoom": True,
                 "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"]})
     st.caption(f"{INTERVAL_MIN}-minute candles · Upstox live feed · chalti hui candle har "
@@ -2426,7 +2431,7 @@ def _body(was_open: bool):
                f"{INTERVAL_MIN}-minute candles · Upstox · market band hai, aakhri session dikh raha hai")
 
 
-def render() -> bool:
+def render(instrument_key: str | None = None, name: str = "Nifty 50") -> bool:
     """One-line switch + the live 5-minute chart.  Returns False if the feature is disabled (caller then keeps its old chart);
     True otherwise -- also when the switch is OFF, so the old chart does not pop up in its place."""
     if not enabled():
@@ -2437,7 +2442,7 @@ def render() -> bool:
             return True
         is_open = market_status.get_market_status()["state"] == "OPEN"
         frag = st.fragment(run_every=TICK_SECONDS if is_open else None)(_body)
-        frag(is_open)
+        frag(is_open, instrument_key, name)
         return True
     except Exception:
         import logging

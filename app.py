@@ -2126,6 +2126,12 @@ if not ACTIVE_SYMBOL:
     _LIVE_CHART_ON = live_chart.render()   # own fast refresh; False -> old chart is used
     _live_dashboard()
 else:
+    try:
+        _lc_meta = stock_universe.resolve(stock_universe.clean_symbol(ACTIVE_SYMBOL)) or {}
+        if _lc_meta.get("instrument_key"):
+            live_chart.render(instrument_key=_lc_meta["instrument_key"], name=_lc_meta.get("symbol") or ACTIVE_SYMBOL)   # same switch + live chart as Nifty, this stock's own candles
+    except Exception:
+        logger.exception("stock live chart failed (ignored)")
     st.info(f"📌 Abhi **{ACTIVE_SYMBOL}** ka poora dashboard active hai (neeche dekho). Nifty 50 index dashboard par wapas jaane ke liye sidebar mein '⬅ Nifty 50' dabao.")
 
 # -------------------------------------------------------------

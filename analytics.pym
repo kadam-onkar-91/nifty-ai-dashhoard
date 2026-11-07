@@ -4153,8 +4153,11 @@ def _option_oi_at_strike(df_option_chain, strike_ref):
     if df_option_chain is None or df_option_chain.empty or strike_ref is None:
         return None
     try:
-        target_strike = round(strike_ref / 50) * 50
+        # the zone price can arrive as text ("24,500.50") -> that made this return None = "Option chain data unavailable" even with a live chain.
+        # Nearest real strike of the chain is used directly (works for Nifty's 50-pt strikes AND any stock's own strike gap).
+        target_strike = float(str(strike_ref).replace(",", "").replace("₹", "").strip())
         tmp = df_option_chain.copy()
+        tmp['Strike'] = tmp['Strike'].astype(float)
         tmp['dist'] = (tmp['Strike'] - target_strike).abs()
         return tmp.sort_values('dist').iloc[0]
     except Exception:

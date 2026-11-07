@@ -894,11 +894,19 @@ def build_mtf(token, meta, df):
             import multi_timeframe
             import smart_money as sm
             res, h1 = {}, None
+            from concurrent.futures import ThreadPoolExecutor as _TP
+            tfs = [t for t in multi_timeframe.TIMEFRAMES if t[0] != "4H"]
+            with _TP(max_workers=len(tfs)) as _px:                    # all timeframes at the SAME time (was one after the other)
+                futs = {t[0]: _px.submit(market_data.fetch_candles_for_timeframe, token, t[1], t[2], t[3], instrument_key=key) for t in tfs}
+                fetched = {}
+                for lab, f in futs.items():
+                    try:
+                        fetched[lab] = f.result(timeout=25)
+                    except Exception:
+                        fetched[lab] = None
+            h1 = fetched.get("1H")
             for label, unit, interval, days in multi_timeframe.TIMEFRAMES:
-                d = multi_timeframe._resample_to_4h(h1) if label == "4H" else market_data.fetch_candles_for_timeframe(
-                    token, unit, interval, days, instrument_key=key)
-                if label == "1H":
-                    h1 = d
+                d = multi_timeframe._resample_to_4h(h1) if label == "4H" else fetched.get(label)
                 if d is None or d.empty or len(d) < 25:
                     res[label] = {"status": "DATA_UNAVAILABLE"}
                     continue
@@ -1151,9 +1159,44 @@ import stock_family
 import stock_store
 
 ENGINE_VERSION = "stock-phase2-v1"
+from concurrent.futures import ThreadPoolExecutor as _TPE
+_ML_POOL = _TPE(max_workers=3, thread_name_prefix="stk-ml")     # own pool: heavy sklearn jobs must never starve safe_io's shared data pool
+_ML_LOCK = threading.Lock()
+_ML_STATE = {}             # symbol -> {"key","res","fut"}
 _WATCH = {"thread": None}
 _WATCH_LOCK = threading.Lock()
 _FAMILY_META = {}          # symbol -> instrument_key (for the live-tick watcher)
+
+
+def ml_cached(fam, sym, df, vix, first_wait=25.0, stale_wait=0.3):
+    """Walk-forward ML result for this stock.  The model only depends on CLOSED 5-min history, so it is retrained once per new candle (not on every
+    30 s refresh and not whenever India VIX moves by 0.1 as before).  While a retrain runs the previous result is used (<= one candle old), so a
+    refresh never waits for it; only the very first call for a stock waits (max `first_wait` s)."""
+    key = (str(df.index[-1]), len(df))
+    with _ML_LOCK:
+        e = _ML_STATE.setdefault(sym, {"key": None, "res": None, "fut": None})
+        if e["res"] is not None and e["key"] == key:
+            return e["res"]
+        fut = e["fut"]
+        if fut is None or fut.done():
+            snap = df.copy()
+
+            def _job(_snap=snap, _key=key):
+                try:
+                    r = fam.ml_engine.train_and_backtest(_snap, vix)
+                except Exception:
+                    logger.exception("stock ML job failed (%s)", sym)
+                    return
+                with _ML_LOCK:
+                    _ML_STATE[sym].update(key=_key, res=r)
+            fut = e["fut"] = _ML_POOL.submit(_job)
+        has_old = e["res"] is not None
+    try:
+        fut.result(timeout=stale_wait if has_old else first_wait)
+    except Exception:
+        pass
+    with _ML_LOCK:
+        return e["res"] or {"model_ready": False}
 
 
 # ------------------------------------------------------------------------------------------------------------------ dashboard context
@@ -1355,7 +1398,7 @@ def _run(ctx, state, gemini_keys, extra=None):
     p2["strategy_result"] = strategy_result
 
     # ---- 2.2 per-stock walk-forward ML (own cache because the engine copy is the stock's own) ----------------------------------------
-    ml = step("ml", lambda: fam.ml_engine.train_and_backtest(df, extra.get("vix")), {"model_ready": False}, timeout=25) or {"model_ready": False}
+    ml = step("ml", lambda: ml_cached(fam, sym, df, extra.get("vix")), {"model_ready": False}) or {"model_ready": False}
     p2["ml_results"] = ml
 
     # ---- 3.3 peer-stocks breadth (one batched Upstox call, cached 120 s) -> consensus + decision see adv/dec ------------------------------
@@ -1927,14 +1970,19 @@ logger = get_logger(__name__)
 ROOT = os.environ.get("STOCK_DATA_DIR", "stock_data")
 PATH = os.path.join(ROOT, "watchlist.json")
 TABLE = "stock_watchlist"
-CYCLE_GAP = 60.0            # a stock is refreshed at most once a minute (candles are 5-min, ticks are handled by the tick watcher)
-WORKERS = 3                 # stocks processed in parallel
+CYCLE_GAP = 30.0            # every watchlist stock is re-run every 30 s (same cadence as the Nifty 50 dashboard); ticks are handled by the tick watcher
+WORKERS = 10                # stocks processed in parallel (one worker per stock, so no stock waits for another)
+RESULT_MAX_AGE = 40.0       # the dashboard re-uses the robot's result when it is younger than this -> instant stock loading
+GLOBAL_TTL = 30.0           # global markets / VIX refreshed every 30 s; global news every 3 min (changes slowly)
 POST_CLOSE_UNTIL = (15, 50)  # one last pass after the close so the day's candles get labelled
 _LOCK = threading.RLock()
 _STATUS = {}
 _STATES = {}
 _RUNNER = {"thread": None, "ai": None, "keys": [], "synced": False}
-_GLOBAL = {"t": 0.0, "v": None}
+_GLOBAL = {"t": 0.0, "v": None, "tn": 0.0, "sent": None, "head": ""}
+_GLOBAL_LOCK = threading.Lock()
+_RESULTS = {}                # symbol -> {"t","ctx","extra","gscore"}  (latest robot result, read by the dashboard)
+_INFLIGHT = {}               # symbol -> Future
 
 
 # ------------------------------------------------------------------------------------------------------------------ shared per-stock state
@@ -2059,18 +2107,39 @@ def _market_state():
 
 
 def _global_bundle():
-    """Global markets / VIX / global news -- fetched once for ALL stocks, cached 5 min."""
-    if _GLOBAL["v"] is not None and time.time() - _GLOBAL["t"] < 300:
+    """Global markets / VIX (30 s) + global news (3 min) -- fetched ONCE for ALL stocks (one lock, no duplicate fetches)."""
+    if _GLOBAL["v"] is not None and time.time() - _GLOBAL["t"] < GLOBAL_TTL:
         return _GLOBAL["v"]
-    import pandas as pd
-    import safe_io, global_markets, global_news
-    df_gm = safe_io.guarded("wl_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
-    gscore, gavg = safe_io.guarded("wl_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
-    vix = safe_io.guarded("wl_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
-    sp = safe_io.guarded("wl_global_news", global_news.get_global_market_sentiment, timeout=10, default=(pd.DataFrame(), ""))
-    df_sent = sp[0] if isinstance(sp, tuple) else pd.DataFrame()
-    _GLOBAL["v"], _GLOBAL["t"] = (df_gm, gscore, gavg, vix, df_sent), time.time()
-    return _GLOBAL["v"]
+    with _GLOBAL_LOCK:
+        if _GLOBAL["v"] is not None and time.time() - _GLOBAL["t"] < GLOBAL_TTL:
+            return _GLOBAL["v"]
+        import pandas as pd
+        import safe_io, global_markets, global_news
+        df_gm = safe_io.guarded("wl_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
+        gscore, gavg = safe_io.guarded("wl_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
+        vix = safe_io.guarded("wl_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
+        if _GLOBAL["sent"] is None or time.time() - _GLOBAL["tn"] >= 180:
+            sp = safe_io.guarded("wl_global_news", global_news.get_global_market_sentiment, timeout=10, default=(pd.DataFrame(), ""))
+            _GLOBAL["sent"] = sp[0] if isinstance(sp, tuple) else pd.DataFrame()
+            _GLOBAL["head"] = str(sp[1]) if isinstance(sp, tuple) and len(sp) > 1 else ""
+            _GLOBAL["tn"] = time.time()
+        _GLOBAL["v"], _GLOBAL["t"] = (df_gm, gscore, gavg, vix, _GLOBAL["sent"]), time.time()
+        return _GLOBAL["v"]
+
+
+def fresh_result(sym, max_age=None, capital=None, risk_pct=None):
+    """The robot's newest finished pass for `sym` (ctx + engine output), or None when it is older than max_age or was built with other risk settings.
+    The dashboard uses it so opening a watchlist stock needs no recomputation at all."""
+    with _LOCK:
+        r = _RESULTS.get(str(sym).upper())
+    if not r or time.time() - r["t"] > (RESULT_MAX_AGE if max_age is None else max_age):
+        return None
+    c = r["ctx"]
+    if capital is not None and abs(float(c.get("capital", capital)) - float(capital)) > 1e-6:
+        return None
+    if risk_pct is not None and abs(float(c.get("risk_pct", risk_pct)) - float(risk_pct)) > 1e-6:
+        return None
+    return r
 
 
 def run_once(sym, token=None):
@@ -2088,6 +2157,9 @@ def run_once(sym, token=None):
             return row
         p2 = stock_engine.run(ctx, state, list(_RUNNER["keys"] or []), extra={"df_gm": df_gm, "df_sent": df_sent, "gavg": gavg, "vix": vix})
         ctx["p2"] = p2
+        with _LOCK:
+            _RESULTS[sym] = {"t": time.time(), "ctx": ctx, "gscore": gscore,
+                             "extra": {"df_gm": df_gm, "df_sent": df_sent, "gavg": gavg, "vix": vix}, "headline": _GLOBAL.get("head") or ""}
         # Market Brain: record this candle + label old ones (cheap part only; the heavy forecaster is drawn when the stock is opened)
         try:
             fam = p2.get("family")
@@ -2111,19 +2183,21 @@ def run_once(sym, token=None):
     finally:
         row["ms"] = round((time.time() - t0) * 1000)
         with _LOCK:
+            row["_t"] = (_STATUS.get(sym) or {}).get("_t", time.time())
             _STATUS[sym] = row
     return row
 
 
 def _loop():
+    """Every stock is scheduled on its own: it is re-run CYCLE_GAP (30 s) after its previous run STARTED, never waiting for a slower stock."""
     done_after_close = {}
     pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="wl")
     while True:
         try:
-            time.sleep(5)
+            time.sleep(0.5)
             syms = list_symbols()
             if not syms:
-                time.sleep(20)
+                time.sleep(15)
                 continue
             mk = _market_state()
             state = mk.get("state")
@@ -2135,35 +2209,40 @@ def _loop():
                 except Exception:
                     after_close = False
                 if not after_close:
-                    time.sleep(30)
+                    time.sleep(20)
                     continue
-            due = []
-            for s in syms:
-                last = (_STATUS.get(s) or {}).get("_t", 0.0)
-                if after_close and done_after_close.get(s) == str(now.date()):
-                    continue
-                if time.time() - last >= CYCLE_GAP:
-                    due.append(s)
             token = None
             try:
                 token = __import__("upstox_auth")._stored_token()
             except Exception:
                 pass
-            futs = []
-            for s in due:
-                futs.append((s, pool.submit(run_once, s, token)))
-            for s, f in futs:
-                try:
-                    f.result(timeout=170)
-                except Exception:
-                    logger.exception("watchlist job timeout %s (ignored)", s)
+            for s in syms:
+                f = _INFLIGHT.get(s)
+                if f is not None and not f.done():
+                    continue                                   # still running -> never stack a second run of the same stock
+                if after_close and done_after_close.get(s) == str(now.date()):
+                    continue
+                last = (_STATUS.get(s) or {}).get("_t", 0.0)
+                if time.time() - last < CYCLE_GAP:
+                    continue
                 with _LOCK:
                     _STATUS.setdefault(s, {})["_t"] = time.time()
                 if after_close:
                     done_after_close[s] = str(now.date())
+                _INFLIGHT[s] = pool.submit(_run_and_stamp, s, token)
         except Exception:
             logger.exception("watchlist loop error (ignored)")
-            time.sleep(10)
+            time.sleep(5)
+
+
+def _run_and_stamp(sym, token):
+    row = run_once(sym, token)
+    with _LOCK:
+        cur = _STATUS.setdefault(sym, {})
+        t = cur.get("_t", time.time())
+        cur.update(row)
+        cur["_t"] = t
+    return row
 
 
 def ensure_runner(ai_engine=None, gemini_keys=None):
@@ -2194,7 +2273,7 @@ def sidebar_panel():
     syms = list_symbols()
     with st.expander(f"⭐ Robot Watchlist ({len(syms)} stocks) -- market me khud trade", expanded=False):
         st.caption("Yahan jo stocks add karoge unki poori research + AI Trade Decision + Gemini review market OPEN hote hi khud chalega (app band ho tab bhi, "
-                   "jab tak GitHub robot tab app jagaye rakhe). Trade lock, SL/target, win/loss sab record hota hai aur har stock apni learning se behtar hota hai. "
+                   "jab tak GitHub robot tab app jagaye rakhe). Har stock har 30 second me naye data se dobara chalta hai (Nifty 50 jaisa). Trade lock, SL/target, win/loss sab record hota hai aur har stock apni learning se behtar hota hai. "
                    "Telegram par har trade ka alert aata hai.")
         c1, c2 = st.columns([3, 1])
         txt = c1.text_input("Stock naam / symbol", key="wl_add_text", placeholder="RELIANCE, TCS ... (comma se kai ek saath)", label_visibility="collapsed")
@@ -2225,7 +2304,7 @@ def sidebar_panel():
                                         "Dir": v.get("direction"), "ms": v.get("ms"), "Error": v.get("error")} for s, v in sorted(stat.items())]),
                          hide_index=True, width="stretch")
         alive = (_RUNNER["thread"] is not None and _RUNNER["thread"].is_alive())
-        st.caption(("🟢 Robot thread chal raha hai" if alive else "🔴 Robot thread band") + " · market OPEN me har stock ~1 min me refresh · "
+        st.caption(("🟢 Robot thread chal raha hai" if alive else "🔴 Robot thread band") + " · market OPEN me har stock har 30 sec me refresh · "
                    "Nifty 50 apne purane robot se chalta rahega.")
 # @@END stock_watchlist
 
@@ -2318,35 +2397,46 @@ def _body(symbol, ai_engine, helpers):
     if "access_token" not in st.session_state:
         st.session_state.access_token = token
 
-    sp.step("Global news + markets")
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=2) as _ex:
-        _f_news = _ex.submit(lambda: safe_io.guarded("stk_global_news", global_news.get_global_market_sentiment, timeout=10,
-                                                      default=(pd.DataFrame(), "Global headline unavailable right now.")))
-        df_gm = safe_io.guarded("stk_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
-        sent_pair = _f_news.result()
-    gscore, gavg = safe_io.guarded("stk_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
-    vix = safe_io.guarded("stk_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
-    df_sent, top_headline = sent_pair if isinstance(sent_pair, tuple) else (pd.DataFrame(), "")
-
-    sp.step(f"{symbol} research engines")
     capital = float(st.session_state.get("risk_capital", 100000.0))
     risk_pct = float(st.session_state.get("risk_pct", 1.0))
-    ctx = stock_pipeline.build_context(symbol, token, ai_engine, capital=capital, risk_pct=risk_pct, global_avg_change=gavg or 0.0,
-                                       sentiment_score=gscore, live_vix=vix, state=stock_watchlist.shared_state(symbol))
-    if ctx.get("status") != "OK":
-        st.error(ctx.get("message") or f"{symbol} ka data abhi available nahi hai.")
-        sp.done()
-        return
-    sp.step("Strategy -> Consensus -> AI decision -> Gemini")
-    try:
-        ctx["p2"] = stock_engine.run(ctx, stock_watchlist.shared_state(symbol), list((helpers or {}).get("gemini_keys") or []),
-                                     extra={"df_gm": df_gm, "df_sent": df_sent, "gavg": gavg, "vix": vix})
-    except Exception as e:
-        logger.exception("stock phase2 failed (ignored)")
-        ctx["p2"] = {"status": "ERROR", "errors": [f"{type(e).__name__}: {e}"]}
-        ctx["errors"] = list(ctx.get("errors") or []) + [f"phase2: {type(e).__name__}: {e}"]
-    ctx["errors"] = list(ctx.get("errors") or []) + list((ctx["p2"] or {}).get("errors") or [])
+    _hit = stock_watchlist.fresh_result(symbol, capital=capital, risk_pct=risk_pct)
+    if _hit:
+        # The watchlist robot already ran this stock < 40 s ago with the very same engines -> show it at once (no recomputation, no waiting).
+        sp.step(f"{symbol} (robot ka taza result)")
+        ctx = dict(_hit["ctx"])
+        ctx["errors"] = list(ctx.get("errors") or []) + list((ctx.get("p2") or {}).get("errors") or [])
+        _x = _hit["extra"]
+        df_gm, df_sent, gavg, vix, gscore = _x["df_gm"], _x["df_sent"], _x["gavg"], _x["vix"], _hit["gscore"]
+        top_headline = _hit.get("headline") or "Global headline: neeche sentiment table dekho."
+        ctx["df"] = ctx["df"].copy()          # the page may add columns; the robot's copy stays untouched
+    else:
+        sp.step("Global news + markets")
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as _ex:
+            _f_news = _ex.submit(lambda: safe_io.guarded("stk_global_news", global_news.get_global_market_sentiment, timeout=10,
+                                                          default=(pd.DataFrame(), "Global headline unavailable right now.")))
+            df_gm = safe_io.guarded("stk_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
+            sent_pair = _f_news.result()
+        gscore, gavg = safe_io.guarded("stk_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
+        vix = safe_io.guarded("stk_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
+        df_sent, top_headline = sent_pair if isinstance(sent_pair, tuple) else (pd.DataFrame(), "")
+
+        sp.step(f"{symbol} research engines")
+        ctx = stock_pipeline.build_context(symbol, token, ai_engine, capital=capital, risk_pct=risk_pct, global_avg_change=gavg or 0.0,
+                                           sentiment_score=gscore, live_vix=vix, state=stock_watchlist.shared_state(symbol))
+        if ctx.get("status") != "OK":
+            st.error(ctx.get("message") or f"{symbol} ka data abhi available nahi hai.")
+            sp.done()
+            return
+        sp.step("Strategy -> Consensus -> AI decision -> Gemini")
+        try:
+            ctx["p2"] = stock_engine.run(ctx, stock_watchlist.shared_state(symbol), list((helpers or {}).get("gemini_keys") or []),
+                                         extra={"df_gm": df_gm, "df_sent": df_sent, "gavg": gavg, "vix": vix})
+        except Exception as e:
+            logger.exception("stock phase2 failed (ignored)")
+            ctx["p2"] = {"status": "ERROR", "errors": [f"{type(e).__name__}: {e}"]}
+            ctx["errors"] = list(ctx.get("errors") or []) + [f"phase2: {type(e).__name__}: {e}"]
+        ctx["errors"] = list(ctx.get("errors") or []) + list((ctx["p2"] or {}).get("errors") or [])
     sp.step("Drawing dashboard")
 
     df, price, ai = ctx["df"], ctx["live_price"], ctx.get("ai") or {}
@@ -2604,23 +2694,32 @@ def _body(symbol, ai_engine, helpers):
     # ------------------------------------------------------------------ Order flow chart
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("📊 Institutional Order Flow Chart (VWAP & Volume Profile)")
-    cdf = df[~df.index.duplicated(keep="last")].tail(120)
+    st.session_state[f"_live_poc_{sym}"] = float(ctx["poc"])      # shown on the live 5-minute chart
     try:
-        _xs = [t.strftime("%d-%b %H:%M") for t in pd.to_datetime(cdf.index)]      # category axis: every candle same width, no night/weekend gaps
+        import live_chart
+        _lc_on = live_chart.enabled()
     except Exception:
-        _xs = [str(t) for t in cdf.index]
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=_xs, open=cdf["Open"], high=cdf["High"], low=cdf["Low"], close=cdf["Close"], name=sym,
-                                 increasing_line_color="#26A69A", decreasing_line_color="#EF5350"))
-    fig.add_trace(go.Scatter(x=_xs, y=cdf["EMA_20"], mode="lines", name="EMA 20", line=dict(color="#2962FF", width=1)))
-    fig.add_trace(go.Scatter(x=_xs, y=cdf["VWAP"], mode="lines", name="VWAP (Smart Money Avg)", line=dict(color="#E040FB", width=2.5, dash="dot")))
-    fig.add_hline(y=ctx["poc"], line_width=2, line_dash="solid", line_color="#FFEA00", annotation_text=f"POC Level (Max Vol): {ctx['poc']:.2f}", annotation_position="top right")
-    _lo, _hi = float(cdf["Low"].min()), float(cdf["High"].max())
-    _pad = max((_hi - _lo) * 0.05, _hi * 0.001)
-    fig.update_layout(xaxis_title="Time", yaxis_title="Price (₹)", template="plotly_dark", height=600, xaxis_rangeslider_visible=False,
-                      xaxis=dict(type="category", nticks=10, tickangle=-35), yaxis=dict(range=[_lo - _pad, _hi + _pad]),
-                      legend=dict(orientation="h", y=1.04, x=0), margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig, width="stretch")
+        _lc_on = False
+    if _lc_on:
+        st.caption("📈 Live 5-minute candle chart dashboard ke sabse upar ek-line switch ke andar hai (ON karke dekho).")
+    else:
+        cdf = df[~df.index.duplicated(keep="last")].tail(120)
+        try:
+            _xs = [t.strftime("%d-%b %H:%M") for t in pd.to_datetime(cdf.index)]      # category axis: every candle same width, no night/weekend gaps
+        except Exception:
+            _xs = [str(t) for t in cdf.index]
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(x=_xs, open=cdf["Open"], high=cdf["High"], low=cdf["Low"], close=cdf["Close"], name=sym,
+                                     increasing_line_color="#26A69A", decreasing_line_color="#EF5350"))
+        fig.add_trace(go.Scatter(x=_xs, y=cdf["EMA_20"], mode="lines", name="EMA 20", line=dict(color="#2962FF", width=1)))
+        fig.add_trace(go.Scatter(x=_xs, y=cdf["VWAP"], mode="lines", name="VWAP (Smart Money Avg)", line=dict(color="#E040FB", width=2.5, dash="dot")))
+        fig.add_hline(y=ctx["poc"], line_width=2, line_dash="solid", line_color="#FFEA00", annotation_text=f"POC Level (Max Vol): {ctx['poc']:.2f}", annotation_position="top right")
+        _lo, _hi = float(cdf["Low"].min()), float(cdf["High"].max())
+        _pad = max((_hi - _lo) * 0.05, _hi * 0.001)
+        fig.update_layout(xaxis_title="Time", yaxis_title="Price (₹)", template="plotly_dark", height=600, xaxis_rangeslider_visible=False,
+                          xaxis=dict(type="category", nticks=10, tickangle=-35), yaxis=dict(range=[_lo - _pad, _hi + _pad]),
+                          legend=dict(orientation="h", y=1.04, x=0), margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, width="stretch")
     vw, poc = ctx["vwap"], ctx["poc"]
     cv1, cv2 = st.columns(2)
     cv1.info(f"**VWAP Trend:** Price is {'BULLISH 🟢' if price > vw else 'BEARISH 🔴'} (VWAP: {_rs(vw)})")

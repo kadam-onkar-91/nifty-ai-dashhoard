@@ -57,7 +57,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
 
 logger = logging.getLogger(__name__)
 
-_POOL = ThreadPoolExecutor(max_workers=10, thread_name_prefix="safe-io")
+_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="safe-io")   # 10 watchlist stocks + dashboard + Nifty share it
 _LOCK = threading.RLock()     # RLock: add_done_callback() runs the callback inline when the job already finished
 _STATE = {}          # key -> {"has": bool, "value": any, "ts": float, "fut": Future|None, "last_ms": float, "last_status": str}
 
