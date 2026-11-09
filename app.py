@@ -55,11 +55,6 @@ import live_chart
 import stock_universe          # Phase 1: every NSE stock + search
 import stock_watchlist         # Phase 4: robot watchlist (background stocks)
 import stock_dashboard         # Phase 1: stock dashboard in the Nifty layout
-import warnings as _warn_quiet
-_warn_quiet.filterwarnings("ignore", category=ResourceWarning)    # thousands of "unclosed database" lines flooded the log on every refresh
-import logging as _lg_quiet
-for _n in ("streamlit.runtime.scriptrunner_utils.script_run_context", "streamlit.runtime.scriptrunner.script_run_context"):
-    _lg_quiet.getLogger(_n).setLevel(_lg_quiet.ERROR)    # robot threads have no page context -> hundreds of harmless "missing ScriptRunContext" log lines
 
 # Page Configuration
 st.set_page_config(page_title="Nifty 50 Real-Time AI Predictor", page_icon="⚡", layout="wide")
@@ -229,10 +224,6 @@ _REFRESH_SEC = 30 if _REFRESH_IS_LIVE else 180
 def _live_dashboard():
     # Shows which step is running right now (so a slow data source is visible instead of a silent spinner) and,
     # once loaded, the slowest steps of this refresh.
-    try:
-        stock_watchlist.page_busy(True)      # the watchlist robot lets this page finish first (it never waits more than ~25 s for it)
-    except Exception:
-        pass
     _sp = safe_io.Stepper(st.empty())
     _sp.step("Broker login + live candles")
     if 'access_token' not in st.session_state:
@@ -337,55 +328,22 @@ def _live_dashboard():
             df['VWAP'] = df['EMA_20'] if 'EMA_20' in df.columns else df['Close']
             df['POC_Level'] = df['Close'].iloc[-1]
 
-        # LOAD SPEED: every independent data source below used to be fetched one AFTER the other (option chain, breadth 20 s + 20 s, Bank Nifty/Sensex,
-        # global news, global markets ...), so the page waited for the SUM of them.  They are all started together now and collected below -> the page
-        # waits only for the slowest one.  Same sources, same timeouts, same "last good value" fallbacks, same fresh data.
-        _sp.step("Option chain + breadth + global data (saath saath)")
-        from concurrent.futures import ThreadPoolExecutor as _LoadPool
-        try:
-            from streamlit.runtime.scriptrunner import get_script_run_ctx as _get_ctx
-            _load_ctx = _get_ctx()
-        except Exception:
-            _load_ctx = None
-        _load_pool = _LoadPool(max_workers=8, thread_name_prefix="nifty-load")
-
-        def _bg(fn, *a, **k):
-            def _job():
-                try:
-                    safe_io._attach_streamlit_ctx(_load_ctx)
-                except Exception:
-                    pass
-                return fn(*a, **k)
-            return _load_pool.submit(_job)
-
-        def _bank_sensex_job():
-            _nc = safe_io.guarded("nifty_change", index_correlation.get_nifty_change_pct, live_price, timeout=8, default=None)
-            return _nc, safe_io.guarded("bank_sensex", index_correlation.get_bank_nifty_sensex, access_token, _nc, timeout=15,
-                                        default=([], "Bank Nifty / Sensex data timed out (retrying in background)."))
-
-        _f_oc = _bg(option_chain.generate_option_chain_data, live_price)
-        _f_h = _bg(safe_io.guarded, "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=20,
-                   default=market_breadth.unavailable_heavyweights())
-        _f_50 = _bg(safe_io.guarded, "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=20,
-                    default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
-        _f_bank = _bg(_bank_sensex_job)
-        # ONE shared fetch for the Nifty page, the watchlist robot and the stock dashboard (same key + ttl): before, each of them downloaded the
-        # same 20+ Yahoo tickers on its own every 30 s, which got Yahoo to throttle ("timed out", "Invalid Crumb") and slowed everything.
-        _f_gnews = _bg(safe_io.guarded, "global_news", global_news.get_global_market_sentiment, timeout=15, ttl=170,
-                       default=(pd.DataFrame(), "Global headline unavailable right now."))
-        _f_gmk = _bg(safe_io.guarded, "global_markets", global_markets.get_global_market_indices, timeout=15, ttl=25, default=pd.DataFrame())
-        _load_pool.shutdown(wait=False)
-
-        fvg, ob, sweeps = smart_money.detect_smc_zones(df)          # (CPU work, overlaps with the fetches above)
-        df_option_chain, oc_source = _f_oc.result()
+        # Fetch Supporting Data for Confluence Engine
+        _sp.step("Option chain")
+        df_option_chain, oc_source = option_chain.generate_option_chain_data(live_price)
+        fvg, ob, sweeps = smart_money.detect_smc_zones(df)
         market_structure = smart_money.detect_market_structure(df)
         smc_event = market_structure[0]["Market Event"] if market_structure else "Neutral Structure"
 
         _sp.step("Market breadth (heavyweights + Nifty 50)")
         # Each source is wrapped: a slow one is skipped after `timeout` s (last good value / "unavailable") and keeps
         # loading in the background, instead of freezing the whole page.
-        df_heavyweights, advances, declines, breadth_ratio, breadth_status, heavyweights_debug = _f_h.result()
-        df_full50, adv50, dec50, ratio50, breadth50_status, full50_debug = _f_50.result()
+        df_heavyweights, advances, declines, breadth_ratio, breadth_status, heavyweights_debug = safe_io.guarded(
+            "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=20,
+            default=market_breadth.unavailable_heavyweights())
+        df_full50, adv50, dec50, ratio50, breadth50_status, full50_debug = safe_io.guarded(
+            "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=20,
+            default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
         max_pain = option_chain.calculate_max_pain(df_option_chain)
         fii_footprint, current_pcr = option_chain.get_fii_dii_fo_footprint(df_option_chain)
         try:
@@ -396,11 +354,15 @@ def _live_dashboard():
         # Bank Nifty / Sensex -- the biggest cross-index drivers of Nifty option
         # sentiment. Fetched Upstox-first (live) with Yahoo Finance fallback.
         _sp.step("Bank Nifty / Sensex")
-        nifty_change_pct, (index_correlation_data, banknifty_correlation_note) = _f_bank.result()
+        nifty_change_pct = safe_io.guarded("nifty_change", index_correlation.get_nifty_change_pct, live_price,
+                                           timeout=8, default=None)
+        index_correlation_data, banknifty_correlation_note = safe_io.guarded(
+            "bank_sensex", index_correlation.get_bank_nifty_sensex, access_token, nifty_change_pct, timeout=15,
+            default=([], "Bank Nifty / Sensex data timed out (retrying in background)."))
 
         _sp.step("Global news + markets")
-        df_global_sentiment, top_headline = _f_gnews.result()
-        df_global_markets = _f_gmk.result()
+        df_global_sentiment, top_headline = global_news.get_global_market_sentiment()
+        df_global_markets = global_markets.get_global_market_indices()
         global_sentiment_score, avg_market_change = global_markets.get_global_market_summary(df_global_markets)
         st.session_state["_last_global_avg_change"] = avg_market_change
         st.session_state["_last_sentiment_score"] = global_sentiment_score
@@ -2188,10 +2150,6 @@ def _live_dashboard():
 
 
     _sp.done()
-    try:
-        stock_watchlist.page_busy(False)
-    except Exception:
-        pass
 
 
 try:                                   # SL / target are checked on the live price every ~2 s (idempotent: one thread per server process)

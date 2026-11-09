@@ -528,25 +528,18 @@ def learning_status():
     url, hdr = _learn_cfg()
     if not url:
         val = (False, "Supabase configure nahi -- learning sirf is session tak.")
-        _LEARN_WARNED["st"] = (now, val)
-        return val
-    if not _LEARN_WARNED.get("st_busy"):
-        _LEARN_WARNED["st_busy"] = True
-
-        def _check():                      # the page never waits for this network call (it runs in the background; shown on the next refresh)
-            try:
-                r = requests.get(f"{url}?select=symbol,name,rows,updated_at&order=updated_at.desc&limit=50", headers=hdr, timeout=6)
-                if r.ok:
-                    syms = {x["symbol"] for x in (r.json() or [])}
-                    val = (True, f"Learning permanent hai ({len(syms)} stock saved).")
-                else:
-                    val = (False, f"`{LEARN_TABLE}` table nahi mila (HTTP {r.status_code}) -- schema.sql ka stock_learning_blobs block run karo.")
-            except Exception as e:
-                val = (False, f"Supabase se baat nahi ho payi: {type(e).__name__}")
-            _LEARN_WARNED["st"] = (time.time(), val)
-            _LEARN_WARNED["st_busy"] = False
-        threading.Thread(target=_check, daemon=True, name="stk-learn-status").start()
-    return c[1]            # None until the first background check is done
+    else:
+        try:
+            r = requests.get(f"{url}?select=symbol,name,rows,updated_at&order=updated_at.desc&limit=50", headers=hdr, timeout=6)
+            if r.ok:
+                syms = {x["symbol"] for x in (r.json() or [])}
+                val = (True, f"Learning permanent hai ({len(syms)} stock saved).")
+            else:
+                val = (False, f"`{LEARN_TABLE}` table nahi mila (HTTP {r.status_code}) -- schema.sql ka stock_learning_blobs block run karo.")
+        except Exception as e:
+            val = (False, f"Supabase se baat nahi ho payi: {type(e).__name__}")
+    _LEARN_WARNED["st"] = (now, val)
+    return val
 # @@END stock_store
 
 # @@MODULE stock_news
@@ -1347,15 +1340,7 @@ import stock_store
 
 ENGINE_VERSION = "stock-phase2-v1"
 from concurrent.futures import ThreadPoolExecutor as _TPE
-def _bg_init():
-    try:
-        import safe_io
-        safe_io.nice_thread()
-    except Exception:
-        pass
-
-
-_ML_POOL = _TPE(max_workers=1, thread_name_prefix="stk-ml", initializer=_bg_init)   # ONE ML job at a time, low OS priority: sklearn fits must never starve the page
+_ML_POOL = _TPE(max_workers=3, thread_name_prefix="stk-ml")     # own pool: heavy sklearn jobs must never starve safe_io's shared data pool
 _ML_LOCK = threading.Lock()
 _ML_STATE = {}             # symbol -> {"key","res","fut"}
 _WATCH = {"thread": None}
@@ -1378,12 +1363,7 @@ def ml_cached(fam, sym, df, vix, first_wait=25.0, stale_wait=0.3):
 
             def _job(_snap=snap, _key=key):
                 try:
-                    try:
-                        import safe_io
-                        safe_io.yield_to_page(45)
-                    except Exception:
-                        pass
-                    r = fam.ml_engine.train_and_backtest(_snap, vix, blocking=True)
+                    r = fam.ml_engine.train_and_backtest(_snap, vix)
                 except Exception:
                     logger.exception("stock ML job failed (%s)", sym)
                     return
@@ -2214,8 +2194,7 @@ ROOT = os.environ.get("STOCK_DATA_DIR", "stock_data")
 PATH = os.path.join(ROOT, "watchlist.json")
 TABLE = "stock_watchlist"
 CYCLE_GAP = 30.0            # every watchlist stock is re-run every 30 s (same cadence as the Nifty 50 dashboard); ticks are handled by the tick watcher
-WORKERS = 4                 # stocks processed at the same time.  More workers only fight the dashboard for the CPU (Python GIL) and make the PAGE slow;
-                            # 4 still finishes 10 stocks inside the 30 s cycle once the data caches are warm.
+WORKERS = 10                # stocks processed in parallel (one worker per stock, so no stock waits for another)
 RESULT_MAX_AGE = 40.0       # the dashboard re-uses the robot's result when it is younger than this -> instant stock loading
 GLOBAL_TTL = 30.0           # global markets / VIX refreshed every 30 s; global news every 3 min (changes slowly)
 POST_CLOSE_UNTIL = (15, 50)  # one last pass after the close so the day's candles get labelled
@@ -2227,28 +2206,6 @@ _GLOBAL = {"t": 0.0, "v": None, "tn": 0.0, "sent": None, "head": ""}
 _GLOBAL_LOCK = threading.Lock()
 _RESULTS = {}                # symbol -> {"t","ctx","extra","gscore"}  (latest robot result, read by the dashboard)
 _INFLIGHT = {}               # symbol -> Future
-_HEAVY = threading.Semaphore(2)   # at most 2 stocks run the CPU-heavy part (41 strategies + ML + decision) at the same moment
-_PAUSE = {"on": False}            # "Robot roko" switch in the sidebar (process wide)
-_T_START = time.time()
-STARTUP_GRACE_S = 90              # after a (re)start the page gets the machine alone until it has finished its first refresh (or 90 s passed)
-
-
-def page_busy(flag):
-    import safe_io
-    safe_io.page_busy(flag)
-
-
-def _yield_to_page(max_wait=45.0):
-    import safe_io
-    safe_io.yield_to_page(max_wait)
-
-
-def _worker_init():
-    try:
-        import safe_io
-        safe_io.nice_thread()
-    except Exception:
-        pass
 
 
 # ------------------------------------------------------------------------------------------------------------------ shared per-stock state
@@ -2381,11 +2338,11 @@ def _global_bundle():
             return _GLOBAL["v"]
         import pandas as pd
         import safe_io, global_markets, global_news
-        df_gm = safe_io.guarded("global_markets", global_markets.get_global_market_indices, timeout=10, ttl=GLOBAL_TTL - 5, default=pd.DataFrame())
+        df_gm = safe_io.guarded("wl_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
         gscore, gavg = safe_io.guarded("wl_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
         vix = safe_io.guarded("wl_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
         if _GLOBAL["sent"] is None or time.time() - _GLOBAL["tn"] >= 180:
-            sp = safe_io.guarded("global_news", global_news.get_global_market_sentiment, timeout=10, ttl=170, default=(pd.DataFrame(), ""))
+            sp = safe_io.guarded("wl_global_news", global_news.get_global_market_sentiment, timeout=10, default=(pd.DataFrame(), ""))
             _GLOBAL["sent"] = sp[0] if isinstance(sp, tuple) else pd.DataFrame()
             _GLOBAL["head"] = str(sp[1]) if isinstance(sp, tuple) and len(sp) > 1 else ""
             _GLOBAL["tn"] = time.time()
@@ -2414,7 +2371,6 @@ def run_once(sym, token=None):
     row = {"symbol": sym, "last_run": time.strftime("%H:%M:%S"), "ok": False, "gate": "", "direction": "", "open": "", "error": "", "ms": 0}
     t0 = time.time()
     try:
-        _yield_to_page()                                   # the first pass builds the stock's engines (heavy) -> let the page load first
         token = token or __import__("upstox_auth")._stored_token()
         df_gm, gscore, gavg, vix, df_sent = _global_bundle()
         state = shared_state(sym)
@@ -2422,9 +2378,7 @@ def run_once(sym, token=None):
         if ctx.get("status") != "OK":
             row["error"] = str(ctx.get("message") or ctx.get("status"))[:160]
             return row
-        _yield_to_page()
-        with _HEAVY:
-            p2 = stock_engine.run(ctx, state, list(_RUNNER["keys"] or []), extra={"df_gm": df_gm, "df_sent": df_sent, "gavg": gavg, "vix": vix})
+        p2 = stock_engine.run(ctx, state, list(_RUNNER["keys"] or []), extra={"df_gm": df_gm, "df_sent": df_sent, "gavg": gavg, "vix": vix})
         ctx["p2"] = p2
         with _LOCK:
             _RESULTS[sym] = {"t": time.time(), "ctx": ctx, "gscore": gscore,
@@ -2467,18 +2421,10 @@ def run_once(sym, token=None):
 def _loop():
     """Every stock is scheduled on its own: it is re-run CYCLE_GAP (30 s) after its previous run STARTED, never waiting for a slower stock."""
     done_after_close = {}
-    pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="wl", initializer=_worker_init)
+    pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="wl")
     while True:
         try:
             time.sleep(0.5)
-            if _PAUSE["on"]:
-                continue
-            try:
-                import safe_io
-                if safe_io.PAGE["runs"] == 0 and time.time() - _T_START < STARTUP_GRACE_S:
-                    continue                                   # first page load of this process runs alone
-            except Exception:
-                pass
             syms = list_symbols()
             if not syms:
                 time.sleep(15)
@@ -2588,16 +2534,12 @@ def sidebar_panel():
                          hide_index=True, width="stretch")
         try:
             import stock_store
-            _ls = stock_store.learning_status()
-            if _ls:
-                (st.caption if _ls[0] else st.warning)(("🧠 " if _ls[0] else "⚠️ ") + _ls[1])
+            _lok, _lmsg = stock_store.learning_status()
+            (st.caption if _lok else st.warning)(("🧠 " if _lok else "⚠️ ") + _lmsg)
         except Exception:
             pass
-        _PAUSE["on"] = bool(st.toggle("⏸ Robot roko (page tez load karne ke liye)", value=_PAUSE["on"], key="wl_pause_toggle",
-                                      help="ON karne par watchlist robot naye pass nahi chalayega -- page ko poora CPU milta hai. OFF karte hi dobara shuru. "
-                                           "App restart par apne aap OFF ho jata hai."))
-        alive = (_RUNNER["thread"] is not None and _RUNNER["thread"].is_alive() and not _PAUSE["on"])
-        st.caption(("🟢 Robot thread chal raha hai" if alive else ("⏸ Robot roka hua hai" if _PAUSE["on"] else "🔴 Robot thread band")) + " · market OPEN me har stock har 30 sec me refresh · "
+        alive = (_RUNNER["thread"] is not None and _RUNNER["thread"].is_alive())
+        st.caption(("🟢 Robot thread chal raha hai" if alive else "🔴 Robot thread band") + " · market OPEN me har stock har 30 sec me refresh · "
                    "Nifty 50 apne purane robot se chalta rahega.")
 # @@END stock_watchlist
 
@@ -2706,9 +2648,9 @@ def _body(symbol, ai_engine, helpers):
         sp.step("Global news + markets")
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=2) as _ex:
-            _f_news = _ex.submit(lambda: safe_io.guarded("global_news", global_news.get_global_market_sentiment, timeout=10, ttl=170,
+            _f_news = _ex.submit(lambda: safe_io.guarded("stk_global_news", global_news.get_global_market_sentiment, timeout=10,
                                                           default=(pd.DataFrame(), "Global headline unavailable right now.")))
-            df_gm = safe_io.guarded("global_markets", global_markets.get_global_market_indices, timeout=10, ttl=25, default=pd.DataFrame())
+            df_gm = safe_io.guarded("stk_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
             sent_pair = _f_news.result()
         gscore, gavg = safe_io.guarded("stk_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
         vix = safe_io.guarded("stk_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
