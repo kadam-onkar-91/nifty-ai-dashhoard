@@ -1,4 +1,9 @@
 import bundle_loader  # noqa: F401  (registers the bundled modules; must stay the first import)
+import warnings
+# thousands of identical sklearn / ResourceWarning lines were written to the log on every refresh (slow I/O, unreadable logs)
+warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.*")
+warnings.filterwarnings("ignore", category=ResourceWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 from app_logging import get_logger
 logger = get_logger(__name__)
 import streamlit as st
@@ -227,8 +232,7 @@ except Exception:
 _REFRESH_SEC = 45 if _REFRESH_IS_LIVE else 180
 
 
-@st.fragment(run_every=_REFRESH_SEC)
-def _live_dashboard():
+def _live_dashboard_body():
     # Shows which step is running right now (so a slow data source is visible instead of a silent spinner) and,
     # once loaded, the slowest steps of this refresh.
     _sp = safe_io.Stepper(st.empty())
@@ -2189,6 +2193,15 @@ def _live_dashboard():
         stock_watchlist.ensure_runner(ai_engine, GEMINI_API_KEYS)
     except Exception:
         logger.exception("watchlist robot start failed (ignored)")
+
+
+@st.fragment(run_every=_REFRESH_SEC)
+def _live_dashboard():
+    stock_watchlist.DASH_BUSY.set()            # robot watchlist pauses while this refresh runs
+    try:
+        _live_dashboard_body()
+    finally:
+        stock_watchlist.DASH_BUSY.clear()
 
 
 try:                                   # SL / target are checked on the live price every ~2 s (idempotent: one thread per server process)

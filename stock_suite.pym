@@ -1340,7 +1340,7 @@ import stock_store
 
 ENGINE_VERSION = "stock-phase2-v1"
 from concurrent.futures import ThreadPoolExecutor as _TPE
-_ML_POOL = _TPE(max_workers=3, thread_name_prefix="stk-ml")     # own pool: heavy sklearn jobs must never starve safe_io's shared data pool
+_ML_POOL = _TPE(max_workers=1, thread_name_prefix="stk-ml")     # own pool: heavy sklearn jobs must never starve safe_io's shared data pool
 _ML_LOCK = threading.Lock()
 _ML_STATE = {}             # symbol -> {"key","res","fut"}
 _WATCH = {"thread": None}
@@ -2193,8 +2193,9 @@ logger = get_logger(__name__)
 ROOT = os.environ.get("STOCK_DATA_DIR", "stock_data")
 PATH = os.path.join(ROOT, "watchlist.json")
 TABLE = "stock_watchlist"
-CYCLE_GAP = 30.0            # every watchlist stock is re-run every 30 s (same cadence as the Nifty 50 dashboard); ticks are handled by the tick watcher
-WORKERS = 4                 # stocks processed in parallel (one worker per stock, so no stock waits for another)
+DASH_BUSY = threading.Event()   # set by app.py while the Nifty dashboard is refreshing -> the robot waits (Nifty always has priority)
+CYCLE_GAP = 90.0            # every watchlist stock is re-run every 30 s (same cadence as the Nifty 50 dashboard); ticks are handled by the tick watcher
+WORKERS = 1                 # stocks processed in parallel (one worker per stock, so no stock waits for another)
 RESULT_MAX_AGE = 40.0       # the dashboard re-uses the robot's result when it is younger than this -> instant stock loading
 GLOBAL_TTL = 30.0           # global markets / VIX refreshed every 30 s; global news every 3 min (changes slowly)
 POST_CLOSE_UNTIL = (15, 50)  # one last pass after the close so the day's candles get labelled
@@ -2442,6 +2443,9 @@ def _loop():
                 if not after_close:
                     time.sleep(20)
                     continue
+            if DASH_BUSY.is_set():
+                time.sleep(1.0)            # Nifty dashboard is mid-refresh: do not steal its CPU / network
+                continue
             token = None
             try:
                 token = __import__("upstox_auth")._stored_token()
