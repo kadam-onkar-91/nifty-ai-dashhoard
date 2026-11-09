@@ -2214,6 +2214,21 @@ _GLOBAL = {"t": 0.0, "v": None, "tn": 0.0, "sent": None, "head": ""}
 _GLOBAL_LOCK = threading.Lock()
 _RESULTS = {}                # symbol -> {"t","ctx","extra","gscore"}  (latest robot result, read by the dashboard)
 _INFLIGHT = {}               # symbol -> Future
+_PAGE_BUSY = {"since": 0.0}  # set by the Nifty page while it is loading -> the robot lets it finish first (bounded wait)
+_HEAVY = threading.Semaphore(2)   # at most 2 stocks run the CPU-heavy part (41 strategies + ML + decision) at the same moment
+
+
+def page_busy(flag):
+    _PAGE_BUSY["since"] = time.time() if flag else 0.0
+
+
+def _yield_to_page(max_wait=25.0):
+    t0 = time.time()
+    while time.time() - t0 < max_wait:
+        s = _PAGE_BUSY["since"]
+        if not s or time.time() - s > 90:        # page idle (or stuck for ages -> never starve the robot because of it)
+            return
+        time.sleep(0.4)
 
 
 # ------------------------------------------------------------------------------------------------------------------ shared per-stock state
@@ -2346,11 +2361,11 @@ def _global_bundle():
             return _GLOBAL["v"]
         import pandas as pd
         import safe_io, global_markets, global_news
-        df_gm = safe_io.guarded("wl_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
+        df_gm = safe_io.guarded("global_markets", global_markets.get_global_market_indices, timeout=10, ttl=GLOBAL_TTL - 5, default=pd.DataFrame())
         gscore, gavg = safe_io.guarded("wl_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
         vix = safe_io.guarded("wl_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
         if _GLOBAL["sent"] is None or time.time() - _GLOBAL["tn"] >= 180:
-            sp = safe_io.guarded("wl_global_news", global_news.get_global_market_sentiment, timeout=10, default=(pd.DataFrame(), ""))
+            sp = safe_io.guarded("global_news", global_news.get_global_market_sentiment, timeout=10, ttl=170, default=(pd.DataFrame(), ""))
             _GLOBAL["sent"] = sp[0] if isinstance(sp, tuple) else pd.DataFrame()
             _GLOBAL["head"] = str(sp[1]) if isinstance(sp, tuple) and len(sp) > 1 else ""
             _GLOBAL["tn"] = time.time()
@@ -2379,6 +2394,7 @@ def run_once(sym, token=None):
     row = {"symbol": sym, "last_run": time.strftime("%H:%M:%S"), "ok": False, "gate": "", "direction": "", "open": "", "error": "", "ms": 0}
     t0 = time.time()
     try:
+        _yield_to_page()                                   # the first pass builds the stock's engines (heavy) -> let the page load first
         token = token or __import__("upstox_auth")._stored_token()
         df_gm, gscore, gavg, vix, df_sent = _global_bundle()
         state = shared_state(sym)
@@ -2386,7 +2402,9 @@ def run_once(sym, token=None):
         if ctx.get("status") != "OK":
             row["error"] = str(ctx.get("message") or ctx.get("status"))[:160]
             return row
-        p2 = stock_engine.run(ctx, state, list(_RUNNER["keys"] or []), extra={"df_gm": df_gm, "df_sent": df_sent, "gavg": gavg, "vix": vix})
+        _yield_to_page()
+        with _HEAVY:
+            p2 = stock_engine.run(ctx, state, list(_RUNNER["keys"] or []), extra={"df_gm": df_gm, "df_sent": df_sent, "gavg": gavg, "vix": vix})
         ctx["p2"] = p2
         with _LOCK:
             _RESULTS[sym] = {"t": time.time(), "ctx": ctx, "gscore": gscore,
@@ -2657,9 +2675,9 @@ def _body(symbol, ai_engine, helpers):
         sp.step("Global news + markets")
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=2) as _ex:
-            _f_news = _ex.submit(lambda: safe_io.guarded("stk_global_news", global_news.get_global_market_sentiment, timeout=10,
+            _f_news = _ex.submit(lambda: safe_io.guarded("global_news", global_news.get_global_market_sentiment, timeout=10, ttl=170,
                                                           default=(pd.DataFrame(), "Global headline unavailable right now.")))
-            df_gm = safe_io.guarded("stk_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
+            df_gm = safe_io.guarded("global_markets", global_markets.get_global_market_indices, timeout=10, ttl=25, default=pd.DataFrame())
             sent_pair = _f_news.result()
         gscore, gavg = safe_io.guarded("stk_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
         vix = safe_io.guarded("stk_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)

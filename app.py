@@ -55,6 +55,8 @@ import live_chart
 import stock_universe          # Phase 1: every NSE stock + search
 import stock_watchlist         # Phase 4: robot watchlist (background stocks)
 import stock_dashboard         # Phase 1: stock dashboard in the Nifty layout
+import warnings as _warn_quiet
+_warn_quiet.filterwarnings("ignore", category=ResourceWarning)    # thousands of "unclosed database" lines flooded the log on every refresh
 import logging as _lg_quiet
 for _n in ("streamlit.runtime.scriptrunner_utils.script_run_context", "streamlit.runtime.scriptrunner.script_run_context"):
     _lg_quiet.getLogger(_n).setLevel(_lg_quiet.ERROR)    # robot threads have no page context -> hundreds of harmless "missing ScriptRunContext" log lines
@@ -227,6 +229,10 @@ _REFRESH_SEC = 30 if _REFRESH_IS_LIVE else 180
 def _live_dashboard():
     # Shows which step is running right now (so a slow data source is visible instead of a silent spinner) and,
     # once loaded, the slowest steps of this refresh.
+    try:
+        stock_watchlist.page_busy(True)      # the watchlist robot lets this page finish first (it never waits more than ~25 s for it)
+    except Exception:
+        pass
     _sp = safe_io.Stepper(st.empty())
     _sp.step("Broker login + live candles")
     if 'access_token' not in st.session_state:
@@ -363,9 +369,11 @@ def _live_dashboard():
         _f_50 = _bg(safe_io.guarded, "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=20,
                     default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
         _f_bank = _bg(_bank_sensex_job)
-        _f_gnews = _bg(safe_io.guarded, "main_global_news", global_news.get_global_market_sentiment, timeout=15,
+        # ONE shared fetch for the Nifty page, the watchlist robot and the stock dashboard (same key + ttl): before, each of them downloaded the
+        # same 20+ Yahoo tickers on its own every 30 s, which got Yahoo to throttle ("timed out", "Invalid Crumb") and slowed everything.
+        _f_gnews = _bg(safe_io.guarded, "global_news", global_news.get_global_market_sentiment, timeout=15, ttl=170,
                        default=(pd.DataFrame(), "Global headline unavailable right now."))
-        _f_gmk = _bg(safe_io.guarded, "main_global_markets", global_markets.get_global_market_indices, timeout=15, default=pd.DataFrame())
+        _f_gmk = _bg(safe_io.guarded, "global_markets", global_markets.get_global_market_indices, timeout=15, ttl=25, default=pd.DataFrame())
         _load_pool.shutdown(wait=False)
 
         fvg, ob, sweeps = smart_money.detect_smc_zones(df)          # (CPU work, overlaps with the fetches above)
@@ -2180,6 +2188,10 @@ def _live_dashboard():
 
 
     _sp.done()
+    try:
+        stock_watchlist.page_busy(False)
+    except Exception:
+        pass
 
 
 try:                                   # SL / target are checked on the live price every ~2 s (idempotent: one thread per server process)
