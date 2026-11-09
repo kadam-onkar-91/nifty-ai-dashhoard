@@ -1,9 +1,4 @@
 import bundle_loader  # noqa: F401  (registers the bundled modules; must stay the first import)
-import warnings
-# thousands of identical sklearn / ResourceWarning lines were written to the log on every refresh (slow I/O, unreadable logs)
-warnings.filterwarnings("ignore", message=".*sklearn.utils.parallel.*")
-warnings.filterwarnings("ignore", category=ResourceWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
 from app_logging import get_logger
 logger = get_logger(__name__)
 import streamlit as st
@@ -60,6 +55,11 @@ import live_chart
 import stock_universe          # Phase 1: every NSE stock + search
 import stock_watchlist         # Phase 4: robot watchlist (background stocks)
 import stock_dashboard         # Phase 1: stock dashboard in the Nifty layout
+import warnings as _warn_quiet
+_warn_quiet.filterwarnings("ignore", category=ResourceWarning)    # thousands of "unclosed database" lines flooded the log on every refresh
+import logging as _lg_quiet
+for _n in ("streamlit.runtime.scriptrunner_utils.script_run_context", "streamlit.runtime.scriptrunner.script_run_context"):
+    _lg_quiet.getLogger(_n).setLevel(_lg_quiet.ERROR)    # robot threads have no page context -> hundreds of harmless "missing ScriptRunContext" log lines
 
 # Page Configuration
 st.set_page_config(page_title="Nifty 50 Real-Time AI Predictor", page_icon="⚡", layout="wide")
@@ -158,16 +158,12 @@ with st.sidebar:
     st.markdown("### 🔎 Select Your Stock")
     # Phase 1: searchable list of EVERY NSE stock (type a few letters of the symbol OR the company name), plus a free-text
     # box for anything not in the list.  Same Load Stock / Nifty 50 buttons as before.
-    _stk_total = stock_universe.count()
-    _stk_q = st.text_input("Stock search (naam / symbol)", placeholder="RELIANCE, TCS, Tata, HDFC...", key="sidebar_stock_search",
-                           help=f"{_stk_total} NSE stocks. Kuch letters likho -- niche sirf matching stocks (max 40) aate hain.")
-    _stk_pairs = []
-    if (_stk_q or "").strip():
-        _stk_pairs = [((f"{r['symbol']} — {r['name']}" if r.get("name") else r["symbol"]), r["symbol"]) for r in stock_universe.search(_stk_q, 40)]
+    _stk_pairs = stock_universe.option_labels()
     _stk_label_to_sym = dict(_stk_pairs)
     _stk_pick = st.selectbox(
         "Select your stocks", options=[l for l, _ in _stk_pairs], index=None, key="sidebar_stock_pick",
-        placeholder="Upar search karo, phir yahan se chuno" if _stk_pairs else "Pehle upar stock ka naam likho")
+        placeholder="Stock ka naam / symbol type karo (RELIANCE, TCS, Tata...)",
+        help=f"{len(_stk_pairs)} NSE stocks. Type karte hi list filter hoti hai -- symbol ya company naam dono chalte hain.")
     _stk_typed = st.text_input("ya seedha symbol likho", placeholder="e.g. RELIANCE, TCS, HDFCBANK, M&M", key="sidebar_stock_input",
                                help="Agar stock upar list me na mile to yahan NSE symbol likh do.")
     _sidebar_symbol_raw = stock_universe.clean_symbol(_stk_typed) or _stk_label_to_sym.get(_stk_pick, "")
@@ -195,10 +191,9 @@ with st.sidebar:
             logger.exception("watchlist toggle failed (ignored)")
     else:
         st.caption("Abhi Nifty 50 dashboard dikh raha hai.")
-    st.caption(f"📚 {_stk_total} NSE stocks · {stock_universe.universe_source()}")
+    st.caption(f"📚 {len(_stk_pairs)} NSE stocks · {stock_universe.universe_source()}")
     try:
-        if st.session_state.get("_dash_last_secs") is not None or st.session_state.get("active_symbol"):
-            stock_watchlist.ensure_runner(ai_engine, GEMINI_API_KEYS)     # robot starts after the first dashboard load (see end of _live_dashboard)
+        stock_watchlist.ensure_runner(ai_engine, GEMINI_API_KEYS)     # one background robot thread (idempotent)
         stock_watchlist.sidebar_panel()
     except Exception:
         logger.exception("watchlist panel failed (ignored)")
@@ -227,14 +222,17 @@ try:
     _REFRESH_IS_LIVE = market_status.get_market_status()["state"] in ("OPEN", "PRE_OPEN")
 except Exception:
     _REFRESH_IS_LIVE = True
-# Fixed timer again (the adaptive version re-ran the whole app whenever one refresh was faster/slower than the last = restart loop).
-# 45 s while NSE is open is longer than a normal refresh, so a refresh is no longer cut off half-way by the next timer tick.
-_REFRESH_SEC = 45 if _REFRESH_IS_LIVE else 180
+_REFRESH_SEC = safe_io.suggested_refresh(_REFRESH_IS_LIVE)   # 30 s live / 180 s closed, but NEVER shorter than a refresh really takes (a timer shorter than the run kept interrupting it -> the page never finished)
 
 
-def _live_dashboard_body():
+@st.fragment(run_every=_REFRESH_SEC)
+def _live_dashboard():
     # Shows which step is running right now (so a slow data source is visible instead of a silent spinner) and,
     # once loaded, the slowest steps of this refresh.
+    try:
+        stock_watchlist.page_busy(True)      # the watchlist robot lets this page finish first (it never waits more than ~25 s for it)
+    except Exception:
+        pass
     _sp = safe_io.Stepper(st.empty())
     _sp.step("Broker login + live candles")
     if 'access_token' not in st.session_state:
@@ -244,14 +242,7 @@ def _live_dashboard_body():
     access_token = upstox_auth.get_upstox_access_token()
 
     # Step 2: Fetch Live Market Data
-    def _fetch_live_copy(_tok):
-        _r = market_data.fetch_live_market_data(_tok)
-        return (_r[0].copy() if _r[0] is not None else None,) + tuple(_r[1:])
-    _sp.step("Live candles (Upstox)")
-    df, model, feature_cols, live_price = safe_io.guarded("live_market_" + ("tok" if access_token else "anon"), _fetch_live_copy, access_token, timeout=14, ttl=8,
-                                                          default=(None, None, [], None))
-    if df is not None:
-        df = df.copy()                     # the guarded cache keeps its own copy; this refresh mutates df freely
+    df, model, feature_cols, live_price = market_data.fetch_live_market_data(access_token)
     try:                                   # v57: "Upstox connected" only means a token exists -- say plainly when the data call itself failed
         if df is not None and not df.empty and getattr(df, "attrs", {}).get("market_source") != "UPSTOX_LIVE":
             st.sidebar.warning("⚠️ Token hai par Upstox se data nahi aaya -- Yahoo (non-tradable) chal raha hai.\n\nAsli wajah: "
@@ -346,25 +337,55 @@ def _live_dashboard_body():
             df['VWAP'] = df['EMA_20'] if 'EMA_20' in df.columns else df['Close']
             df['POC_Level'] = df['Close'].iloc[-1]
 
-        # Fetch Supporting Data for Confluence Engine
-        _sp.step("Option chain")
-        _oc = safe_io.guarded("option_chain", option_chain.generate_option_chain_data, live_price, timeout=10, ttl=15, default=None)
-        if _oc is None:                    # nothing loaded yet and the source is slow -> honest SIMULATED placeholder, real chain lands next refresh
-            _oc = (option_chain.get_mock_option_chain(live_price), "SIMULATED")
-        df_option_chain, oc_source = _oc
-        fvg, ob, sweeps = smart_money.detect_smc_zones(df)
+        # LOAD SPEED: every independent data source below used to be fetched one AFTER the other (option chain, breadth 20 s + 20 s, Bank Nifty/Sensex,
+        # global news, global markets ...), so the page waited for the SUM of them.  They are all started together now and collected below -> the page
+        # waits only for the slowest one.  Same sources, same timeouts, same "last good value" fallbacks, same fresh data.
+        _sp.step("Option chain + breadth + global data (saath saath)")
+        from concurrent.futures import ThreadPoolExecutor as _LoadPool
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx as _get_ctx
+            _load_ctx = _get_ctx()
+        except Exception:
+            _load_ctx = None
+        _load_pool = _LoadPool(max_workers=8, thread_name_prefix="nifty-load")
+
+        def _bg(fn, *a, **k):
+            def _job():
+                try:
+                    safe_io._attach_streamlit_ctx(_load_ctx)
+                except Exception:
+                    pass
+                return fn(*a, **k)
+            return _load_pool.submit(_job)
+
+        def _bank_sensex_job():
+            _nc = safe_io.guarded("nifty_change", index_correlation.get_nifty_change_pct, live_price, timeout=8, default=None)
+            return _nc, safe_io.guarded("bank_sensex", index_correlation.get_bank_nifty_sensex, access_token, _nc, timeout=15,
+                                        default=([], "Bank Nifty / Sensex data timed out (retrying in background)."))
+
+        _f_oc = _bg(option_chain.generate_option_chain_data, live_price)
+        _f_h = _bg(safe_io.guarded, "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=20,
+                   default=market_breadth.unavailable_heavyweights())
+        _f_50 = _bg(safe_io.guarded, "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=20,
+                    default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
+        _f_bank = _bg(_bank_sensex_job)
+        # ONE shared fetch for the Nifty page, the watchlist robot and the stock dashboard (same key + ttl): before, each of them downloaded the
+        # same 20+ Yahoo tickers on its own every 30 s, which got Yahoo to throttle ("timed out", "Invalid Crumb") and slowed everything.
+        _f_gnews = _bg(safe_io.guarded, "global_news", global_news.get_global_market_sentiment, timeout=15, ttl=170,
+                       default=(pd.DataFrame(), "Global headline unavailable right now."))
+        _f_gmk = _bg(safe_io.guarded, "global_markets", global_markets.get_global_market_indices, timeout=15, ttl=25, default=pd.DataFrame())
+        _load_pool.shutdown(wait=False)
+
+        fvg, ob, sweeps = smart_money.detect_smc_zones(df)          # (CPU work, overlaps with the fetches above)
+        df_option_chain, oc_source = _f_oc.result()
         market_structure = smart_money.detect_market_structure(df)
         smc_event = market_structure[0]["Market Event"] if market_structure else "Neutral Structure"
 
         _sp.step("Market breadth (heavyweights + Nifty 50)")
         # Each source is wrapped: a slow one is skipped after `timeout` s (last good value / "unavailable") and keeps
         # loading in the background, instead of freezing the whole page.
-        df_heavyweights, advances, declines, breadth_ratio, breadth_status, heavyweights_debug = safe_io.guarded(
-            "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=20, ttl=45,
-            default=market_breadth.unavailable_heavyweights())
-        df_full50, adv50, dec50, ratio50, breadth50_status, full50_debug = safe_io.guarded(
-            "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=20, ttl=45,
-            default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
+        df_heavyweights, advances, declines, breadth_ratio, breadth_status, heavyweights_debug = _f_h.result()
+        df_full50, adv50, dec50, ratio50, breadth50_status, full50_debug = _f_50.result()
         max_pain = option_chain.calculate_max_pain(df_option_chain)
         fii_footprint, current_pcr = option_chain.get_fii_dii_fo_footprint(df_option_chain)
         try:
@@ -375,16 +396,11 @@ def _live_dashboard_body():
         # Bank Nifty / Sensex -- the biggest cross-index drivers of Nifty option
         # sentiment. Fetched Upstox-first (live) with Yahoo Finance fallback.
         _sp.step("Bank Nifty / Sensex")
-        nifty_change_pct = safe_io.guarded("nifty_change", index_correlation.get_nifty_change_pct, live_price,
-                                           timeout=8, ttl=20, default=None)
-        index_correlation_data, banknifty_correlation_note = safe_io.guarded(
-            "bank_sensex", index_correlation.get_bank_nifty_sensex, access_token, nifty_change_pct, timeout=15, ttl=20,
-            default=([], "Bank Nifty / Sensex data timed out (retrying in background)."))
+        nifty_change_pct, (index_correlation_data, banknifty_correlation_note) = _f_bank.result()
 
         _sp.step("Global news + markets")
-        df_global_sentiment, top_headline = safe_io.guarded("g_news", global_news.get_global_market_sentiment, timeout=10, ttl=120,
-                                                            default=(pd.DataFrame(), "Global news loading..."))
-        df_global_markets = safe_io.guarded("g_markets", global_markets.get_global_market_indices, timeout=10, ttl=60, default=pd.DataFrame())
+        df_global_sentiment, top_headline = _f_gnews.result()
+        df_global_markets = _f_gmk.result()
         global_sentiment_score, avg_market_change = global_markets.get_global_market_summary(df_global_markets)
         st.session_state["_last_global_avg_change"] = avg_market_change
         st.session_state["_last_sentiment_score"] = global_sentiment_score
@@ -425,7 +441,7 @@ def _live_dashboard_body():
             iv_source = atm_rows if not atm_rows.empty else df_option_chain
             mean_iv = iv_source['IV (%)'].mean()
             current_atm_iv = float(mean_iv) if pd.notna(mean_iv) and mean_iv > 0 else None
-        iv_percentile = option_chain.get_iv_percentile(current_atm_iv)
+        iv_percentile = safe_io.guarded("iv_percentile", option_chain.get_iv_percentile, current_atm_iv, timeout=5, ttl=60, default=None)
         sector_breadth = market_breadth.get_sector_breadth(df_full50)
 
         # -------------------------------------------------------------
@@ -526,7 +542,6 @@ def _live_dashboard_body():
         regime = market_regime.detect_regime(df, live_vix=live_vix)
         regime_guidance = market_regime.regime_adjusted_guidance(regime)
 
-        _sp.step("Pivots + liquidity map")
         pivots = cpr_pivot.calculate_pivots(df)
         cpr_pos = cpr_pivot.cpr_position(live_price, pivots)
         orb = cpr_pivot.opening_range(df)
@@ -546,7 +561,6 @@ def _live_dashboard_body():
         # and being at support cannot produce a SELL unless breakdown exists.
         # Missing data is kept explicit; nothing is fabricated.
         # -------------------------------------------------------------
-        _sp.step("Support / Resistance context")
         sr_context = support_resistance.build_comprehensive_sr_context(
             df=df, live_price=live_price, atr=ai_analysis['tech_metrics'].get('atr', 15.0),
             df_option_chain=df_option_chain, fvg_list=fvg, ob_list=ob,
@@ -701,9 +715,10 @@ def _live_dashboard_body():
         # extra quotes call for order_flow, everything else runs on data
         # already in trading_logs.db.
         # -------------------------------------------------------------
-        _sp.step("Order flow")
-        order_flow_snapshot = safe_io.guarded("order_flow", order_flow.get_order_flow_snapshot, access_token, timeout=6, ttl=8,
-                                              default={"status": "DATA_UNAVAILABLE", "reason": "Order flow load ho raha hai (background)."})
+        order_flow_snapshot = safe_io.guarded("order_flow", order_flow.get_order_flow_snapshot, access_token, timeout=7, ttl=4,
+                                              default={"status": "DATA_UNAVAILABLE", "reason": "Order book fetch timed out (retrying in background).",
+                                                       "instrument": None, "total_buy_qty": None, "total_sell_qty": None, "imbalance_pct": None,
+                                                       "pressure": None, "best_bid": None, "best_ask": None, "spread": None})
         closed_trades = database.fetch_all_closed_trades()
         backtest_report = backtest_engine.generate_backtest_report(closed_trades)
         monte_carlo_report = monte_carlo.run_monte_carlo(closed_trades)
@@ -717,9 +732,8 @@ def _live_dashboard_body():
         # risk + consecutive losses). All additive/read-only, same as
         # Phase 1-3.
         # -------------------------------------------------------------
-        _sp.step("Multi-timeframe structure")
-        mtf_structure = safe_io.guarded("mtf", multi_timeframe.get_multi_timeframe_structure, access_token, timeout=12, ttl=60,
-                                        default={"status": "DATA_UNAVAILABLE", "reason": "Multi-timeframe load ho raha hai (background).",
+        mtf_structure = safe_io.guarded("mtf_structure", multi_timeframe.get_multi_timeframe_structure, access_token, timeout=10, ttl=45,
+                                        default={"status": "DATA_UNAVAILABLE", "reason": "Multi-timeframe candles timed out (retrying in background).",
                                                  "timeframes": {}, "alignment": None})
         default_capital = st.session_state.get('risk_capital', 100000.0)
         default_risk_pct = st.session_state.get('risk_pct', 1.0)
@@ -1457,7 +1471,8 @@ def _live_dashboard_body():
             # not a separate gate -- see ai_trade_decision.py / trade_learning.py.
             _n50_news_for_ai = st.session_state.get("_nifty50_news_cache")
             if _n50_news_for_ai is None:
-                _n50_news_for_ai, _ = safe_io.guarded("n50_news", multi_stock_engine.get_nifty50_news, limit=10, timeout=8, ttl=300, default=([], "loading"))
+                _n50_res = safe_io.guarded("n50_news_ai", multi_stock_engine.get_nifty50_news, 10, timeout=4, ttl=300, default=([], "timeout"))
+                _n50_news_for_ai = (_n50_res or ([], ""))[0]
             _n50_news_sent = multi_stock_engine.get_nifty50_news_sentiment(_n50_news_for_ai)
             _n50_fund_bias = multi_stock_engine.get_nifty50_fundamentals_bias(
                 st.session_state.get("_nifty50_fund_cache"))
@@ -1813,16 +1828,14 @@ def _live_dashboard_body():
                 st.caption(f"Upar sirf latest {len(_recent_setups)} trades dikhte hain; Resolved Trades / Win Rate ka count poore Supabase history se aata hai.")
                 with st.expander(f"📜 Saare trades dikhao (Buy + Sell, poori history)", expanded=False):
                     try:
-                        # loaded only when asked: this was a 1000-row Supabase read on EVERY refresh, even while the expander was collapsed
-                        _all_loaded = st.toggle("Poori history load karo", key="load_all_trades_toggle", value=False)
-                        _all_setups = trade_learning.get_recent_setups(limit=1000) if _all_loaded else []
-                        st.caption(f"Total {len(_all_setups)} trades (naya sabse upar)." if _all_loaded else "Toggle ON karoge tabhi poori list Supabase se aayegi (refresh tez rakhne ke liye).")
+                        _all_setups = trade_learning.get_recent_setups(limit=1000)
+                        st.caption(f"Total {len(_all_setups)} trades (naya sabse upar).")
                         st.dataframe([{
                             "When": s['timestamp'], "Direction": f"{s['direction']} {s['strike']}{s['option_type']}",
                             "Entry": f"₹{s['entry']:,.2f}", "SL": f"₹{s['stop_loss']:,.2f}", "Target": f"₹{s['target']:,.2f}",
                             "Confidence": f"{s['confidence_pct']}%", "Status": s['status'],
                             "Exit": f"₹{s['exit_price']:,.2f} @ {s['exit_timestamp']}" if s['exit_price'] else "-"} for s in _all_setups],
-                            hide_index=True, width="stretch", height=(480 if _all_loaded else 60))
+                            hide_index=True, width="stretch", height=480)
                     except Exception:
                         logger.exception("all-trades table failed (ignored)")
                         st.caption("Poori list abhi load nahi ho payi.")
@@ -2103,7 +2116,7 @@ def _live_dashboard_body():
         with st.expander("🗞️ NIFTY 50 News", expanded=False):
             _refresh_nifty_news = st.button("🔄 Refresh NIFTY 50 News", key="refresh_nifty50_news")
             if _refresh_nifty_news or "_nifty50_news_cache" not in st.session_state:
-                _n50_news, _n50_news_status = safe_io.guarded("n50_news", multi_stock_engine.get_nifty50_news, limit=10, timeout=8, ttl=(0 if _refresh_nifty_news else 300), default=([], "loading"))
+                _n50_news, _n50_news_status = multi_stock_engine.get_nifty50_news(limit=10)
                 st.session_state["_nifty50_news_cache"] = _n50_news
                 st.session_state["_nifty50_news_status"] = _n50_news_status
             _n50_news = st.session_state.get("_nifty50_news_cache", [])
@@ -2180,28 +2193,22 @@ def _live_dashboard_body():
 
 
 
-    else:
-        _sp.done()
-        st.session_state["_dash_last_secs"] = None
-        st.warning("⏳ Live candles abhi nahi aaye (Upstox token / network ya Yahoo block). Page khud 10 second me dobara try karega -- "
-                   "Upstox login ya UPSTOX_ANALYTICS_TOKEN check karo.\n\nWajah: " + str(market_data.last_upstox_error() or "data source ne abhi reply nahi diya"))
-        return
-
-    _tot, _rows = _sp.done()
-    st.session_state["_dash_last_secs"] = _tot
-    try:           # the stock robot starts only AFTER the Nifty dashboard has finished its first load (it used to compete with it for CPU/network)
-        stock_watchlist.ensure_runner(ai_engine, GEMINI_API_KEYS)
-    except Exception:
-        logger.exception("watchlist robot start failed (ignored)")
-
-
-@st.fragment(run_every=_REFRESH_SEC)
-def _live_dashboard():
-    stock_watchlist.DASH_BUSY.set()            # robot watchlist pauses while this refresh runs
+    _total_sec, _ = _sp.done()
     try:
-        _live_dashboard_body()
-    finally:
-        stock_watchlist.DASH_BUSY.clear()
+        stock_watchlist.page_busy(False)
+    except Exception:
+        pass
+    # The timer must be longer than a run.  If the measured run time wants a different timer than the one this fragment was started with
+    # (by 15 s or more), restart once with the right one (max 3 times per session, so it can never loop).
+    try:
+        _want = safe_io.suggested_refresh(_REFRESH_IS_LIVE)
+        _n_adapt = st.session_state.get("_refresh_adapts", 0)
+        if abs(_want - _REFRESH_SEC) >= 15 and _n_adapt < 3:
+            st.session_state["_refresh_adapts"] = _n_adapt + 1
+            st.rerun()
+    except Exception as _e_rr:
+        if type(_e_rr).__name__ in ("RerunException", "StopException"):
+            raise
 
 
 try:                                   # SL / target are checked on the live price every ~2 s (idempotent: one thread per server process)
