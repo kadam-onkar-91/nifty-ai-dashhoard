@@ -244,7 +244,7 @@ def _live_dashboard():
         _r = market_data.fetch_live_market_data(_tok)
         return (_r[0].copy() if _r[0] is not None else None,) + tuple(_r[1:])
     _sp.step("Live candles (Upstox)")
-    df, model, feature_cols, live_price = safe_io.guarded("live_market", _fetch_live_copy, access_token, timeout=14, ttl=8,
+    df, model, feature_cols, live_price = safe_io.guarded("live_market_" + ("tok" if access_token else "anon"), _fetch_live_copy, access_token, timeout=14, ttl=8,
                                                           default=(None, None, [], None))
     if df is not None:
         df = df.copy()                     # the guarded cache keeps its own copy; this refresh mutates df freely
@@ -522,6 +522,7 @@ def _live_dashboard():
         regime = market_regime.detect_regime(df, live_vix=live_vix)
         regime_guidance = market_regime.regime_adjusted_guidance(regime)
 
+        _sp.step("Pivots + liquidity map")
         pivots = cpr_pivot.calculate_pivots(df)
         cpr_pos = cpr_pivot.cpr_position(live_price, pivots)
         orb = cpr_pivot.opening_range(df)
@@ -541,6 +542,7 @@ def _live_dashboard():
         # and being at support cannot produce a SELL unless breakdown exists.
         # Missing data is kept explicit; nothing is fabricated.
         # -------------------------------------------------------------
+        _sp.step("Support / Resistance context")
         sr_context = support_resistance.build_comprehensive_sr_context(
             df=df, live_price=live_price, atr=ai_analysis['tech_metrics'].get('atr', 15.0),
             df_option_chain=df_option_chain, fvg_list=fvg, ob_list=ob,
@@ -695,7 +697,9 @@ def _live_dashboard():
         # extra quotes call for order_flow, everything else runs on data
         # already in trading_logs.db.
         # -------------------------------------------------------------
-        order_flow_snapshot = order_flow.get_order_flow_snapshot(access_token)
+        _sp.step("Order flow")
+        order_flow_snapshot = safe_io.guarded("order_flow", order_flow.get_order_flow_snapshot, access_token, timeout=6, ttl=8,
+                                              default={"status": "DATA_UNAVAILABLE", "reason": "Order flow load ho raha hai (background)."})
         closed_trades = database.fetch_all_closed_trades()
         backtest_report = backtest_engine.generate_backtest_report(closed_trades)
         monte_carlo_report = monte_carlo.run_monte_carlo(closed_trades)
@@ -709,7 +713,10 @@ def _live_dashboard():
         # risk + consecutive losses). All additive/read-only, same as
         # Phase 1-3.
         # -------------------------------------------------------------
-        mtf_structure = multi_timeframe.get_multi_timeframe_structure(access_token)
+        _sp.step("Multi-timeframe structure")
+        mtf_structure = safe_io.guarded("mtf", multi_timeframe.get_multi_timeframe_structure, access_token, timeout=12, ttl=60,
+                                        default={"status": "DATA_UNAVAILABLE", "reason": "Multi-timeframe load ho raha hai (background).",
+                                                 "timeframes": {}, "alignment": None})
         default_capital = st.session_state.get('risk_capital', 100000.0)
         default_risk_pct = st.session_state.get('risk_pct', 1.0)
         position_size_result = position_sizing.calculate_position_size(
@@ -1446,7 +1453,7 @@ def _live_dashboard():
             # not a separate gate -- see ai_trade_decision.py / trade_learning.py.
             _n50_news_for_ai = st.session_state.get("_nifty50_news_cache")
             if _n50_news_for_ai is None:
-                _n50_news_for_ai, _ = multi_stock_engine.get_nifty50_news(limit=10)
+                _n50_news_for_ai, _ = safe_io.guarded("n50_news", multi_stock_engine.get_nifty50_news, limit=10, timeout=8, ttl=300, default=([], "loading"))
             _n50_news_sent = multi_stock_engine.get_nifty50_news_sentiment(_n50_news_for_ai)
             _n50_fund_bias = multi_stock_engine.get_nifty50_fundamentals_bias(
                 st.session_state.get("_nifty50_fund_cache"))
@@ -2092,7 +2099,7 @@ def _live_dashboard():
         with st.expander("🗞️ NIFTY 50 News", expanded=False):
             _refresh_nifty_news = st.button("🔄 Refresh NIFTY 50 News", key="refresh_nifty50_news")
             if _refresh_nifty_news or "_nifty50_news_cache" not in st.session_state:
-                _n50_news, _n50_news_status = multi_stock_engine.get_nifty50_news(limit=10)
+                _n50_news, _n50_news_status = safe_io.guarded("n50_news", multi_stock_engine.get_nifty50_news, limit=10, timeout=8, ttl=(0 if _refresh_nifty_news else 300), default=([], "loading"))
                 st.session_state["_nifty50_news_cache"] = _n50_news
                 st.session_state["_nifty50_news_status"] = _n50_news_status
             _n50_news = st.session_state.get("_nifty50_news_cache", [])

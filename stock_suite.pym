@@ -2422,6 +2422,7 @@ def _loop():
     """Every stock is scheduled on its own: it is re-run CYCLE_GAP (30 s) after its previous run STARTED, never waiting for a slower stock."""
     done_after_close = {}
     pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="wl")
+    time.sleep(30)      # let the Nifty dashboard finish its own first load before the stocks start competing for CPU / network
     while True:
         try:
             time.sleep(0.5)
