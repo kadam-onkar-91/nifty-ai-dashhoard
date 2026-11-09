@@ -138,7 +138,7 @@ def suggested_refresh(is_live, live_min=30, closed_min=180, cap=300):
     base = live_min if is_live else closed_min
     ema = _RUN_STATS.get("ema")
     if ema is None:
-        return max(base, 75)
+        return max(base, 120)
     return int(min(cap, max(base, ema * 1.4 + 8)))
 
 
@@ -159,8 +159,10 @@ class Stepper:
         now = time.time()
         if self.cur is not None:
             self.rows.append((self.cur, now - self.last_t))
-            if now - self.last_t >= 3:
-                logger.info("slow step: %s took %.1fs", self.cur, now - self.last_t)
+            try:                               # print -> shows in the Streamlit Cloud log ("Manage app" -> logs): every step with its seconds
+                print(f"[STEP] {self.cur}: {now - self.last_t:.1f}s (total {now - self.t0:.0f}s)", flush=True)
+            except Exception:
+                pass
         self.cur, self.last_t = label, now
         if self.ph is not None:
             try:
@@ -178,6 +180,10 @@ class Stepper:
             self.rows.append((self.cur, now - self.last_t))
             self.cur = None
         total = now - self.t0
+        try:
+            print(f"[STEP] DONE total {total:.1f}s", flush=True)
+        except Exception:
+            pass
         try:                                   # remember how long a full run takes (smoothed) -> suggested_refresh()
             prev = _RUN_STATS.get("ema")
             _RUN_STATS.update(last_total=total, ema=(total if prev is None else 0.5 * prev + 0.5 * total), rows=list(self.rows),
