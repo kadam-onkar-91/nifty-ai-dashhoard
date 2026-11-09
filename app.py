@@ -153,12 +153,16 @@ with st.sidebar:
     st.markdown("### 🔎 Select Your Stock")
     # Phase 1: searchable list of EVERY NSE stock (type a few letters of the symbol OR the company name), plus a free-text
     # box for anything not in the list.  Same Load Stock / Nifty 50 buttons as before.
-    _stk_pairs = stock_universe.option_labels()
+    _stk_total = stock_universe.count()
+    _stk_q = st.text_input("Stock search (naam / symbol)", placeholder="RELIANCE, TCS, Tata, HDFC...", key="sidebar_stock_search",
+                           help=f"{_stk_total} NSE stocks. Kuch letters likho -- niche sirf matching stocks (max 40) aate hain.")
+    _stk_pairs = []
+    if (_stk_q or "").strip():
+        _stk_pairs = [((f"{r['symbol']} — {r['name']}" if r.get("name") else r["symbol"]), r["symbol"]) for r in stock_universe.search(_stk_q, 40)]
     _stk_label_to_sym = dict(_stk_pairs)
     _stk_pick = st.selectbox(
         "Select your stocks", options=[l for l, _ in _stk_pairs], index=None, key="sidebar_stock_pick",
-        placeholder="Stock ka naam / symbol type karo (RELIANCE, TCS, Tata...)",
-        help=f"{len(_stk_pairs)} NSE stocks. Type karte hi list filter hoti hai -- symbol ya company naam dono chalte hain.")
+        placeholder="Upar search karo, phir yahan se chuno" if _stk_pairs else "Pehle upar stock ka naam likho")
     _stk_typed = st.text_input("ya seedha symbol likho", placeholder="e.g. RELIANCE, TCS, HDFCBANK, M&M", key="sidebar_stock_input",
                                help="Agar stock upar list me na mile to yahan NSE symbol likh do.")
     _sidebar_symbol_raw = stock_universe.clean_symbol(_stk_typed) or _stk_label_to_sym.get(_stk_pick, "")
@@ -186,9 +190,10 @@ with st.sidebar:
             logger.exception("watchlist toggle failed (ignored)")
     else:
         st.caption("Abhi Nifty 50 dashboard dikh raha hai.")
-    st.caption(f"📚 {len(_stk_pairs)} NSE stocks · {stock_universe.universe_source()}")
+    st.caption(f"📚 {_stk_total} NSE stocks · {stock_universe.universe_source()}")
     try:
-        stock_watchlist.ensure_runner(ai_engine, GEMINI_API_KEYS)     # one background robot thread (idempotent)
+        if st.session_state.get("_dash_last_secs") is not None or st.session_state.get("active_symbol"):
+            stock_watchlist.ensure_runner(ai_engine, GEMINI_API_KEYS)     # robot starts after the first dashboard load (see end of _live_dashboard)
         stock_watchlist.sidebar_panel()
     except Exception:
         logger.exception("watchlist panel failed (ignored)")
@@ -217,17 +222,9 @@ try:
     _REFRESH_IS_LIVE = market_status.get_market_status()["state"] in ("OPEN", "PRE_OPEN")
 except Exception:
     _REFRESH_IS_LIVE = True
-def _pick_refresh_sec(last_total):
-    """Refresh every ~1.6x of how long one refresh really takes (min 30 s live).  A fixed 30 s timer used to INTERRUPT a refresh that
-    needed longer, so the page never reached its last section (Global Markets tracker) and just kept restarting."""
-    if not _REFRESH_IS_LIVE:
-        return 180
-    if not last_total:
-        return 75                      # first run: cold caches, give it room
-    return int(min(120, max(30, last_total * 1.6 + 5)))
-
-
-_REFRESH_SEC = _pick_refresh_sec(st.session_state.get("_dash_last_secs"))
+# Fixed timer again (the adaptive version re-ran the whole app whenever one refresh was faster/slower than the last = restart loop).
+# 45 s while NSE is open is longer than a normal refresh, so a refresh is no longer cut off half-way by the next timer tick.
+_REFRESH_SEC = 45 if _REFRESH_IS_LIVE else 180
 
 
 @st.fragment(run_every=_REFRESH_SEC)
@@ -1805,14 +1802,16 @@ def _live_dashboard():
                 st.caption(f"Upar sirf latest {len(_recent_setups)} trades dikhte hain; Resolved Trades / Win Rate ka count poore Supabase history se aata hai.")
                 with st.expander(f"📜 Saare trades dikhao (Buy + Sell, poori history)", expanded=False):
                     try:
-                        _all_setups = trade_learning.get_recent_setups(limit=1000)
-                        st.caption(f"Total {len(_all_setups)} trades (naya sabse upar).")
+                        # loaded only when asked: this was a 1000-row Supabase read on EVERY refresh, even while the expander was collapsed
+                        _all_loaded = st.toggle("Poori history load karo", key="load_all_trades_toggle", value=False)
+                        _all_setups = trade_learning.get_recent_setups(limit=1000) if _all_loaded else []
+                        st.caption(f"Total {len(_all_setups)} trades (naya sabse upar)." if _all_loaded else "Toggle ON karoge tabhi poori list Supabase se aayegi (refresh tez rakhne ke liye).")
                         st.dataframe([{
                             "When": s['timestamp'], "Direction": f"{s['direction']} {s['strike']}{s['option_type']}",
                             "Entry": f"₹{s['entry']:,.2f}", "SL": f"₹{s['stop_loss']:,.2f}", "Target": f"₹{s['target']:,.2f}",
                             "Confidence": f"{s['confidence_pct']}%", "Status": s['status'],
                             "Exit": f"₹{s['exit_price']:,.2f} @ {s['exit_timestamp']}" if s['exit_price'] else "-"} for s in _all_setups],
-                            hide_index=True, width="stretch", height=480)
+                            hide_index=True, width="stretch", height=(480 if _all_loaded else 60))
                     except Exception:
                         logger.exception("all-trades table failed (ignored)")
                         st.caption("Poori list abhi load nahi ho payi.")
@@ -2179,8 +2178,10 @@ def _live_dashboard():
 
     _tot, _rows = _sp.done()
     st.session_state["_dash_last_secs"] = _tot
-    if abs(_pick_refresh_sec(_tot) - _REFRESH_SEC) > 15:      # timer no longer matches the real refresh time -> re-pick it once
-        st.rerun()
+    try:           # the stock robot starts only AFTER the Nifty dashboard has finished its first load (it used to compete with it for CPU/network)
+        stock_watchlist.ensure_runner(ai_engine, GEMINI_API_KEYS)
+    except Exception:
+        logger.exception("watchlist robot start failed (ignored)")
 
 
 try:                                   # SL / target are checked on the live price every ~2 s (idempotent: one thread per server process)
