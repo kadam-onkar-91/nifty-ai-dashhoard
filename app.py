@@ -720,9 +720,16 @@ def _live_dashboard():
                                                        "instrument": None, "total_buy_qty": None, "total_sell_qty": None, "imbalance_pct": None,
                                                        "pressure": None, "best_bid": None, "best_ask": None, "spread": None})
         closed_trades = database.fetch_all_closed_trades()
-        backtest_report = backtest_engine.generate_backtest_report(closed_trades)
-        monte_carlo_report = monte_carlo.run_monte_carlo(closed_trades)
-        drift_report = drift_detection.check_for_drift(closed_trades)
+        # These three only depend on the closed-trade list, which changes a few times a day -> compute once per change, not every refresh (same results).
+        _bt_key = hash(repr(closed_trades))
+        _bt_memo = st.session_state.get("_bt_memo")
+        if _bt_memo and _bt_memo[0] == _bt_key:
+            backtest_report, monte_carlo_report, drift_report = _bt_memo[1]
+        else:
+            backtest_report = backtest_engine.generate_backtest_report(closed_trades)
+            monte_carlo_report = monte_carlo.run_monte_carlo(closed_trades)
+            drift_report = drift_detection.check_for_drift(closed_trades)
+            st.session_state["_bt_memo"] = (_bt_key, (backtest_report, monte_carlo_report, drift_report))
 
         # -------------------------------------------------------------
         # PHASE 4 -- Multi-Timeframe Structure (real 1D/4H/1H/30M/15M/5M
