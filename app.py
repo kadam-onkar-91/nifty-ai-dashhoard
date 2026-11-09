@@ -217,7 +217,17 @@ try:
     _REFRESH_IS_LIVE = market_status.get_market_status()["state"] in ("OPEN", "PRE_OPEN")
 except Exception:
     _REFRESH_IS_LIVE = True
-_REFRESH_SEC = 30 if _REFRESH_IS_LIVE else 180
+def _pick_refresh_sec(last_total):
+    """Refresh every ~1.6x of how long one refresh really takes (min 30 s live).  A fixed 30 s timer used to INTERRUPT a refresh that
+    needed longer, so the page never reached its last section (Global Markets tracker) and just kept restarting."""
+    if not _REFRESH_IS_LIVE:
+        return 180
+    if not last_total:
+        return 75                      # first run: cold caches, give it room
+    return int(min(120, max(30, last_total * 1.6 + 5)))
+
+
+_REFRESH_SEC = _pick_refresh_sec(st.session_state.get("_dash_last_secs"))
 
 
 @st.fragment(run_every=_REFRESH_SEC)
@@ -2162,11 +2172,15 @@ def _live_dashboard():
 
     else:
         _sp.done()
+        st.session_state["_dash_last_secs"] = None
         st.warning("⏳ Live candles abhi nahi aaye (Upstox token / network ya Yahoo block). Page khud 10 second me dobara try karega -- "
                    "Upstox login ya UPSTOX_ANALYTICS_TOKEN check karo.\n\nWajah: " + str(market_data.last_upstox_error() or "data source ne abhi reply nahi diya"))
         return
 
-    _sp.done()
+    _tot, _rows = _sp.done()
+    st.session_state["_dash_last_secs"] = _tot
+    if abs(_pick_refresh_sec(_tot) - _REFRESH_SEC) > 15:      # timer no longer matches the real refresh time -> re-pick it once
+        st.rerun()
 
 
 try:                                   # SL / target are checked on the live price every ~2 s (idempotent: one thread per server process)
