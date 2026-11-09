@@ -528,18 +528,25 @@ def learning_status():
     url, hdr = _learn_cfg()
     if not url:
         val = (False, "Supabase configure nahi -- learning sirf is session tak.")
-    else:
-        try:
-            r = requests.get(f"{url}?select=symbol,name,rows,updated_at&order=updated_at.desc&limit=50", headers=hdr, timeout=6)
-            if r.ok:
-                syms = {x["symbol"] for x in (r.json() or [])}
-                val = (True, f"Learning permanent hai ({len(syms)} stock saved).")
-            else:
-                val = (False, f"`{LEARN_TABLE}` table nahi mila (HTTP {r.status_code}) -- schema.sql ka stock_learning_blobs block run karo.")
-        except Exception as e:
-            val = (False, f"Supabase se baat nahi ho payi: {type(e).__name__}")
-    _LEARN_WARNED["st"] = (now, val)
-    return val
+        _LEARN_WARNED["st"] = (now, val)
+        return val
+    if not _LEARN_WARNED.get("st_busy"):
+        _LEARN_WARNED["st_busy"] = True
+
+        def _check():                      # the page never waits for this network call (it runs in the background; shown on the next refresh)
+            try:
+                r = requests.get(f"{url}?select=symbol,name,rows,updated_at&order=updated_at.desc&limit=50", headers=hdr, timeout=6)
+                if r.ok:
+                    syms = {x["symbol"] for x in (r.json() or [])}
+                    val = (True, f"Learning permanent hai ({len(syms)} stock saved).")
+                else:
+                    val = (False, f"`{LEARN_TABLE}` table nahi mila (HTTP {r.status_code}) -- schema.sql ka stock_learning_blobs block run karo.")
+            except Exception as e:
+                val = (False, f"Supabase se baat nahi ho payi: {type(e).__name__}")
+            _LEARN_WARNED["st"] = (time.time(), val)
+            _LEARN_WARNED["st_busy"] = False
+        threading.Thread(target=_check, daemon=True, name="stk-learn-status").start()
+    return c[1]            # None until the first background check is done
 # @@END stock_store
 
 # @@MODULE stock_news
@@ -1363,7 +1370,7 @@ def ml_cached(fam, sym, df, vix, first_wait=25.0, stale_wait=0.3):
 
             def _job(_snap=snap, _key=key):
                 try:
-                    r = fam.ml_engine.train_and_backtest(_snap, vix)
+                    r = fam.ml_engine.train_and_backtest(_snap, vix, blocking=True)
                 except Exception:
                     logger.exception("stock ML job failed (%s)", sym)
                     return
@@ -2194,7 +2201,8 @@ ROOT = os.environ.get("STOCK_DATA_DIR", "stock_data")
 PATH = os.path.join(ROOT, "watchlist.json")
 TABLE = "stock_watchlist"
 CYCLE_GAP = 30.0            # every watchlist stock is re-run every 30 s (same cadence as the Nifty 50 dashboard); ticks are handled by the tick watcher
-WORKERS = 10                # stocks processed in parallel (one worker per stock, so no stock waits for another)
+WORKERS = 4                 # stocks processed at the same time.  More workers only fight the dashboard for the CPU (Python GIL) and make the PAGE slow;
+                            # 4 still finishes 10 stocks inside the 30 s cycle once the data caches are warm.
 RESULT_MAX_AGE = 40.0       # the dashboard re-uses the robot's result when it is younger than this -> instant stock loading
 GLOBAL_TTL = 30.0           # global markets / VIX refreshed every 30 s; global news every 3 min (changes slowly)
 POST_CLOSE_UNTIL = (15, 50)  # one last pass after the close so the day's candles get labelled
@@ -2534,8 +2542,9 @@ def sidebar_panel():
                          hide_index=True, width="stretch")
         try:
             import stock_store
-            _lok, _lmsg = stock_store.learning_status()
-            (st.caption if _lok else st.warning)(("🧠 " if _lok else "⚠️ ") + _lmsg)
+            _ls = stock_store.learning_status()
+            if _ls:
+                (st.caption if _ls[0] else st.warning)(("🧠 " if _ls[0] else "⚠️ ") + _ls[1])
         except Exception:
             pass
         alive = (_RUNNER["thread"] is not None and _RUNNER["thread"].is_alive())

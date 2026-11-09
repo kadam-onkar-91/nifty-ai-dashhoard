@@ -2312,11 +2312,27 @@ def _train_and_backtest_impl(df, live_vix=None):
 # arrives -> cache it per (last candle, rows, VIX) with a safety TTL.
 # ---------------------------------------------------------------------
 import time as _time
-_ML_CACHE = {"key": None, "ts": 0.0, "result": None}
+import threading as _th_ml
+_ML_CACHE = {"key": None, "ts": 0.0, "result": None, "last_ts": None, "n_rows": None, "fut": None}
+_ML_BG_LOCK = _th_ml.Lock()
 ML_CACHE_MAX_AGE = 240  # seconds
+ML_STALE_MAX_AGE = 900  # a previous result is only ever re-used (while a fresh one trains) when it is younger than this
 
 
-def train_and_backtest(df, live_vix=None):
+def _ml_close(a, b, minutes=10):
+    """True when two candle timestamps are at most `minutes` apart (the cached model is from the same / previous candle)."""
+    try:
+        import pandas as _pd
+        return 0 <= abs((_pd.Timestamp(a) - _pd.Timestamp(b)).total_seconds()) <= minutes * 60
+    except Exception:
+        return False
+
+
+def train_and_backtest(df, live_vix=None, blocking=False):
+    """Walk-forward ML.  A result is re-used while the candle/VIX key is unchanged.  When the key changed (new candle or the VIX moved 0.1) the model
+    used to be retrained RIGHT HERE on the page thread (seconds to tens of seconds -> slow loading).  Now the previous result (at most one candle
+    old -- the model only learns from CLOSED candles anyway) is returned at once and the retrain runs in the background; the next refresh (30 s) has
+    the new result.  The very first call, a big gap in the data, or blocking=True still train in place."""
     try:
         last_ts = str(df.index[-1]) if (df is not None and len(df) > 0) else "none"
         n_rows = len(df) if df is not None else 0
@@ -2327,9 +2343,28 @@ def train_and_backtest(df, live_vix=None):
     now = _time.time()
     if _ML_CACHE["key"] == key and _ML_CACHE["result"] is not None and now - _ML_CACHE["ts"] < ML_CACHE_MAX_AGE:
         return _ML_CACHE["result"]
-    result = _train_and_backtest_impl(df, live_vix=live_vix)
-    _ML_CACHE["key"], _ML_CACHE["ts"], _ML_CACHE["result"] = key, now, result
-    return result
+    have = _ML_CACHE["result"] is not None
+    can_stale = (not blocking and have and now - _ML_CACHE["ts"] < ML_STALE_MAX_AGE and _ml_close(last_ts, _ML_CACHE["last_ts"])
+                 and abs(n_rows - (_ML_CACHE["n_rows"] or 0)) <= 3)
+    if not can_stale:
+        result = _train_and_backtest_impl(df, live_vix=live_vix)
+        _ML_CACHE.update(key=key, ts=now, result=result, last_ts=last_ts, n_rows=n_rows)
+        return result
+    with _ML_BG_LOCK:
+        fut = _ML_CACHE.get("fut")
+        if fut is None or not fut.is_alive():
+            snap = df.copy()
+
+            def _bg(_snap=snap, _key=key, _vix=live_vix, _last=last_ts, _n=n_rows):
+                try:
+                    r = _train_and_backtest_impl(_snap, live_vix=_vix)
+                    _ML_CACHE.update(key=_key, ts=_time.time(), result=r, last_ts=_last, n_rows=_n)
+                except Exception:
+                    logger.exception("background ML retrain failed (previous result kept)")
+            t = _th_ml.Thread(target=_bg, daemon=True, name="ml-retrain")
+            _ML_CACHE["fut"] = t
+            t.start()
+    return _ML_CACHE["result"]
 # @@END ml_engine
 # @@MODULE backtest_engine
 from app_logging import get_logger
