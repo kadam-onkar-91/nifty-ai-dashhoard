@@ -2194,7 +2194,7 @@ ROOT = os.environ.get("STOCK_DATA_DIR", "stock_data")
 PATH = os.path.join(ROOT, "watchlist.json")
 TABLE = "stock_watchlist"
 CYCLE_GAP = 30.0            # every watchlist stock is re-run every 30 s (same cadence as the Nifty 50 dashboard); ticks are handled by the tick watcher
-WORKERS = 4                 # stocks processed in parallel (one worker per stock, so no stock waits for another)
+WORKERS = 10                # stocks processed in parallel (one worker per stock, so no stock waits for another)
 RESULT_MAX_AGE = 40.0       # the dashboard re-uses the robot's result when it is younger than this -> instant stock loading
 GLOBAL_TTL = 30.0           # global markets / VIX refreshed every 30 s; global news every 3 min (changes slowly)
 POST_CLOSE_UNTIL = (15, 50)  # one last pass after the close so the day's candles get labelled
@@ -2338,11 +2338,11 @@ def _global_bundle():
             return _GLOBAL["v"]
         import pandas as pd
         import safe_io, global_markets, global_news
-        df_gm = safe_io.guarded("g_markets", global_markets.get_global_market_indices, timeout=10, ttl=60, default=pd.DataFrame())
+        df_gm = safe_io.guarded("wl_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
         gscore, gavg = safe_io.guarded("wl_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
         vix = safe_io.guarded("wl_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
         if _GLOBAL["sent"] is None or time.time() - _GLOBAL["tn"] >= 180:
-            sp = safe_io.guarded("g_news", global_news.get_global_market_sentiment, timeout=10, ttl=120, default=(pd.DataFrame(), ""))
+            sp = safe_io.guarded("wl_global_news", global_news.get_global_market_sentiment, timeout=10, default=(pd.DataFrame(), ""))
             _GLOBAL["sent"] = sp[0] if isinstance(sp, tuple) else pd.DataFrame()
             _GLOBAL["head"] = str(sp[1]) if isinstance(sp, tuple) and len(sp) > 1 else ""
             _GLOBAL["tn"] = time.time()
@@ -2648,9 +2648,9 @@ def _body(symbol, ai_engine, helpers):
         sp.step("Global news + markets")
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=2) as _ex:
-            _f_news = _ex.submit(lambda: safe_io.guarded("g_news", global_news.get_global_market_sentiment, timeout=10, ttl=120,
+            _f_news = _ex.submit(lambda: safe_io.guarded("stk_global_news", global_news.get_global_market_sentiment, timeout=10,
                                                           default=(pd.DataFrame(), "Global headline unavailable right now.")))
-            df_gm = safe_io.guarded("g_markets", global_markets.get_global_market_indices, timeout=10, ttl=60, default=pd.DataFrame())
+            df_gm = safe_io.guarded("stk_global_markets", global_markets.get_global_market_indices, timeout=10, default=pd.DataFrame())
             sent_pair = _f_news.result()
         gscore, gavg = safe_io.guarded("stk_global_summary", global_markets.get_global_market_summary, df_gm, timeout=5, default=("Neutral / Mixed 🟡", 0.0))
         vix = safe_io.guarded("stk_vix", global_markets.get_live_vix, df_gm, timeout=5, default=None)
