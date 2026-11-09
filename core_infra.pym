@@ -167,6 +167,40 @@ class Stepper:
             except Exception:
                 pass
         return total, self.rows
+
+
+# ---- page priority: background work (watchlist robot, ML retrains) lets the dashboard page finish first -------------------------------------
+PAGE = {"since": 0.0, "runs": 0}
+
+
+def page_busy(flag):
+    """Called by the Nifty page when a refresh starts (True) / ends (False)."""
+    if flag:
+        PAGE["since"] = time.time()
+    else:
+        PAGE["since"] = 0.0
+        PAGE["runs"] += 1
+
+
+def yield_to_page(max_wait=25.0):
+    """Background threads call this before heavy work: waits (at most max_wait s) while the page is mid-refresh.  A page that looks stuck for
+    more than 90 s never blocks background work."""
+    t0 = time.time()
+    while time.time() - t0 < max_wait:
+        s = PAGE["since"]
+        if not s or time.time() - s > 90:
+            return
+        time.sleep(0.4)
+
+
+def nice_thread(n=15):
+    """Lower the OS priority of the CALLING thread (Linux) so a CPU-hungry background thread never beats the page thread for a core."""
+    try:
+        import os
+        import threading
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), n)
+    except Exception:
+        pass
 # @@END safe_io
 # @@MODULE market_status
 from app_logging import get_logger

@@ -2357,6 +2357,12 @@ def train_and_backtest(df, live_vix=None, blocking=False):
 
             def _bg(_snap=snap, _key=key, _vix=live_vix, _last=last_ts, _n=n_rows):
                 try:
+                    try:
+                        import safe_io
+                        safe_io.nice_thread()                 # background retrain must not slow the page
+                        safe_io.yield_to_page(30)
+                    except Exception:
+                        pass
                     r = _train_and_backtest_impl(_snap, live_vix=_vix)
                     _ML_CACHE.update(key=_key, ts=_time.time(), result=r, last_ts=_last, n_rows=_n)
                 except Exception:
