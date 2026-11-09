@@ -233,7 +233,14 @@ def _live_dashboard():
     access_token = upstox_auth.get_upstox_access_token()
 
     # Step 2: Fetch Live Market Data
-    df, model, feature_cols, live_price = market_data.fetch_live_market_data(access_token)
+    def _fetch_live_copy(_tok):
+        _r = market_data.fetch_live_market_data(_tok)
+        return (_r[0].copy() if _r[0] is not None else None,) + tuple(_r[1:])
+    _sp.step("Live candles (Upstox)")
+    df, model, feature_cols, live_price = safe_io.guarded("live_market", _fetch_live_copy, access_token, timeout=14, ttl=8,
+                                                          default=(None, None, [], None))
+    if df is not None:
+        df = df.copy()                     # the guarded cache keeps its own copy; this refresh mutates df freely
     try:                                   # v57: "Upstox connected" only means a token exists -- say plainly when the data call itself failed
         if df is not None and not df.empty and getattr(df, "attrs", {}).get("market_source") != "UPSTOX_LIVE":
             st.sidebar.warning("⚠️ Token hai par Upstox se data nahi aaya -- Yahoo (non-tradable) chal raha hai.\n\nAsli wajah: "
@@ -291,7 +298,7 @@ def _live_dashboard():
         # below -- nothing breaks.
         # -------------------------------------------------------------
         try:
-            fut_volume = market_data.fetch_nifty_futures_volume(access_token)
+            fut_volume = safe_io.guarded("fut_volume", market_data.fetch_nifty_futures_volume, access_token, timeout=6, ttl=20, default=None)
             if fut_volume is not None and not fut_volume.empty and fut_volume.sum() > 0:
                 df['Volume'] = fut_volume.reindex(df.index, method='nearest', tolerance=pd.Timedelta(minutes=10))
                 df['Volume'] = df['Volume'].fillna(0)
@@ -330,7 +337,10 @@ def _live_dashboard():
 
         # Fetch Supporting Data for Confluence Engine
         _sp.step("Option chain")
-        df_option_chain, oc_source = option_chain.generate_option_chain_data(live_price)
+        _oc = safe_io.guarded("option_chain", option_chain.generate_option_chain_data, live_price, timeout=10, ttl=15, default=None)
+        if _oc is None:                    # nothing loaded yet and the source is slow -> honest SIMULATED placeholder, real chain lands next refresh
+            _oc = (option_chain.get_mock_option_chain(live_price), "SIMULATED")
+        df_option_chain, oc_source = _oc
         fvg, ob, sweeps = smart_money.detect_smc_zones(df)
         market_structure = smart_money.detect_market_structure(df)
         smc_event = market_structure[0]["Market Event"] if market_structure else "Neutral Structure"
@@ -339,10 +349,10 @@ def _live_dashboard():
         # Each source is wrapped: a slow one is skipped after `timeout` s (last good value / "unavailable") and keeps
         # loading in the background, instead of freezing the whole page.
         df_heavyweights, advances, declines, breadth_ratio, breadth_status, heavyweights_debug = safe_io.guarded(
-            "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=20,
+            "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=20, ttl=45,
             default=market_breadth.unavailable_heavyweights())
         df_full50, adv50, dec50, ratio50, breadth50_status, full50_debug = safe_io.guarded(
-            "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=20,
+            "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=20, ttl=45,
             default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
         max_pain = option_chain.calculate_max_pain(df_option_chain)
         fii_footprint, current_pcr = option_chain.get_fii_dii_fo_footprint(df_option_chain)
@@ -355,14 +365,15 @@ def _live_dashboard():
         # sentiment. Fetched Upstox-first (live) with Yahoo Finance fallback.
         _sp.step("Bank Nifty / Sensex")
         nifty_change_pct = safe_io.guarded("nifty_change", index_correlation.get_nifty_change_pct, live_price,
-                                           timeout=8, default=None)
+                                           timeout=8, ttl=20, default=None)
         index_correlation_data, banknifty_correlation_note = safe_io.guarded(
-            "bank_sensex", index_correlation.get_bank_nifty_sensex, access_token, nifty_change_pct, timeout=15,
+            "bank_sensex", index_correlation.get_bank_nifty_sensex, access_token, nifty_change_pct, timeout=15, ttl=20,
             default=([], "Bank Nifty / Sensex data timed out (retrying in background)."))
 
         _sp.step("Global news + markets")
-        df_global_sentiment, top_headline = global_news.get_global_market_sentiment()
-        df_global_markets = global_markets.get_global_market_indices()
+        df_global_sentiment, top_headline = safe_io.guarded("g_news", global_news.get_global_market_sentiment, timeout=10, ttl=120,
+                                                            default=(pd.DataFrame(), "Global news loading..."))
+        df_global_markets = safe_io.guarded("g_markets", global_markets.get_global_market_indices, timeout=10, ttl=60, default=pd.DataFrame())
         global_sentiment_score, avg_market_change = global_markets.get_global_market_summary(df_global_markets)
         st.session_state["_last_global_avg_change"] = avg_market_change
         st.session_state["_last_sentiment_score"] = global_sentiment_score
@@ -2148,6 +2159,12 @@ def _live_dashboard():
                 st.dataframe(df_global_markets, width="stretch")
 
 
+
+    else:
+        _sp.done()
+        st.warning("⏳ Live candles abhi nahi aaye (Upstox token / network ya Yahoo block). Page khud 10 second me dobara try karega -- "
+                   "Upstox login ya UPSTOX_ANALYTICS_TOKEN check karo.\n\nWajah: " + str(market_data.last_upstox_error() or "data source ne abhi reply nahi diya"))
+        return
 
     _sp.done()
 

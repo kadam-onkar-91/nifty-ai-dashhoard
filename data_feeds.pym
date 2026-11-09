@@ -306,7 +306,7 @@ def fetch_live_market_data(access_token):
         # strategy/AI decision can mistake Yahoo data for the authenticated
         # Upstox feed requested by the trading engine.
         upstox_note = last_upstox_error() or upstox_note
-        df = yf.download("^NSEI", period="5d", interval="5m", progress=False)
+        df = yf.download("^NSEI", period="5d", interval="5m", progress=False, timeout=8)
         market_source = "YAHOO_FALLBACK_NON_TRADABLE"
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -452,7 +452,7 @@ def fetch_daily_candles(access_token=None, days_back=180):
                 df = None
     if df is None or df.empty or len(df) < 20:
         try:
-            y = yf.download("^NSEI", period="6mo", interval="1d", progress=False)
+            y = yf.download("^NSEI", period="6mo", interval="1d", progress=False, timeout=8)
             if isinstance(y.columns, pd.MultiIndex):
                 y.columns = y.columns.get_level_values(0)
             y = y[["Open", "High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce").dropna()

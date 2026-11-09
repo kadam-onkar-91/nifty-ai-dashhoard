@@ -84,7 +84,9 @@ def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
         if ttl and st["has"] and now - st["ts"] < ttl:
             return st["value"]
         fut = st["fut"]
+        _fresh_job = False
         if fut is None or fut.done():
+            _fresh_job = True
             t0 = time.time()
 
             def _job():
@@ -108,13 +110,21 @@ def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
                         s["last_status"] = f"error: {type(exc).__name__}"
                         logger.warning("safe_io %s failed: %s", _key, exc)
             fut.add_done_callback(_done)
+    # SPEED FIX: a job that is STILL running from an earlier refresh must not be waited for again (that made every refresh cost the
+    # sum of all timeouts = 60-90 s, longer than the 30 s fragment timer, so the page was interrupted and only ever "refreshed").
+    # With a last-good value we also cap the wait for a new job, so the page paints at once and the fresh value lands next refresh.
+    with _LOCK:
+        _has = _STATE[key]["has"]
+    _wait = timeout if _fresh_job else min(timeout, 0.3)
+    if _has:
+        _wait = min(_wait, 4.0)
     try:
-        fut.result(timeout=timeout)
+        fut.result(timeout=_wait)
     except _FutTimeout:
         with _LOCK:
             _STATE[key]["last_status"] = f"timeout>{timeout:.0f}s (running in background)"
-        logger.warning("safe_io %s timed out after %.0fs; using %s", key, timeout,
-                       "last good value" if _STATE[key]["has"] else "default")
+        logger.info("safe_io %s still loading after %.1fs; using %s", key, _wait,
+                    "last good value" if _STATE[key]["has"] else "default")
     except Exception:
         pass                                                   # the done-callback already recorded it
     with _LOCK:
