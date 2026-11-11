@@ -142,6 +142,12 @@ trade_learning.configure_supabase(
     st.secrets.get("SUPABASE_KEY", None)
 )
 
+try:        # LOAD SPEED: slow, slow-moving data (NSE stock list, 50-stock fundamentals, NIFTY news) loads in the BACKGROUND, once per server process
+    stock_universe.load_universe()               # instant (memory / disk / bundled list); the full list downloads in a background thread
+    multi_stock_engine.prewarm_background()
+except Exception:
+    logger.exception("prewarm failed (ignored)")
+
 ui_theme.inject_theme()   # premium dark-glass look + animations
 # (hero banner is drawn right after the sidebar below, so it already knows which stock is active)
 
@@ -235,26 +241,6 @@ def _live_dashboard():
         pass
     _sp = safe_io.Stepper(st.empty())
     _sp.step("Broker login + live candles")
-    # SPEED (cold start): the learning history (every trade from Supabase + its factor JSON) was first read in the MIDDLE of the page run, one
-    # step after another (the "AI trade decision" and "Learning" steps took 8-15 s on a fresh start).  Start reading it NOW in a background thread,
-    # while the broker / market data loads -- it only fills the same caches those steps read anyway, so the numbers are identical.
-    try:
-        import threading as _thr
-        _pw = safe_io.__dict__.setdefault("_LEARN_PREWARM", {"t": 0.0})   # lives in a module, not in the script (the script restarts every run)
-        if time.time() - _pw["t"] > 60:
-            _pw["t"] = time.time()
-
-            def _prewarm_learning():
-                for _fn, _kw in ((trade_learning.get_overall_track_record, {}), (trade_learning.get_factor_reliability, {}),
-                                 (trade_learning.get_learning_summary, {}), (trade_learning._labelled_rows_full, {}),
-                                 (trade_learning.get_recent_setups, {"limit": 20})):
-                    try:
-                        _fn(**_kw)
-                    except Exception:
-                        pass
-            _thr.Thread(target=_prewarm_learning, daemon=True, name="learn-prewarm").start()
-    except Exception:
-        pass
     if 'access_token' not in st.session_state:
         st.session_state.access_token = None
 
@@ -1361,6 +1347,13 @@ def _live_dashboard():
         # Uses the same real completed-candle/dashboard data. It is an
         # additional vote, never an all-factors hard gate.
         # -------------------------------------------------------------
+        try:                # non-blocking: newest real snapshot (memory/disk) if there is one, else the background load is simply still running
+            _n50_v, _n50_age, _n50_loading = multi_stock_engine.get_nifty50_fundamentals_cached()
+            if _n50_v is not None:
+                st.session_state["_nifty50_fund_cache"] = _n50_v
+                st.session_state["_nifty50_fund_age"] = _n50_age
+        except Exception:
+            logger.exception("fundamentals cache read failed (ignored)")
         _sp.step("Strategy engine (40 strategies)")
         strategy_result = strategy_engine.analyze(
             df, sr_context=sr_context, level_prediction=level_prediction,
@@ -1805,7 +1798,6 @@ def _live_dashboard():
                 logger.exception('timeline expander failed (ignored)')
                 st.caption("Timeline abhi available nahi.")
 
-        _sp.step("Learning + history tables")
         with st.expander("📈 Engine ka real track record + factor reliability", expanded=False):
             _track = trade_learning.get_overall_track_record()
             if _track['sample_size'] == 0:
@@ -1856,16 +1848,14 @@ def _live_dashboard():
                 st.caption(f"Upar sirf latest {len(_recent_setups)} trades dikhte hain; Resolved Trades / Win Rate ka count poore Supabase history se aata hai.")
                 with st.expander(f"📜 Saare trades dikhao (Buy + Sell, poori history)", expanded=False):
                     try:
-                        # SPEED: 1000 rows were fetched + sent to the phone on every refresh even while this box was closed.  Now only on demand.
-                        if st.toggle("Poori history load karo (page tez rakhne ke liye default band)", value=False, key="_all_trades_toggle"):
-                            _all_setups = trade_learning.get_recent_setups(limit=1000)
-                            st.caption(f"Total {len(_all_setups)} trades (naya sabse upar).")
-                            st.dataframe([{
-                                "When": s['timestamp'], "Direction": f"{s['direction']} {s['strike']}{s['option_type']}",
-                                "Entry": f"₹{s['entry']:,.2f}", "SL": f"₹{s['stop_loss']:,.2f}", "Target": f"₹{s['target']:,.2f}",
-                                "Confidence": f"{s['confidence_pct']}%", "Status": s['status'],
-                                "Exit": f"₹{s['exit_price']:,.2f} @ {s['exit_timestamp']}" if s['exit_price'] else "-"} for s in _all_setups],
-                                hide_index=True, width="stretch", height=480)
+                        _all_setups = trade_learning.get_recent_setups(limit=1000)
+                        st.caption(f"Total {len(_all_setups)} trades (naya sabse upar).")
+                        st.dataframe([{
+                            "When": s['timestamp'], "Direction": f"{s['direction']} {s['strike']}{s['option_type']}",
+                            "Entry": f"₹{s['entry']:,.2f}", "SL": f"₹{s['stop_loss']:,.2f}", "Target": f"₹{s['target']:,.2f}",
+                            "Confidence": f"{s['confidence_pct']}%", "Status": s['status'],
+                            "Exit": f"₹{s['exit_price']:,.2f} @ {s['exit_timestamp']}" if s['exit_price'] else "-"} for s in _all_setups],
+                            hide_index=True, width="stretch", height=480)
                     except Exception:
                         logger.exception("all-trades table failed (ignored)")
                         st.caption("Poori list abhi load nahi ho payi.")
@@ -2145,15 +2135,14 @@ def _live_dashboard():
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("🗞️ NIFTY 50 News", expanded=False):
             _refresh_nifty_news = st.button("🔄 Refresh NIFTY 50 News", key="refresh_nifty50_news")
-            if _refresh_nifty_news or "_nifty50_news_cache" not in st.session_state:
-                # SPEED: a brand-new session (page reload / Upstox login redirect) used to WAIT here for the news download.  Now the fetch runs in the
-                # background (shared by all sessions, same Google News feed) and the page continues; the 30 s refresh picks the result up.
-                if _refresh_nifty_news:
-                    _nres = multi_stock_engine.get_nifty50_news(limit=10)
-                else:
-                    _nres = safe_io.guarded("n50_news_ui", multi_stock_engine.get_nifty50_news, 10, timeout=3, ttl=120, default=None)
-                if _nres is not None:
-                    st.session_state["_nifty50_news_cache"], st.session_state["_nifty50_news_status"] = _nres
+            if _refresh_nifty_news:
+                _n50_news, _n50_news_status = multi_stock_engine.get_nifty50_news(limit=10)       # user asked for fresh headlines
+                st.session_state["_nifty50_news_cache"] = _n50_news
+                st.session_state["_nifty50_news_status"] = _n50_news_status
+            else:        # same shared, time-limited fetch the AI engine uses (never blocks the page for more than a few seconds)
+                _n50_res_ui = safe_io.guarded("n50_news_ai", multi_stock_engine.get_nifty50_news, 10, timeout=3, ttl=300, default=([], "loading"))
+                st.session_state["_nifty50_news_cache"] = (_n50_res_ui or ([], ""))[0]
+                st.session_state["_nifty50_news_status"] = (_n50_res_ui or ([], ""))[1]
             _n50_news = st.session_state.get("_nifty50_news_cache", [])
             if not _n50_news:
                 st.info("NIFTY 50 news unavailable from the current RSS source right now.")
@@ -2171,16 +2160,16 @@ def _live_dashboard():
             st.caption("Real NIFTY 50 nahi ek single company hai, isliye ek official PE/EPS nahi hota — ye "
                        "asli 50 constituents ke fundamentals ka equal-weight average hai, honestly labelled "
                        "as an aggregate (Nifty ke official index-weighted number se alag).")
-            _refresh_nifty_fund = st.button("🔄 Refresh NIFTY 50 Fundamentals (slow — ~50 stocks)", key="refresh_nifty50_fund")
-            if _refresh_nifty_fund or "_nifty50_fund_cache" not in st.session_state:
-                # SPEED: this used to download 50 stocks' fundamentals from Yahoo INSIDE the page run (up to 45 s, every new session, and again after
-                # every failure -- Yahoo answers 401 right now), so everything below it and the Upstox-login page stayed blank.  Same data, same
-                # function -- now fetched in the background (one fetch shared by all sessions); the page never waits for it.
-                _fres = safe_io.guarded("n50_fund_ui", multi_stock_engine.get_nifty50_fundamentals, 50,
-                                        timeout=(40 if _refresh_nifty_fund else 0.5), ttl=(0 if _refresh_nifty_fund else 600), default=None)
-                if _fres is not None:
-                    st.session_state["_nifty50_fund_cache"] = _fres
-            _n50_fund = st.session_state.get("_nifty50_fund_cache") or {"status": "UNAVAILABLE", "reason": "Background me load ho raha hai -- 30 sec me apne aap aa jayega (ya 'Refresh' dabao)."}
+            _refresh_nifty_fund = st.button("🔄 Refresh NIFTY 50 Fundamentals (background me chalta hai)", key="refresh_nifty50_fund")
+            # Never blocks the page: shows the newest real snapshot (with its age) and refreshes it in a background thread.
+            _fv, _fage, _floading = multi_stock_engine.get_nifty50_fundamentals_cached(force_refresh=bool(_refresh_nifty_fund))
+            if _fv is not None:
+                st.session_state["_nifty50_fund_cache"] = _fv
+                _age_txt = (f"{int(_fage // 60)} min" if _fage < 3600 else f"{_fage / 3600:.1f} ghante") if _fage is not None else "?"
+                st.caption(f"🕒 Snapshot {_age_txt} purana" + (" · naya snapshot background me load ho raha hai..." if _floading else " (fundamentals hafton/quarter me badalte hain, isliye ye sahi hai)"))
+            elif _floading:
+                st.info("⏳ 50 stocks ke fundamentals background me load ho rahe hain -- page ko rokta nahi. Thodi der me apne aap aa jayenge.")
+            _n50_fund = st.session_state.get("_nifty50_fund_cache") or {"status": "UNAVAILABLE", "reason": "Abhi load ho raha hai / mila nahi -- thodi der baad dekho ya refresh dabao."}
             if _n50_fund.get("status") != "AVAILABLE":
                 st.warning(_n50_fund.get("reason") or "NIFTY 50 fundamentals unavailable right now.")
             else:

@@ -305,20 +305,6 @@ import threading as _sb_threading
 _SB_READ_CACHE = {}
 _SB_READ_LOCK = _sb_threading.Lock()
 _SB_READ_TTL = 12
-# SPEED: the full-history reads (every trade + its big factors_json) were re-downloaded from Supabase every refresh even though the history only
-# changes when a trade is written -- and every write already calls _sb_cache_clear().  So these may live much longer; open-trade reads stay at 12 s.
-_SB_READ_TTL_HEAVY = 300
-_SB_HEAVY_FUNCS = {"_sb_resolved_factors_status", "_sb_status_counts", "_sb_recent"}
-
-
-import functools as _sb_functools
-
-
-@_sb_functools.lru_cache(maxsize=8192)
-def _parse_factors(factors_json):
-    """json.loads of one factors_json string, remembered (was: re-parsed once per factor key per row on every refresh).
-    READ-ONLY callers only -- the returned dict is shared, never modify it."""
-    return json.loads(factors_json)
 
 
 def _sb_cache_clear():
@@ -332,7 +318,7 @@ def _sb_read_cached(fn):
         now = _sb_time.time()
         with _SB_READ_LOCK:
             hit = _SB_READ_CACHE.get(key)
-            if hit and now - hit[0] < (_SB_READ_TTL_HEAVY if fn.__name__ in _SB_HEAVY_FUNCS else _SB_READ_TTL):
+            if hit and now - hit[0] < _SB_READ_TTL:
                 return hit[1]
         value = fn(*args, **kwargs)
         with _SB_READ_LOCK:
@@ -780,7 +766,7 @@ def get_factor_reliability():
         true_wins, true_losses, true_total = 0, 0, 0
         for factors_json, status in rows:
             try:
-                factors = _parse_factors(factors_json) if isinstance(factors_json, str) else factors_json
+                factors = json.loads(factors_json) if isinstance(factors_json, str) else factors_json
             except Exception:
                 logger.exception("Broad exception caught; fallback path executed")
                 continue
@@ -877,7 +863,7 @@ def get_learning_summary():
         n = 0
         for factors_json, _status in rows:
             try:
-                factors = _parse_factors(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+                factors = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
             except Exception:
                 logger.exception("Broad exception caught; fallback path executed")
                 continue
@@ -888,7 +874,7 @@ def get_learning_summary():
     reversal_samples = reversal_wins = reversal_losses = 0
     for factors_json, status in rows:
         try:
-            f = _parse_factors(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+            f = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
             if (f.get("_learning_meta") or {}).get("immediate_reversal_observed"):
                 reversal_samples += 1
                 reversal_wins += int(status == "WIN")
@@ -916,7 +902,7 @@ def _factor_bayesian_reliability(rows, key):
     true_wins = true_n = false_wins = false_n = 0
     for factors_json, status in rows:
         try:
-            factors = _parse_factors(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+            factors = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
         except Exception:
             logger.exception("Broad exception caught; fallback path executed")
             continue
@@ -952,14 +938,14 @@ def _labelled_rows_full(include_shadow=True):
         if status not in ("WIN", "LOSS"):
             continue
         try:
-            f = _parse_factors(factors_json) if isinstance(factors_json, str) else (factors_json or {})
+            f = json.loads(factors_json) if isinstance(factors_json, str) else (factors_json or {})
         except Exception:
             continue
         if not isinstance(f, dict):
             continue
         real.append({"flags": {k: v for k, v in f.items() if not str(k).startswith("_")}, "label": 1 if status == "WIN" else 0,
                      "weight": 1.0, "version": (f.get("_entry_meta") or {}).get("logic_version"),
-                     "feats": dict(f["_features"]) if isinstance(f.get("_features"), dict) else None, "source": "real"})   # copy: f is the shared parsed dict
+                     "feats": f.get("_features") if isinstance(f.get("_features"), dict) else None, "source": "real"})
     return out + real[-LEARNING_WINDOW:]
 
 

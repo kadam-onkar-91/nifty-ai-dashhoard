@@ -143,29 +143,75 @@ def _write_disk(rows):
         logger.exception("could not write stock universe cache (ignored)")
 
 
-def load_universe(force=False):
-    """List of dicts {symbol, name, isin, instrument_key, lot_size, tick_size}.  Never raises, never empty."""
-    now = time.time()
+_BG = {"thread": None}
+
+
+def _bg_refresh():
+    """Download the full NSE list in a background thread (never holds _LOCK while the network call runs)."""
+    try:
+        rows = _download()
+        _write_disk(rows)
+        with _LOCK:
+            _MEM.update(ts=time.time(), data=rows, source="Upstox instrument master (live)")
+    except Exception:
+        logger.exception("Upstox instrument master background download failed (will retry later)")
+        with _LOCK:
+            if _MEM.get("data"):                     # keep what we have, retry in 10 min
+                _MEM["ts"] = time.time() - CACHE_TTL_S + 600
+
+
+def _kick_bg_refresh():
     with _LOCK:
-        if not force and _MEM["data"] and now - _MEM["ts"] < CACHE_TTL_S:
-            return _MEM["data"]
-        disk_ts, disk_rows = _read_disk()
-        if not force and disk_rows and now - disk_ts < CACHE_TTL_S:
-            _MEM.update(ts=disk_ts, data=disk_rows, source="disk cache")
-            return disk_rows
+        t = _BG["thread"]
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=_bg_refresh, name="nse-universe-loader", daemon=True)
+        _BG["thread"] = t
+        t.start()
+
+
+def wait_for_full_list(timeout=20.0):
+    """Block (at most `timeout` s) until the background download has finished.  Only used when ONE specific stock must be resolved."""
+    t = _BG.get("thread")
+    if t is not None and t.is_alive():
+        t.join(timeout)
+
+
+def load_universe(force=False):
+    """List of dicts {symbol, name, isin, instrument_key, lot_size, tick_size}.  Never raises, never empty.
+    LOAD SPEED: this used to download the whole Upstox NSE file (up to 25 s) BEFORE the page could draw anything.  Now it answers
+    at once from memory / disk (even an old copy) / the bundled list, and refreshes the full list in a background thread.
+    force=True still downloads synchronously."""
+    now = time.time()
+    if force:
         try:
             rows = _download()
             _write_disk(rows)
-            _MEM.update(ts=now, data=rows, source="Upstox instrument master (live)")
+            with _LOCK:
+                _MEM.update(ts=time.time(), data=rows, source="Upstox instrument master (live)")
             return rows
         except Exception:
-            logger.exception("Upstox instrument master unavailable -- using older copy / fallback list")
-        if disk_rows:
-            _MEM.update(ts=now - CACHE_TTL_S + 600, data=disk_rows, source="older disk cache")
+            logger.exception("Upstox instrument master unavailable (force) -- using what we have")
+    with _LOCK:
+        if _MEM["data"] and now - _MEM["ts"] < CACHE_TTL_S:
+            return _MEM["data"]
+        stale_mem = _MEM["data"]
+    disk_ts, disk_rows = _read_disk()
+    with _LOCK:
+        if disk_rows and now - disk_ts < CACHE_TTL_S:
+            _MEM.update(ts=disk_ts, data=disk_rows, source="disk cache")
             return disk_rows
-        rows = _fallback_rows()
-        _MEM.update(ts=now - CACHE_TTL_S + 300, data=rows, source="bundled fallback list")      # retry download in 5 min
-        return rows
+        if stale_mem:                                  # expired copy in memory: serve it now, refresh in the background
+            _MEM["ts"] = now - CACHE_TTL_S + 120       # do not trigger again for 2 minutes
+            data = stale_mem
+        elif disk_rows:                                # expired copy on disk: serve it now, refresh in the background
+            _MEM.update(ts=now - CACHE_TTL_S + 120, data=disk_rows, source="older disk cache (refreshing)")
+            data = disk_rows
+        else:                                          # nothing at all (fresh server): bundled list now, real list in ~seconds
+            data = _fallback_rows()
+            _MEM.update(ts=now - CACHE_TTL_S + 20, data=data, source="bundled list (full NSE list loading in background)")
+    _kick_bg_refresh()
+    return data
 
 
 def universe_source():
@@ -186,6 +232,8 @@ def resolve(raw):
     sym = clean_symbol(raw)
     if not sym:
         return {}
+    if str(_MEM.get("source", "")).startswith("bundled list"):
+        wait_for_full_list(20.0)                       # one specific stock needs its real instrument key
     hit = _index().get(sym)
     if hit:
         return dict(hit, known=True)
@@ -2214,26 +2262,15 @@ _GLOBAL = {"t": 0.0, "v": None, "tn": 0.0, "sent": None, "head": ""}
 _GLOBAL_LOCK = threading.Lock()
 _RESULTS = {}                # symbol -> {"t","ctx","extra","gscore"}  (latest robot result, read by the dashboard)
 _INFLIGHT = {}               # symbol -> Future
-_PAGE_BUSY = {"since": 0.0, "n": 0}  # set by the Nifty page while it is loading -> the robot lets it finish first (bounded wait)
+_PAGE_BUSY = {"since": 0.0}  # set by the Nifty page while it is loading -> the robot lets it finish first (bounded wait)
 _HEAVY = threading.Semaphore(1)   # at most 2 stocks run the CPU-heavy part (41 strategies + ML + decision) at the same moment
 
 
 def page_busy(flag):
-    # COUNTER, not a single flag: with two pages open (your phone + the keep-open robot tab) the first one to finish used to clear the flag
-    # while the other was still loading, so the watchlist robot started its CPU-heavy work in the middle of the page load.
-    now = time.time()
-    if flag:
-        if not _PAGE_BUSY["since"] or now - _PAGE_BUSY["since"] > 400:
-            _PAGE_BUSY["n"] = 0                         # a run that was cut off never called page_busy(False) -> forget it
-        _PAGE_BUSY["n"] += 1
-        _PAGE_BUSY["since"] = now
-    else:
-        _PAGE_BUSY["n"] = max(0, _PAGE_BUSY["n"] - 1)
-        if _PAGE_BUSY["n"] == 0:
-            _PAGE_BUSY["since"] = 0.0
+    _PAGE_BUSY["since"] = time.time() if flag else 0.0
 
 
-def _yield_to_page(max_wait=75.0):
+def _yield_to_page(max_wait=45.0):
     t0 = time.time()
     while time.time() - t0 < max_wait:
         s = _PAGE_BUSY["since"]

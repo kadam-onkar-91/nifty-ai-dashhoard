@@ -260,7 +260,7 @@ def _get_nifty50_constituents():
     return NIFTY50_CONSTITUENTS, 'Bundled NIFTY 50 fallback list'
 
 
-def _nifty50_fundamentals(limit=50):
+def _nifty50_fundamentals(limit=50, force=False):
     """Build a transparent NIFTY 50 constituent fundamental snapshot.
 
     Yahoo does not expose the official live NIFTY 50 weight table through this
@@ -269,7 +269,7 @@ def _nifty50_fundamentals(limit=50):
     """
     fields=['marketCap','trailingPE','forwardPE','priceToBook','returnOnEquity','profitMargins','revenueGrowth','earningsGrowth','debtToEquity','dividendYield']
     now=_time.time()
-    if _FUND_CACHE['value'] is not None and now-_FUND_CACHE['ts']<_FUND_TTL and _FUND_CACHE.get('limit')==limit:
+    if (not force) and _FUND_CACHE['value'] is not None and now-_FUND_CACHE['ts']<_FUND_TTL and _FUND_CACHE.get('limit')==limit:
         return _FUND_CACHE['value']
     constituents, constituent_source = _get_nifty50_constituents()
 
@@ -340,6 +340,100 @@ def get_nifty50_fundamentals(limit=50):
     number -- same real data the per-stock dashboard already computes but
     never displayed anywhere until now."""
     return _nifty50_fundamentals(limit=limit)
+
+
+# ---------------------------------------------------------------------
+# LOAD SPEED: non-blocking access to the slow, slow-moving data (50-stock fundamentals, news).
+# Fundamentals change over weeks/quarters, not seconds, so a copy that is minutes/hours old is still correct -- but it is always shown
+# WITH its age, and it is refreshed in a background thread.  The page never waits for it (it used to wait up to ~50 s on every new visit).
+# A copy is also kept on disk, so a restart of the app process shows the last real snapshot at once while the new one loads.
+# ---------------------------------------------------------------------
+import json as _json
+import os as _os
+import tempfile as _tempfile
+
+_FUND_DISK = _os.path.join(_tempfile.gettempdir(), "nifty50_fundamentals_snapshot_v1.json")
+_FUND_BG = {"thread": None, "last_try": 0.0}
+_FUND_LOCK = _threading.Lock()
+_FUND_RETRY_S = 90          # a failed/empty background load is retried after this many seconds
+
+
+def _fund_read_disk():
+    try:
+        with open(_FUND_DISK, "r", encoding="utf-8") as fh:
+            j = _json.load(fh)
+        v = j.get("value")
+        if isinstance(v, dict) and v.get("status") == "AVAILABLE":
+            return float(j.get("ts", 0.0)), v
+    except Exception:
+        pass
+    return 0.0, None
+
+
+def _fund_write_disk(ts, value):
+    try:
+        tmp = _FUND_DISK + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            _json.dump({"ts": ts, "value": value}, fh)
+        _os.replace(tmp, _FUND_DISK)
+    except Exception:
+        logger.exception("could not write NIFTY 50 fundamentals snapshot (ignored)")
+
+
+def _fund_bg_job(force=False):
+    try:
+        out = _nifty50_fundamentals(limit=50, force=bool(force))
+        if isinstance(out, dict) and out.get("status") == "AVAILABLE" and out.get("coverage", 0) > 0:
+            _fund_write_disk(_time.time(), out)
+    except Exception:
+        logger.exception("NIFTY 50 fundamentals background load failed (ignored)")
+
+
+def get_nifty50_fundamentals_cached(force_refresh=False):
+    """NEVER blocks.  Returns (value_or_None, age_seconds_or_None, loading_bool).
+    value is the newest real snapshot we have (memory -> disk); a refresh runs in a background thread when it is older than the TTL."""
+    now = _time.time()
+    value, ts = _FUND_CACHE.get("value"), _FUND_CACHE.get("ts", 0.0)
+    if value is None or _FUND_CACHE.get("limit") != 50:
+        d_ts, d_val = _fund_read_disk()
+        if d_val is not None:
+            value, ts = d_val, d_ts
+            _FUND_CACHE.update(ts=d_ts, value=d_val, limit=50)      # also serves the normal get_nifty50_fundamentals() path
+    age = (now - ts) if value is not None else None
+    need = force_refresh or value is None or (age is not None and age >= _FUND_TTL)
+    with _FUND_LOCK:
+        t = _FUND_BG["thread"]
+        running = t is not None and t.is_alive()
+        if need and not running and (force_refresh or now - _FUND_BG["last_try"] >= _FUND_RETRY_S):
+            _FUND_BG["last_try"] = now
+            t = _threading.Thread(target=_fund_bg_job, args=(bool(force_refresh),), name="n50-fund-loader", daemon=True)
+            _FUND_BG["thread"] = t
+            t.start()
+            running = True
+    return value, age, running
+
+
+_PREWARM = {"started": False}
+
+
+def prewarm_background():
+    """Start (once per server process) the slow loads in the background so they are ready by the time they are needed."""
+    if _PREWARM["started"]:
+        return False
+    _PREWARM["started"] = True
+
+    def _job():
+        try:
+            get_nifty50_fundamentals_cached()
+        except Exception:
+            logger.exception("prewarm: fundamentals (ignored)")
+        try:
+            _nifty_news(limit=10)
+        except Exception:
+            logger.exception("prewarm: news (ignored)")
+
+    _threading.Thread(target=_job, name="n50-prewarm", daemon=True).start()
+    return True
 
 
 # ---------------------------------------------------------------------
