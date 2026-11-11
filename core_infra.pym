@@ -57,21 +57,9 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
 
 logger = logging.getLogger(__name__)
 
-_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="safe-io")   # 10 watchlist stocks + dashboard + Nifty share it
+_POOL = ThreadPoolExecutor(max_workers=10, thread_name_prefix="safe-io")
 _LOCK = threading.RLock()     # RLock: add_done_callback() runs the callback inline when the job already finished
 _STATE = {}          # key -> {"has": bool, "value": any, "ts": float, "fut": Future|None, "last_ms": float, "last_status": str}
-
-
-_ONCE = set()
-
-
-def once(name):
-    """True the first time `name` is asked in this server process, False afterwards (used to start one-off background work)."""
-    with _LOCK:
-        if name in _ONCE:
-            return False
-        _ONCE.add(name)
-        return True
 
 
 def _attach_streamlit_ctx(ctx):
@@ -140,61 +128,9 @@ def status(key):
         return None if s is None else {"last_ms": s["last_ms"], "status": s["last_status"], "has_value": s["has"]}
 
 
-_RUN_STATS = {"last_total": None, "ema": None, "rows": [], "runs": 0}   # process-wide: a new session starts knowing how long a refresh really takes
-
-
-def suggested_refresh(is_live, live_min=30, closed_min=180, cap=300):
-    """Fragment timer in seconds.  A timer shorter than one run makes Streamlit restart the run before it finishes (the page then never gets
-    past the middle of the pipeline and 'refresh' loops forever).  So: the timer = max(normal timer, 1.4 x measured run time + 8 s).
-    Before any run has been measured the first run gets a roomy timer (cold start is the slowest)."""
-    base = live_min if is_live else closed_min
-    ema = _RUN_STATS.get("ema")
-    if ema is None:
-        return max(base, 120)
-    return int(min(cap, max(base, ema * 1.4 + 8)))
-
-
-# ---- who is looking at the app? --------------------------------------------------------------------------------------------------------
-# Your own tab and the GitHub "robot tab" both run the WHOLE heavy pipeline, on one small shared server (the log showed two copies of every
-# step running at once -> every run 2-5x slower).  While a human tab is actively running the engine, the robot tab only shows a light
-# "standby" page (and still prints the IST heartbeat the robot checks); the moment the human tab is gone, the robot runs the engine again.
-_SESS = {"human_start": 0.0, "human_done": 0.0, "robot_done": 0.0}
-
-
-def run_started(robot):
-    if not robot:
-        _SESS["human_start"] = time.time()
-
-
-def run_aborted(robot):
-    """Always called when a run ends (finished, interrupted or crashed): a run that is no longer running must not look 'in progress'."""
-    if not robot:
-        _SESS["human_start"] = 0.0
-
-
-def run_completed(robot):
-    if robot:
-        _SESS["robot_done"] = time.time()
-    else:
-        _SESS["human_done"] = time.time()
-
-
-def human_active(window=None):
-    """True while a NON-robot tab is running the engine (a run in progress, or one that completed recently)."""
-    now = time.time()
-    st_ = _SESS["human_start"]
-    if st_ and now - st_ < 600:
-        return True
-    if window is None:
-        ema = _RUN_STATS.get("ema") or 60.0
-        window = max(90.0, 1.4 * ema + 40.0)          # a bit longer than one human refresh timer
-    return (now - _SESS["human_done"]) < window
-
-
 class Stepper:
     """Records step durations of one refresh and renders them.  Usage:
          sp = Stepper(placeholder); sp.step("Option chain"); ...; sp.step("Strategy engine"); ...; sp.done()
-    While loading it also shows the slowest finished steps so far, so the slow source is visible even if the run never completes.
     """
 
     def __init__(self, placeholder=None):
@@ -208,18 +144,10 @@ class Stepper:
         now = time.time()
         if self.cur is not None:
             self.rows.append((self.cur, now - self.last_t))
-            try:                               # print -> shows in the Streamlit Cloud log ("Manage app" -> logs): every step with its seconds
-                print(f"[STEP] {self.cur}: {now - self.last_t:.1f}s (total {now - self.t0:.0f}s)", flush=True)
-            except Exception:
-                pass
         self.cur, self.last_t = label, now
         if self.ph is not None:
             try:
-                txt = f"⏳ Loading: **{label}** ... (total {now - self.t0:.0f}s so far)"
-                slow = sorted((r for r in self.rows if r[1] >= 2), key=lambda r: -r[1])[:3]
-                if slow:
-                    txt += " | slow so far: " + ", ".join(f"{n} {d:.1f}s" for n, d in slow)
-                self.ph.caption(txt)
+                self.ph.caption(f"⏳ Loading: **{label}** ... (total {now - self.t0:.0f}s so far)")
             except Exception:
                 pass
 
@@ -227,22 +155,8 @@ class Stepper:
         now = time.time()
         if self.cur is not None:
             self.rows.append((self.cur, now - self.last_t))
-            try:                               # the LAST step used to be missing from the log -> the biggest chunk was invisible
-                print(f"[STEP] {self.cur}: {now - self.last_t:.1f}s (total {now - self.t0:.0f}s)", flush=True)
-            except Exception:
-                pass
             self.cur = None
         total = now - self.t0
-        try:
-            print(f"[STEP] DONE total {total:.1f}s", flush=True)
-        except Exception:
-            pass
-        try:                                   # remember how long a full run takes (smoothed) -> suggested_refresh()
-            prev = _RUN_STATS.get("ema")
-            _RUN_STATS.update(last_total=total, ema=(total if prev is None else 0.5 * prev + 0.5 * total), rows=list(self.rows),
-                              runs=_RUN_STATS.get("runs", 0) + 1)
-        except Exception:
-            pass
         slow = sorted(self.rows, key=lambda r: -r[1])[:3]
         txt = f"✅ Page {total:.1f}s me load hua"
         if slow and total >= 8:

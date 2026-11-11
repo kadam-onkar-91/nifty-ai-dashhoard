@@ -25,7 +25,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 MORNING_END = (13, 50)     # the morning session stops here; the afternoon session (queued behind it) takes over
 AFTERNOON_END = (15, 35)
 SPLIT_AT = (13, 45)        # a run that starts before this is the "morning" session
-RELOAD_EVERY_MIN = 120     # a fresh page every so often, in case the websocket died silently.  (Was 30: every reload = a brand-new heavy session on the app.)
+RELOAD_EVERY_MIN = 30      # a fresh page every so often, in case the websocket died silently
 CHECK_EVERY_S = 60
 
 
@@ -54,11 +54,7 @@ def log(msg: str) -> None:
 
 
 HEARTBEAT_RE = re.compile(r"IST Time:\s*(\d{2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2})")
-MAX_LAG_S = 420            # the dashboard prints its own IST clock every cycle; a heavy refresh really takes 60-150 s on the free server, so only a clock
-                           # older than this means "stopped".  (Was 180: the robot kept reloading a page that was only BUSY, and every reload started one more
-                           # heavy session while the old one was still running -> the dashboard got slower and slower.)
-LAG_FAILS_BEFORE_RELOAD = 4   # a merely-late clock must be late on this many checks IN A ROW (1 per minute) before the page is reloaded
-ROBOT_QUERY = "robot=1"    # tells the app "this is the robot tab": it idles in standby while a person's tab is running the engine (see app.py)
+MAX_LAG_S = 180            # the dashboard prints its own IST clock every cycle (~30 s); older than this = it stopped processing
 
 
 def parse_heartbeat(body: str, now: datetime):
@@ -73,13 +69,6 @@ def parse_heartbeat(body: str, now: datetime):
         return None
 
 
-def add_robot_flag(url: str) -> str:
-    """APP_URL + ?robot=1 (keeps any query string the link already has)."""
-    if re.search(r"(^|[?&])robot=", url):
-        return url
-    return url + ("&" if "?" in url else "?") + ROBOT_QUERY
-
-
 def main() -> int:
     url = (os.environ.get("APP_URL") or "").strip()
     if not url.startswith("http"):
@@ -90,7 +79,6 @@ def main() -> int:
         log("APP_URL is the Streamlit DASHBOARD link (share.streamlit.io), not your app's own link. Open your app, copy the address "
             "that ends with .streamlit.app and put THAT in the APP_URL variable.")
         return 1
-    url = add_robot_flag(url)
     log(f"App host: {host}")
     now = ist_now()
     if is_skip_day(now, os.environ.get("SKIP_DATES")):
@@ -184,11 +172,8 @@ def main() -> int:
             log("Streamlit app not visible yet (app may still be starting).")
             diag("open")
 
-        soft = {"v": False}      # True when the last failure was only "clock late" (page may just be busy), not a broken page
-
         def healthy():
             """-> (ok, note).  ok=False when the page is broken OR the dashboard's own IST clock stopped moving (engine not cycling)."""
-            soft["v"] = False
             try:
                 scope = app_scope()
                 if scope is None:
@@ -200,7 +185,6 @@ def main() -> int:
                 if lag is None:
                     return True, "heartbeat not visible yet"
                 if lag > MAX_LAG_S:
-                    soft["v"] = True
                     return False, f"dashboard clock is {lag:.0f}s behind -> not refreshing"
                 note = f"engine heartbeat OK (clock lag {max(lag, 0):.0f}s)"
                 if "DATA STALE/FROZEN" in body:
@@ -232,16 +216,12 @@ def main() -> int:
                 ok, note = healthy()
                 if not ok:
                     fails += 1
-                    need = LAG_FAILS_BEFORE_RELOAD if soft["v"] else 2      # a broken page: reload on the 2nd check; a merely busy one: be patient
-                    if fails < need:
-                        log(f"Page not healthy (#{fails}): {note} -> checking again in a minute (reload only after {need} in a row).")
-                        if fails == 1:
-                            diag("unhealthy")
+                    if fails == 1:
+                        log(f"Page not healthy (#1): {note} -> checking again in a minute.")
+                        diag("unhealthy")
                         continue
                     log(f"Page not healthy (#{fails}): {note} -> reloading.")
                     open_app(); last_reload = time.time()
-                    if soft["v"]:
-                        fails = 0           # only "late": start counting again.  A BROKEN page keeps its count so that after 2 failed reloads the tab is rebuilt
                     continue
                 fails = 0
                 if time.time() - last_reload > RELOAD_EVERY_MIN * 60:

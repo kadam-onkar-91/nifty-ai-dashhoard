@@ -52,26 +52,9 @@ import trade_notify
 from ai_chat import render_ai_chat
 import ui_theme
 import live_chart
-import stock_universe          # Phase 1: every NSE stock + search
-import stock_watchlist         # Phase 4: robot watchlist (background stocks)
-import stock_dashboard         # Phase 1: stock dashboard in the Nifty layout
-import warnings as _warn_quiet
-_warn_quiet.filterwarnings("ignore", category=ResourceWarning)    # thousands of "unclosed database" lines flooded the log on every refresh
-import logging as _lg_quiet
-for _n in ("streamlit.runtime.scriptrunner_utils.script_run_context", "streamlit.runtime.scriptrunner.script_run_context"):
-    _lg_quiet.getLogger(_n).setLevel(_lg_quiet.ERROR)    # robot threads have no page context -> hundreds of harmless "missing ScriptRunContext" log lines
 
 # Page Configuration
 st.set_page_config(page_title="Nifty 50 Real-Time AI Predictor", page_icon="⚡", layout="wide")
-
-# Robot tab (GitHub Actions keep_open.py opens the app with ?robot=1).  Remembered in session_state because the query string can be cleared
-# later (the Upstox login redirect clears it).
-if "_is_robot" not in st.session_state:
-    try:
-        st.session_state["_is_robot"] = str(st.query_params.get("robot", "")).strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        st.session_state["_is_robot"] = False
-_IS_ROBOT = bool(st.session_state.get("_is_robot"))
 
 st.markdown("""
     <style>
@@ -151,14 +134,8 @@ trade_learning.configure_supabase(
     st.secrets.get("SUPABASE_KEY", None)
 )
 
-try:        # LOAD SPEED: slow, slow-moving data (NSE stock list, 50-stock fundamentals, NIFTY news) loads in the BACKGROUND, once per server process
-    stock_universe.load_universe()               # instant (memory / disk / bundled list); the full list downloads in a background thread
-    multi_stock_engine.prewarm_background()
-except Exception:
-    logger.exception("prewarm failed (ignored)")
-
 ui_theme.inject_theme()   # premium dark-glass look + animations
-# (hero banner is drawn right after the sidebar below, so it already knows which stock is active)
+ui_theme.render_hero()    # animated hero banner (presentation only)
 
 # -------------------------------------------------------------
 # 🔎 SELECT YOUR STOCK -- primary sidebar entry point (works the moment
@@ -171,17 +148,12 @@ ui_theme.inject_theme()   # premium dark-glass look + animations
 # -------------------------------------------------------------
 with st.sidebar:
     st.markdown("### 🔎 Select Your Stock")
-    # Phase 1: searchable list of EVERY NSE stock (type a few letters of the symbol OR the company name), plus a free-text
-    # box for anything not in the list.  Same Load Stock / Nifty 50 buttons as before.
-    _stk_pairs = stock_universe.option_labels()
-    _stk_label_to_sym = dict(_stk_pairs)
-    _stk_pick = st.selectbox(
-        "Select your stocks", options=[l for l, _ in _stk_pairs], index=None, key="sidebar_stock_pick",
-        placeholder="Stock ka naam / symbol type karo (RELIANCE, TCS, Tata...)",
-        help=f"{len(_stk_pairs)} NSE stocks. Type karte hi list filter hoti hai -- symbol ya company naam dono chalte hain.")
-    _stk_typed = st.text_input("ya seedha symbol likho", placeholder="e.g. RELIANCE, TCS, HDFCBANK, M&M", key="sidebar_stock_input",
-                               help="Agar stock upar list me na mile to yahan NSE symbol likh do.")
-    _sidebar_symbol_raw = stock_universe.clean_symbol(_stk_typed) or _stk_label_to_sym.get(_stk_pick, "")
+    _sidebar_symbol_raw = st.text_input(
+        "Select your stocks",
+        placeholder="e.g. RELIANCE, TCS, HDFCBANK",
+        key="sidebar_stock_input",
+        help="Koi bhi NSE stock ka naam/symbol daalo — poora dashboard usi stock ka ban jaayega, ekdum Nifty 50 wale jaisa hi.",
+    ).strip().upper()
     _sb_col1, _sb_col2 = st.columns(2)
     with _sb_col1:
         if st.button("Load Stock", key="sidebar_load_stock_btn", width="stretch") and _sidebar_symbol_raw:
@@ -192,32 +164,10 @@ with st.sidebar:
             st.session_state["active_symbol"] = None
     if st.session_state.get("active_symbol"):
         st.success(f"Active dashboard: **{st.session_state['active_symbol']}**")
-        try:                                     # one-click add / remove of the stock that is open right now
-            _wl_sym = stock_universe.clean_symbol(st.session_state["active_symbol"])
-            if _wl_sym in stock_watchlist.list_symbols():
-                if st.button(f"🗑 {_wl_sym} ko Robot Watchlist se hatao", key="wl_toggle_btn", width="stretch"):
-                    stock_watchlist.remove(_wl_sym)
-                    st.rerun()
-            elif st.button(f"⭐ {_wl_sym} ko Robot Watchlist me add karo", key="wl_toggle_btn", width="stretch"):
-                _ok, _msg = stock_watchlist.add(_wl_sym)
-                (st.success if _ok else st.warning)(_msg)
-                st.rerun()
-        except Exception:
-            logger.exception("watchlist toggle failed (ignored)")
     else:
         st.caption("Abhi Nifty 50 dashboard dikh raha hai.")
-    st.caption(f"📚 {len(_stk_pairs)} NSE stocks · {stock_universe.universe_source()}")
-    try:
-        stock_watchlist.ensure_runner(ai_engine, GEMINI_API_KEYS)     # one background robot thread (idempotent)
-        stock_watchlist.sidebar_panel()
-    except Exception:
-        logger.exception("watchlist panel failed (ignored)")
 
 ACTIVE_SYMBOL = st.session_state.get("active_symbol") or None
-if ACTIVE_SYMBOL:
-    stock_dashboard.render_stock_hero(stock_universe.clean_symbol(ACTIVE_SYMBOL))   # same hero, stock's name
-else:
-    ui_theme.render_hero()    # animated hero banner (presentation only)
 
 # -------------------------------------------------------------
 # LIVE DASHBOARD -- runs as an independent st.fragment that refreshes
@@ -231,104 +181,19 @@ else:
 # fragment (see bottom of file) means it now only re-renders when you
 # actually interact with it -- never on the 30s timer.
 # -------------------------------------------------------------
-# -------------------------------------------------------------
-# COLD-START PREWARM (once per server process, in a background thread).  The first page after a start used to do ALL of this one step after
-# the other while you waited: instrument master download, global markets/news, candles, ML training.  Now they start together the moment the
-# server starts (the page reuses the very same cached / single-flight results, nothing is computed twice).  Every step is optional: a failure
-# here only means the page does that step itself, exactly as before.
-# -------------------------------------------------------------
-def _prewarm_process():
-    import threading as _th
-    from concurrent.futures import ThreadPoolExecutor as _PW
-
-    def _t(label, fn):
-        _t0 = time.time()
-        try:
-            fn()
-            print(f"[PREWARM] {label}: {time.time() - _t0:.1f}s", flush=True)
-        except Exception as _e:
-            print(f"[PREWARM] {label} skipped: {type(_e).__name__}: {_e}", flush=True)
-
-    def _candles_and_ml():
-        _tok = None
-        try:
-            _tok = upstox_auth._stored_token() or upstox_auth._analytics_token()
-        except Exception:
-            _tok = None
-        if not _tok:
-            return
-        _df, _m, _f, _lp = market_data.fetch_live_market_data(_tok)
-        if _df is not None and not _df.empty:
-            _t("daily candles", lambda: market_data.fetch_daily_candles(_tok))
-            ml_engine.train_and_backtest(_df)             # starts the single-flight background training; the page joins it
-
-    _jobs = [
-        ("futures key", lambda: market_data._load_upstox_nifty_future_key()),
-        ("NSE equity map", lambda: market_breadth._load_upstox_nse_equity_map()),
-        ("global markets", lambda: safe_io.guarded("global_markets", global_markets.get_global_market_indices, timeout=30, ttl=25, default=pd.DataFrame())),
-        ("global news", lambda: safe_io.guarded("global_news", global_news.get_global_market_sentiment, timeout=30, ttl=170,
-                                                default=(pd.DataFrame(), "Global headline unavailable right now."))),
-        ("candles + ML", _candles_and_ml),
-    ]
-    with _PW(max_workers=4, thread_name_prefix="prewarm") as _pool:
-        for _label, _fn in _jobs:
-            _pool.submit(_t, _label, _fn)
-
-
-try:
-    if safe_io.once("prewarm_process"):
-        import threading as _th_pw
-        _th_pw.Thread(target=_prewarm_process, name="prewarm", daemon=True).start()
-except Exception:
-    logger.exception("prewarm could not start (ignored)")
-
 # Adaptive refresh: 30s while NSE is open/pre-open (live data matters); 180s when closed,
 # because nothing changes then and every refresh re-runs the whole heavy pipeline (~10-20s).
 try:
     _REFRESH_IS_LIVE = market_status.get_market_status()["state"] in ("OPEN", "PRE_OPEN")
 except Exception:
     _REFRESH_IS_LIVE = True
-_REFRESH_SEC = safe_io.suggested_refresh(_REFRESH_IS_LIVE)   # 30 s live / 180 s closed, but NEVER shorter than a refresh really takes (a timer shorter than the run kept interrupting it -> the page never finished)
-
-
-def _robot_standby_view():
-    """Light page for the robot tab while a person's tab is running the engine.  It still prints the 'IST Time: ...' heartbeat that
-    keep_open.py checks, so the robot knows this tab is alive."""
-    try:
-        _ms = market_status.get_market_status()
-        _line = f"{_ms['label']} | IST Time: {_ms['now_ist'].strftime('%d-%b-%Y %H:%M:%S')}"
-    except Exception:
-        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-        _line = "IST Time: " + (_dt.now(_tz.utc) + _td(hours=5, minutes=30)).strftime("%d-%b-%Y %H:%M:%S")
-    st.info("🤖 Robot tab STANDBY -- " + _line + " -- engine abhi aapke apne tab mein chal raha hai, isliye yeh tab CPU nahi kha raha "
-            "(dashboard tez rehta hai). Aapka tab band hote hi yeh robot tab khud poora engine sambhal leta hai.")
+_REFRESH_SEC = 30 if _REFRESH_IS_LIVE else 180
 
 
 @st.fragment(run_every=_REFRESH_SEC)
 def _live_dashboard():
-    """Entry point of the live dashboard fragment.  The robot tab idles while a human tab is running the engine (no double work on the same
-    small server); everything else runs the normal pipeline (_live_dashboard_body)."""
-    if _IS_ROBOT and safe_io.human_active():
-        _robot_standby_view()
-        return
-    safe_io.run_started(_IS_ROBOT)
-    try:
-        _live_dashboard_body()
-    finally:
-        safe_io.run_aborted(_IS_ROBOT)                  # a run that ended (finished / interrupted / crashed) is never 'in progress'
-        try:
-            stock_watchlist.page_busy(False)
-        except Exception:
-            pass
-
-
-def _live_dashboard_body():
     # Shows which step is running right now (so a slow data source is visible instead of a silent spinner) and,
     # once loaded, the slowest steps of this refresh.
-    try:
-        stock_watchlist.page_busy(True)      # the watchlist robot lets this page finish first (it never waits more than ~25 s for it)
-    except Exception:
-        pass
     _sp = safe_io.Stepper(st.empty())
     _sp.step("Broker login + live candles")
     if 'access_token' not in st.session_state:
@@ -396,7 +261,7 @@ def _live_dashboard_body():
         # below -- nothing breaks.
         # -------------------------------------------------------------
         try:
-            fut_volume = safe_io.guarded("fut_volume", market_data.fetch_nifty_futures_volume, access_token, timeout=6, ttl=20, default=None)
+            fut_volume = market_data.fetch_nifty_futures_volume(access_token)
             if fut_volume is not None and not fut_volume.empty and fut_volume.sum() > 0:
                 df['Volume'] = fut_volume.reindex(df.index, method='nearest', tolerance=pd.Timedelta(minutes=10))
                 df['Volume'] = df['Volume'].fillna(0)
@@ -433,55 +298,22 @@ def _live_dashboard_body():
             df['VWAP'] = df['EMA_20'] if 'EMA_20' in df.columns else df['Close']
             df['POC_Level'] = df['Close'].iloc[-1]
 
-        # LOAD SPEED: every independent data source below used to be fetched one AFTER the other (option chain, breadth 20 s + 20 s, Bank Nifty/Sensex,
-        # global news, global markets ...), so the page waited for the SUM of them.  They are all started together now and collected below -> the page
-        # waits only for the slowest one.  Same sources, same timeouts, same "last good value" fallbacks, same fresh data.
-        _sp.step("Option chain + breadth + global data (saath saath)")
-        from concurrent.futures import ThreadPoolExecutor as _LoadPool
-        try:
-            from streamlit.runtime.scriptrunner import get_script_run_ctx as _get_ctx
-            _load_ctx = _get_ctx()
-        except Exception:
-            _load_ctx = None
-        _load_pool = _LoadPool(max_workers=8, thread_name_prefix="nifty-load")
-
-        def _bg(fn, *a, **k):
-            def _job():
-                try:
-                    safe_io._attach_streamlit_ctx(_load_ctx)
-                except Exception:
-                    pass
-                return fn(*a, **k)
-            return _load_pool.submit(_job)
-
-        def _bank_sensex_job():
-            _nc = safe_io.guarded("nifty_change", index_correlation.get_nifty_change_pct, live_price, timeout=8, default=None)
-            return _nc, safe_io.guarded("bank_sensex", index_correlation.get_bank_nifty_sensex, access_token, _nc, timeout=8,
-                                        default=([], "Bank Nifty / Sensex data timed out (retrying in background)."))
-
-        _f_oc = _bg(option_chain.generate_option_chain_data, live_price)
-        _f_h = _bg(safe_io.guarded, "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=8,
-                   default=market_breadth.unavailable_heavyweights())
-        _f_50 = _bg(safe_io.guarded, "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=8,
-                    default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
-        _f_bank = _bg(_bank_sensex_job)
-        # ONE shared fetch for the Nifty page, the watchlist robot and the stock dashboard (same key + ttl): before, each of them downloaded the
-        # same 20+ Yahoo tickers on its own every 30 s, which got Yahoo to throttle ("timed out", "Invalid Crumb") and slowed everything.
-        _f_gnews = _bg(safe_io.guarded, "global_news", global_news.get_global_market_sentiment, timeout=8, ttl=170,
-                       default=(pd.DataFrame(), "Global headline unavailable right now."))
-        _f_gmk = _bg(safe_io.guarded, "global_markets", global_markets.get_global_market_indices, timeout=8, ttl=25, default=pd.DataFrame())
-        _load_pool.shutdown(wait=False)
-
-        fvg, ob, sweeps = smart_money.detect_smc_zones(df)          # (CPU work, overlaps with the fetches above)
-        df_option_chain, oc_source = _f_oc.result()
+        # Fetch Supporting Data for Confluence Engine
+        _sp.step("Option chain")
+        df_option_chain, oc_source = option_chain.generate_option_chain_data(live_price)
+        fvg, ob, sweeps = smart_money.detect_smc_zones(df)
         market_structure = smart_money.detect_market_structure(df)
         smc_event = market_structure[0]["Market Event"] if market_structure else "Neutral Structure"
 
         _sp.step("Market breadth (heavyweights + Nifty 50)")
         # Each source is wrapped: a slow one is skipped after `timeout` s (last good value / "unavailable") and keeps
         # loading in the background, instead of freezing the whole page.
-        df_heavyweights, advances, declines, breadth_ratio, breadth_status, heavyweights_debug = _f_h.result()
-        df_full50, adv50, dec50, ratio50, breadth50_status, full50_debug = _f_50.result()
+        df_heavyweights, advances, declines, breadth_ratio, breadth_status, heavyweights_debug = safe_io.guarded(
+            "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=20,
+            default=market_breadth.unavailable_heavyweights())
+        df_full50, adv50, dec50, ratio50, breadth50_status, full50_debug = safe_io.guarded(
+            "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=20,
+            default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
         max_pain = option_chain.calculate_max_pain(df_option_chain)
         fii_footprint, current_pcr = option_chain.get_fii_dii_fo_footprint(df_option_chain)
         try:
@@ -492,11 +324,15 @@ def _live_dashboard_body():
         # Bank Nifty / Sensex -- the biggest cross-index drivers of Nifty option
         # sentiment. Fetched Upstox-first (live) with Yahoo Finance fallback.
         _sp.step("Bank Nifty / Sensex")
-        nifty_change_pct, (index_correlation_data, banknifty_correlation_note) = _f_bank.result()
+        nifty_change_pct = safe_io.guarded("nifty_change", index_correlation.get_nifty_change_pct, live_price,
+                                           timeout=8, default=None)
+        index_correlation_data, banknifty_correlation_note = safe_io.guarded(
+            "bank_sensex", index_correlation.get_bank_nifty_sensex, access_token, nifty_change_pct, timeout=15,
+            default=([], "Bank Nifty / Sensex data timed out (retrying in background)."))
 
         _sp.step("Global news + markets")
-        df_global_sentiment, top_headline = _f_gnews.result()
-        df_global_markets = _f_gmk.result()
+        df_global_sentiment, top_headline = global_news.get_global_market_sentiment()
+        df_global_markets = global_markets.get_global_market_indices()
         global_sentiment_score, avg_market_change = global_markets.get_global_market_summary(df_global_markets)
         st.session_state["_last_global_avg_change"] = avg_market_change
         st.session_state["_last_sentiment_score"] = global_sentiment_score
@@ -537,7 +373,7 @@ def _live_dashboard_body():
             iv_source = atm_rows if not atm_rows.empty else df_option_chain
             mean_iv = iv_source['IV (%)'].mean()
             current_atm_iv = float(mean_iv) if pd.notna(mean_iv) and mean_iv > 0 else None
-        iv_percentile = safe_io.guarded("iv_percentile", option_chain.get_iv_percentile, current_atm_iv, timeout=5, ttl=60, default=None)
+        iv_percentile = option_chain.get_iv_percentile(current_atm_iv)
         sector_breadth = market_breadth.get_sector_breadth(df_full50)
 
         # -------------------------------------------------------------
@@ -811,21 +647,11 @@ def _live_dashboard_body():
         # extra quotes call for order_flow, everything else runs on data
         # already in trading_logs.db.
         # -------------------------------------------------------------
-        order_flow_snapshot = safe_io.guarded("order_flow", order_flow.get_order_flow_snapshot, access_token, timeout=7, ttl=4,
-                                              default={"status": "DATA_UNAVAILABLE", "reason": "Order book fetch timed out (retrying in background).",
-                                                       "instrument": None, "total_buy_qty": None, "total_sell_qty": None, "imbalance_pct": None,
-                                                       "pressure": None, "best_bid": None, "best_ask": None, "spread": None})
+        order_flow_snapshot = order_flow.get_order_flow_snapshot(access_token)
         closed_trades = database.fetch_all_closed_trades()
-        # These three only depend on the closed-trade list, which changes a few times a day -> compute once per change, not every refresh (same results).
-        _bt_key = hash(repr(closed_trades))
-        _bt_memo = st.session_state.get("_bt_memo")
-        if _bt_memo and _bt_memo[0] == _bt_key:
-            backtest_report, monte_carlo_report, drift_report = _bt_memo[1]
-        else:
-            backtest_report = backtest_engine.generate_backtest_report(closed_trades)
-            monte_carlo_report = monte_carlo.run_monte_carlo(closed_trades)
-            drift_report = drift_detection.check_for_drift(closed_trades)
-            st.session_state["_bt_memo"] = (_bt_key, (backtest_report, monte_carlo_report, drift_report))
+        backtest_report = backtest_engine.generate_backtest_report(closed_trades)
+        monte_carlo_report = monte_carlo.run_monte_carlo(closed_trades)
+        drift_report = drift_detection.check_for_drift(closed_trades)
 
         # -------------------------------------------------------------
         # PHASE 4 -- Multi-Timeframe Structure (real 1D/4H/1H/30M/15M/5M
@@ -835,9 +661,7 @@ def _live_dashboard_body():
         # risk + consecutive losses). All additive/read-only, same as
         # Phase 1-3.
         # -------------------------------------------------------------
-        mtf_structure = safe_io.guarded("mtf_structure", multi_timeframe.get_multi_timeframe_structure, access_token, timeout=10, ttl=45,
-                                        default={"status": "DATA_UNAVAILABLE", "reason": "Multi-timeframe candles timed out (retrying in background).",
-                                                 "timeframes": {}, "alignment": None})
+        mtf_structure = multi_timeframe.get_multi_timeframe_structure(access_token)
         default_capital = st.session_state.get('risk_capital', 100000.0)
         default_risk_pct = st.session_state.get('risk_pct', 1.0)
         position_size_result = position_sizing.calculate_position_size(
@@ -1437,13 +1261,6 @@ def _live_dashboard_body():
         # Uses the same real completed-candle/dashboard data. It is an
         # additional vote, never an all-factors hard gate.
         # -------------------------------------------------------------
-        try:                # non-blocking: newest real snapshot (memory/disk) if there is one, else the background load is simply still running
-            _n50_v, _n50_age, _n50_loading = multi_stock_engine.get_nifty50_fundamentals_cached()
-            if _n50_v is not None:
-                st.session_state["_nifty50_fund_cache"] = _n50_v
-                st.session_state["_nifty50_fund_age"] = _n50_age
-        except Exception:
-            logger.exception("fundamentals cache read failed (ignored)")
         _sp.step("Strategy engine (40 strategies)")
         strategy_result = strategy_engine.analyze(
             df, sr_context=sr_context, level_prediction=level_prediction,
@@ -1581,8 +1398,7 @@ def _live_dashboard_body():
             # not a separate gate -- see ai_trade_decision.py / trade_learning.py.
             _n50_news_for_ai = st.session_state.get("_nifty50_news_cache")
             if _n50_news_for_ai is None:
-                _n50_res = safe_io.guarded("n50_news_ai", multi_stock_engine.get_nifty50_news, 10, timeout=4, ttl=300, default=([], "timeout"))
-                _n50_news_for_ai = (_n50_res or ([], ""))[0]
+                _n50_news_for_ai, _ = multi_stock_engine.get_nifty50_news(limit=10)
             _n50_news_sent = multi_stock_engine.get_nifty50_news_sentiment(_n50_news_for_ai)
             _n50_fund_bias = multi_stock_engine.get_nifty50_fundamentals_bias(
                 st.session_state.get("_nifty50_fund_cache"))
@@ -1640,16 +1456,7 @@ def _live_dashboard_body():
             # -------------------------------------------------------------
             _gemini_review = {"status": "NOT_NEEDED", "approved": False, "reason": "No qualifying deterministic setup yet."}
             _pre_ok = bool(_decision.get('has_setup'))
-            # Market band (shaam/weekend/holiday): strategies still read the LAST session's candles, so a "setup" can exist on stale prices.
-            # No Gemini call, no trade, no Telegram alert and no shadow trade on stale data -- everything waits for the market to open.
-            try:
-                _mkt_open_for_trade = market_status.get_market_status().get("state") == "OPEN"
-            except Exception:
-                _mkt_open_for_trade = True
-            if _pre_ok and not _mkt_open_for_trade:
-                _decision = dict(_decision, has_setup=False, reason="Market abhi OPEN nahi hai -- Gemini review aur trade market khulne par hi hoga (band market ke purane candle par trade nahi).")
-                _gemini_review = {"status": "NOT_NEEDED", "approved": False, "reason": "Market closed -- review/trade market OPEN hone par."}
-            if not _pre_ok and _decision.get('candidate') and _mkt_open_for_trade:
+            if not _pre_ok and _decision.get('candidate'):
                 try:
                     shadow_trades.log(_decision['candidate'], ai_trade_decision.classify_block(_decision.get('reason')))
                 except Exception:
@@ -1824,7 +1631,6 @@ def _live_dashboard_body():
         except Exception:
             logger.exception('market brain failed (ignored)')
 
-        _sp.step("Panels: shadow trades / gates / timeline / track record")
         with st.expander("🕶️ Shadow trades -- jo setups block hue, unka result (bina paisa lagaye seekhna)", expanded=False):
             try:
                 _sh = shadow_trades.summary()
@@ -1935,22 +1741,6 @@ def _live_dashboard_body():
                 } for s in _recent_setups]
                 st.dataframe(_setup_rows, hide_index=True, width="stretch")
 
-            if _recent_setups:
-                st.caption(f"Upar sirf latest {len(_recent_setups)} trades dikhte hain; Resolved Trades / Win Rate ka count poore Supabase history se aata hai.")
-                with st.expander(f"📜 Saare trades dikhao (Buy + Sell, poori history)", expanded=False):
-                    try:
-                        _all_setups = trade_learning.get_recent_setups(limit=1000)
-                        st.caption(f"Total {len(_all_setups)} trades (naya sabse upar).")
-                        st.dataframe([{
-                            "When": s['timestamp'], "Direction": f"{s['direction']} {s['strike']}{s['option_type']}",
-                            "Entry": f"₹{s['entry']:,.2f}", "SL": f"₹{s['stop_loss']:,.2f}", "Target": f"₹{s['target']:,.2f}",
-                            "Confidence": f"{s['confidence_pct']}%", "Status": s['status'],
-                            "Exit": f"₹{s['exit_price']:,.2f} @ {s['exit_timestamp']}" if s['exit_price'] else "-"} for s in _all_setups],
-                            hide_index=True, width="stretch", height=480)
-                    except Exception:
-                        logger.exception("all-trades table failed (ignored)")
-                        st.caption("Poori list abhi load nahi ho payi.")
-
             _with_g = [x for x in (_recent_setups or []) if x.get('gemini')]
             if _with_g:
                 with st.expander("🧠 Har trade ke peeche Gemini ka report (jis approval par trade liya gaya)", expanded=False):
@@ -1993,7 +1783,6 @@ def _live_dashboard_body():
         # for the candidate-only FINAL SAFETY REVIEW above and the chat box,
         # so a no-setup market consumes no Gemini trade-review quota.
         # -------------------------------------------------------------
-        _sp.step("Panels: reasoning report + order-flow chart + sniper + F&O")
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("🦅 Multi-Factor Hybrid AI Deep Reasoning Report", expanded=False):
             ai_report_text = ai_engine.generate_llm_reasoning(
@@ -2100,7 +1889,6 @@ def _live_dashboard_body():
         # Full 50-stock breadth shown first (how many of the actual 50 are up
         # vs down), then the best-weighted heavyweights table underneath.
         # -------------------------------------------------------------
-        _sp.step("Panels: breadth / Bank Nifty / indicators / option chain")
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("📈 Nifty Internal Breadth & Heavyweights Tracker", expanded=False):
 
@@ -2194,7 +1982,6 @@ def _live_dashboard_body():
                     logger.exception("Broad exception caught; fallback path executed")
                     st.dataframe(df_option_chain, width="stretch")
 
-        _sp.step("Panels: SMC + news + fundamentals")
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("🏦 Smart Money Concepts & Market Structure (BOS / CHoCH)")
         if market_structure:
@@ -2229,14 +2016,10 @@ def _live_dashboard_body():
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("🗞️ NIFTY 50 News", expanded=False):
             _refresh_nifty_news = st.button("🔄 Refresh NIFTY 50 News", key="refresh_nifty50_news")
-            if _refresh_nifty_news:
-                _n50_news, _n50_news_status = multi_stock_engine.get_nifty50_news(limit=10)       # user asked for fresh headlines
+            if _refresh_nifty_news or "_nifty50_news_cache" not in st.session_state:
+                _n50_news, _n50_news_status = multi_stock_engine.get_nifty50_news(limit=10)
                 st.session_state["_nifty50_news_cache"] = _n50_news
                 st.session_state["_nifty50_news_status"] = _n50_news_status
-            else:        # same shared, time-limited fetch the AI engine uses (never blocks the page for more than a few seconds)
-                _n50_res_ui = safe_io.guarded("n50_news_ai", multi_stock_engine.get_nifty50_news, 10, timeout=3, ttl=300, default=([], "loading"))
-                st.session_state["_nifty50_news_cache"] = (_n50_res_ui or ([], ""))[0]
-                st.session_state["_nifty50_news_status"] = (_n50_res_ui or ([], ""))[1]
             _n50_news = st.session_state.get("_nifty50_news_cache", [])
             if not _n50_news:
                 st.info("NIFTY 50 news unavailable from the current RSS source right now.")
@@ -2254,16 +2037,11 @@ def _live_dashboard_body():
             st.caption("Real NIFTY 50 nahi ek single company hai, isliye ek official PE/EPS nahi hota — ye "
                        "asli 50 constituents ke fundamentals ka equal-weight average hai, honestly labelled "
                        "as an aggregate (Nifty ke official index-weighted number se alag).")
-            _refresh_nifty_fund = st.button("🔄 Refresh NIFTY 50 Fundamentals (background me chalta hai)", key="refresh_nifty50_fund")
-            # Never blocks the page: shows the newest real snapshot (with its age) and refreshes it in a background thread.
-            _fv, _fage, _floading = multi_stock_engine.get_nifty50_fundamentals_cached(force_refresh=bool(_refresh_nifty_fund))
-            if _fv is not None:
-                st.session_state["_nifty50_fund_cache"] = _fv
-                _age_txt = (f"{int(_fage // 60)} min" if _fage < 3600 else f"{_fage / 3600:.1f} ghante") if _fage is not None else "?"
-                st.caption(f"🕒 Snapshot {_age_txt} purana" + (" · naya snapshot background me load ho raha hai..." if _floading else " (fundamentals hafton/quarter me badalte hain, isliye ye sahi hai)"))
-            elif _floading:
-                st.info("⏳ 50 stocks ke fundamentals background me load ho rahe hain -- page ko rokta nahi. Thodi der me apne aap aa jayenge.")
-            _n50_fund = st.session_state.get("_nifty50_fund_cache") or {"status": "UNAVAILABLE", "reason": "Abhi load ho raha hai / mila nahi -- thodi der baad dekho ya refresh dabao."}
+            _refresh_nifty_fund = st.button("🔄 Refresh NIFTY 50 Fundamentals (slow — ~50 stocks)", key="refresh_nifty50_fund")
+            if _refresh_nifty_fund or "_nifty50_fund_cache" not in st.session_state:
+                with st.spinner("Fetching all 50 constituent fundamentals..."):
+                    st.session_state["_nifty50_fund_cache"] = multi_stock_engine.get_nifty50_fundamentals(limit=50)
+            _n50_fund = st.session_state.get("_nifty50_fund_cache") or {"status": "UNAVAILABLE", "reason": "Not fetched yet — click refresh."}
             if _n50_fund.get("status") != "AVAILABLE":
                 st.warning(_n50_fund.get("reason") or "NIFTY 50 fundamentals unavailable right now.")
             else:
@@ -2316,23 +2094,7 @@ def _live_dashboard_body():
 
 
 
-    _total_sec, _ = _sp.done()
-    safe_io.run_completed(_IS_ROBOT)
-    try:
-        stock_watchlist.page_busy(False)
-    except Exception:
-        pass
-    # The timer must be longer than a run.  If the measured run time wants a different timer than the one this fragment was started with
-    # (by 15 s or more), restart once with the right one (max 3 times per session, so it can never loop).
-    try:
-        _want = safe_io.suggested_refresh(_REFRESH_IS_LIVE)
-        _n_adapt = st.session_state.get("_refresh_adapts", 0)
-        if abs(_want - _REFRESH_SEC) >= 15 and _n_adapt < 3:
-            st.session_state["_refresh_adapts"] = _n_adapt + 1
-            st.rerun()
-    except Exception as _e_rr:
-        if type(_e_rr).__name__ in ("RerunException", "StopException"):
-            raise
+    _sp.done()
 
 
 try:                                   # SL / target are checked on the live price every ~2 s (idempotent: one thread per server process)
@@ -2346,13 +2108,7 @@ if not ACTIVE_SYMBOL:
     _LIVE_CHART_ON = live_chart.render()   # own fast refresh; False -> old chart is used
     _live_dashboard()
 else:
-    try:
-        _lc_meta = stock_universe.resolve(stock_universe.clean_symbol(ACTIVE_SYMBOL)) or {}
-        if _lc_meta.get("instrument_key"):
-            live_chart.render(instrument_key=_lc_meta["instrument_key"], name=_lc_meta.get("symbol") or ACTIVE_SYMBOL)   # same switch + live chart as Nifty, this stock's own candles
-    except Exception:
-        logger.exception("stock live chart failed (ignored)")
-    st.info(f"📌 Abhi **{ACTIVE_SYMBOL}** ka poora dashboard active hai (neeche dekho). Nifty 50 index dashboard par wapas jaane ke liye sidebar mein '⬅ Nifty 50' dabao.")
+    st.info(f"📌 Abhi **{ACTIVE_SYMBOL}** dashboard active hai (neeche dekho). Nifty 50 index dashboard par wapas jaane ke liye sidebar mein '⬅ Nifty 50' dabao.")
 
 # -------------------------------------------------------------
 # INTERACTIVE AI CHAT -- deliberately OUTSIDE the fragment above, so the
@@ -2800,18 +2556,10 @@ def _render_stock_dashboard(symbol):
 
 if ACTIVE_SYMBOL:
     try:
-        # Phase 1: the selected stock gets the SAME dashboard layout/engines as Nifty 50 (see stock_dashboard.py / stock_pipeline.py).
-        stock_dashboard.render(ACTIVE_SYMBOL, ai_engine, {
-            "fundamentals": _render_fundamentals_cards, "news": _render_stock_news, "metric": _research_metric,
-            "gemini_keys": GEMINI_API_KEYS})
+        _render_stock_dashboard(ACTIVE_SYMBOL)
     except Exception as _stock_ui_err:
-        logger.exception("Stock dashboard failed -- falling back to the older tabbed stock view")
+        logger.exception("Full stock dashboard failed")
         st.error(f"Stock dashboard error: {_stock_ui_err}")
-        try:
-            _render_stock_dashboard(ACTIVE_SYMBOL)
-        except Exception as _stock_ui_err2:
-            logger.exception("Fallback stock dashboard failed too")
-            st.error(f"Fallback stock dashboard error: {_stock_ui_err2}")
 else:
     st.subheader("📊 Select Your Stock")
     st.caption("👈 Sidebar mein koi bhi NSE stock ka naam daal kar **Load Stock** dabao — poora dashboard "

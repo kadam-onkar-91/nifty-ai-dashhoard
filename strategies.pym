@@ -2312,80 +2312,24 @@ def _train_and_backtest_impl(df, live_vix=None):
 # arrives -> cache it per (last candle, rows, VIX) with a safety TTL.
 # ---------------------------------------------------------------------
 import time as _time
-import threading as _threading
-from concurrent.futures import ThreadPoolExecutor as _MLPool
 _ML_CACHE = {"key": None, "ts": 0.0, "result": None}
-ML_CACHE_MAX_AGE = 240   # seconds: a result for the CURRENT candle is reused for this long
-ML_STALE_OK_S = 900      # while the new candle's model trains in the background, the previous candle's result is served for up to this long
-ML_COLD_WAIT_S = 6.0     # very first call of the process (nothing to serve yet): wait this long, then show "warming up" and keep training in the background
-_ML_LOCK = _threading.Lock()
-_ML_JOB = {"fut": None, "key": None}
-_ML_EXEC = _MLPool(max_workers=1, thread_name_prefix="ml-train")
+ML_CACHE_MAX_AGE = 240  # seconds
 
 
-def _ml_warming_result():
-    return {
-        "Accuracy": "Warming up", "Win Rate": "N/A", "Net PnL": "N/A", "Sample Size": "0 Trades", "latest_signal": 0, "model_ready": False,
-        "latest_confidence": 0.0, "calibrated_confidence": None,
-        "calibration_note": "ML model is training in the background (first minute after a start) -- it joins the decision as soon as it is ready",
-    }
-
-
-def _ml_job(key, df, live_vix):
-    result = _train_and_backtest_impl(df, live_vix=live_vix)
-    with _ML_LOCK:
-        _ML_CACHE["key"], _ML_CACHE["ts"], _ML_CACHE["result"] = key, _time.time(), result
-    return result
-
-
-def train_and_backtest(df, live_vix=None, blocking=False):
-    """Same result as before, but it never blocks the page for the whole training any more.
-    The model only learns from COMPLETED candles, so its result cannot change until a new candle arrives.
-      * same candle (key) -> cached result;
-      * new candle        -> training starts in ONE background thread (single-flight, shared by every tab) and the previous candle's
-                             result keeps being served meanwhile (<= ML_STALE_OK_S old) -- the page no longer waits 5-60 s for it;
-      * cold start        -> wait at most ML_COLD_WAIT_S, then 'warming up' (model_ready=False, a state the engine already handles).
-    The VIX is not part of the key any more (it wiggles every refresh and used to force a needless full re-train inside the same candle)."""
+def train_and_backtest(df, live_vix=None):
     try:
         last_ts = str(df.index[-1]) if (df is not None and len(df) > 0) else "none"
         n_rows = len(df) if df is not None else 0
     except Exception:
         last_ts, n_rows = "err", -1
-    key = (last_ts, n_rows)
+    vix_key = round(float(live_vix), 1) if live_vix is not None else None
+    key = (last_ts, n_rows, vix_key)
     now = _time.time()
-    if blocking:
-        # called from a caller's OWN background thread (the per-stock engines in stock_suite use blocking=True): train right here
-        with _ML_LOCK:
-            if _ML_CACHE["key"] == key and _ML_CACHE["result"] is not None and now - _ML_CACHE["ts"] < ML_CACHE_MAX_AGE:
-                return _ML_CACHE["result"]
-        result = _train_and_backtest_impl(df, live_vix=live_vix)
-        with _ML_LOCK:
-            _ML_CACHE["key"], _ML_CACHE["ts"], _ML_CACHE["result"] = key, _time.time(), result
-        return result
-    with _ML_LOCK:
-        cached_key, cached_ts, cached = _ML_CACHE["key"], _ML_CACHE["ts"], _ML_CACHE["result"]
-        if cached_key == key and cached is not None and now - cached_ts < ML_CACHE_MAX_AGE:
-            return cached
-        fut = _ML_JOB["fut"]
-        if fut is None or fut.done():                      # nothing in flight -> start one (an in-flight job is never duplicated)
-            try:
-                fut = _ML_EXEC.submit(_ml_job, key, df.copy() if df is not None else None, live_vix)
-                _ML_JOB["fut"], _ML_JOB["key"] = fut, key
-            except Exception:
-                logger.exception("ML background job could not start; training inline")
-                fut = None
-    if fut is None:
-        result = _train_and_backtest_impl(df, live_vix=live_vix)
-        with _ML_LOCK:
-            _ML_CACHE["key"], _ML_CACHE["ts"], _ML_CACHE["result"] = key, _time.time(), result
-        return result
-    if cached is not None and now - cached_ts < ML_STALE_OK_S:
-        return cached                                            # previous candle's result; the new one lands in the background
-    try:
-        return fut.result(timeout=ML_COLD_WAIT_S)
-    except Exception:
-        with _ML_LOCK:
-            return _ML_CACHE["result"] if _ML_CACHE["result"] is not None else _ml_warming_result()
+    if _ML_CACHE["key"] == key and _ML_CACHE["result"] is not None and now - _ML_CACHE["ts"] < ML_CACHE_MAX_AGE:
+        return _ML_CACHE["result"]
+    result = _train_and_backtest_impl(df, live_vix=live_vix)
+    _ML_CACHE["key"], _ML_CACHE["ts"], _ML_CACHE["result"] = key, now, result
+    return result
 # @@END ml_engine
 # @@MODULE backtest_engine
 from app_logging import get_logger
