@@ -1593,6 +1593,11 @@ def _run(ctx, state, gemini_keys, extra=None):
     sym = ctx["symbol"]
 
     def step(name, fn, default=None, timeout=None):
+        try:
+            import stock_watchlist as _wl
+            _wl.yield_if_robot()                 # robot thread + a dashboard refresh running -> wait here, the page goes first
+        except Exception:
+            pass
         t0 = time.time()
         try:
             if timeout:
@@ -2268,6 +2273,8 @@ _RESULTS = {}                # symbol -> {"t","ctx","extra","gscore"}  (latest r
 _INFLIGHT = {}               # symbol -> Future
 _PAGE_BUSY = {}              # thread id -> start time of a running dashboard refresh (a SET of refreshes: your tab + the robot tab can run together; the old single
                              # flag was cleared by whichever finished first while the other was still running)
+_BOOT = time.time()
+START_GRACE_S = 180.0       # after a server start the robot waits for the page's FIRST finished refresh (or at most this long), so the cold start of the page is never slowed down
 _HEAVY = threading.Semaphore(1)   # at most 1 stock runs the CPU-heavy part (41 strategies + ML + decision) at a time
 
 
@@ -2287,6 +2294,26 @@ def _page_is_busy():
             if now - t0 > 400:                     # a refresh that "never finished" must not starve the robot for ever
                 _PAGE_BUSY.pop(tid, None)
         return bool(_PAGE_BUSY)
+
+
+def yield_if_robot(max_wait=45.0):
+    """Called between the steps of a stock engine run.  Only the ROBOT's worker threads wait here (while a dashboard page is refreshing), so a run
+    that was already in progress when the page started stops competing for the CPU at its next step instead of slowing the page down."""
+    try:
+        if threading.current_thread().name.startswith("wl"):
+            _yield_to_page(max_wait)
+    except Exception:
+        pass
+
+
+def _robot_may_start():
+    try:
+        import safe_io
+        if safe_io._RUN_STATS.get("runs", 0) >= 1:
+            return True
+    except Exception:
+        return True
+    return time.time() - _BOOT >= START_GRACE_S
 
 
 def _yield_to_page(max_wait=None):
@@ -2520,6 +2547,9 @@ def _loop():
     while True:
         try:
             time.sleep(0.5)
+            if not _robot_may_start():
+                time.sleep(2)
+                continue
             syms = list_symbols()
             if not syms:
                 time.sleep(15)
@@ -3229,15 +3259,46 @@ def _body(symbol, ai_engine, helpers):
 
 def render(symbol, ai_engine, helpers):
     """Draws the stock dashboard as its own self-refreshing fragment (30 s while NSE is open, 180 s when closed) -- same as Nifty."""
-    every = 30 if _is_live() else 180
+    live = _is_live()
+    every = safe_io.refresh_for(live)            # 30 s live / 180 s closed -- longer only when real runs are slower (never cut off by its own timer)
 
     @st.fragment(run_every=every)
     def _frag():
         try:
+            _want = safe_io.refresh_for(live)
+            _n = st.session_state.get("_refresh_adapts_stk", 0)
+            if _want - every >= 15 and _n < 2:
+                st.session_state["_refresh_adapts_stk"] = _n + 1
+                st.rerun()
+        except Exception as _e_rr:
+            if type(_e_rr).__name__ in ("RerunException", "StopException"):
+                raise
+        _ok = False
+        try:
+            stock_watchlist.page_busy(True)
+        except Exception:
+            pass
+        try:
             _body(symbol, ai_engine, helpers)
+            _ok = True
         except Exception as e:
+            _ok = True                                   # a crash is shown on the page; it is not a timer interrupt
+            if type(e).__name__ in ("RerunException", "StopException"):
+                _ok = type(e).__name__ == "RerunException"
+                raise
             logger.exception("stock dashboard crashed")
             st.error(f"Stock dashboard error: {type(e).__name__}: {e}")
+        except BaseException as e:                       # script stopped by the timer (StopException is not an Exception subclass)
+            _ok = type(e).__name__ == "RerunException"
+            raise
+        finally:
+            try:
+                if _ok:
+                    safe_io.run_completed(False)
+                safe_io.note_run_result(_ok)
+                stock_watchlist.page_busy(False)
+            except Exception:
+                pass
 
     _frag()
 # @@END stock_dashboard

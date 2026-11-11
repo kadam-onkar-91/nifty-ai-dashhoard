@@ -154,6 +154,28 @@ def suggested_refresh(is_live, live_min=30, closed_min=180, cap=300):
     return int(min(cap, max(base, ema * 1.4 + 8)))
 
 
+_RUN_STATS.setdefault("interrupts", 0)
+
+
+def note_run_result(completed):
+    """A page run that never reached its end (Streamlit stopped it because the timer fired again) counts as an 'interrupt'.
+    Used by refresh_for(): repeated interrupts make the timer longer, so a slow run is never cut off again and again."""
+    _RUN_STATS["interrupts"] = 0 if completed else min(6, _RUN_STATS.get("interrupts", 0) + 1)
+
+
+def refresh_for(is_live, live_min=30, closed_min=180, cap=300):
+    """Timer for a self-refreshing page fragment.  Normal case = the plain 30 s (live) / 180 s (closed) timer, exactly as before.
+    Only when real runs are slower than that does it grow: 1.4 x the measured run time + 8 s, and +30 s per interrupted run in a row
+    (a run that is cut off before it finishes never gets measured, so the interrupts are the signal)."""
+    base = live_min if is_live else closed_min
+    ema = _RUN_STATS.get("ema")
+    want = base
+    if ema is not None:
+        want = max(want, ema * 1.4 + 8)
+    want = max(want, base + 30 * _RUN_STATS.get("interrupts", 0))
+    return int(min(cap, want))
+
+
 # ---- who is looking at the app? --------------------------------------------------------------------------------------------------------
 # Your own tab and the GitHub "robot tab" both run the WHOLE heavy pipeline, on one small shared server (the log showed two copies of every
 # step running at once -> every run 2-5x slower).  While a human tab is actively running the engine, the robot tab only shows a light

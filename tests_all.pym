@@ -3352,4 +3352,60 @@ class StockAddOnTests(unittest.TestCase):
             wl.ROOT, wl.PATH = old_root, old_path
 
 
+class RefreshTimerTests(unittest.TestCase):
+    def setUp(self):
+        self._st = dict(safe_io._RUN_STATS)
+        safe_io._RUN_STATS.update(ema=None, interrupts=0)
+
+    def tearDown(self):
+        safe_io._RUN_STATS.clear()
+        safe_io._RUN_STATS.update(self._st)
+
+    def test_normal_timer_unchanged(self):
+        self.assertEqual(safe_io.refresh_for(True), 30)
+        self.assertEqual(safe_io.refresh_for(False), 180)
+        safe_io._RUN_STATS["ema"] = 12.0
+        self.assertEqual(safe_io.refresh_for(True), 30)
+
+    def test_slow_runs_lengthen_timer(self):
+        safe_io._RUN_STATS["ema"] = 50.0
+        self.assertEqual(safe_io.refresh_for(True), 78)          # 1.4 x 50 + 8
+        safe_io._RUN_STATS["ema"] = 900.0
+        self.assertEqual(safe_io.refresh_for(True), 300)         # capped
+
+    def test_interrupts_lengthen_timer_and_reset(self):
+        safe_io.note_run_result(False)
+        safe_io.note_run_result(False)
+        self.assertEqual(safe_io.refresh_for(True), 90)
+        safe_io.note_run_result(True)
+        self.assertEqual(safe_io.refresh_for(True), 30)
+
+    def test_robot_yields_only_in_its_own_threads(self):
+        import stock_watchlist as wl
+        wl.page_busy(True)
+        try:
+            t0 = time.time()
+            wl.yield_if_robot(max_wait=2.0)                       # main thread is not a robot worker -> returns at once
+            self.assertLess(time.time() - t0, 0.5)
+        finally:
+            wl.page_busy(False)
+
+    def test_robot_waits_for_first_page_run(self):
+        import stock_watchlist as wl
+        runs = safe_io._RUN_STATS.get("runs", 0)
+        old_boot = wl._BOOT
+        try:
+            safe_io._RUN_STATS["runs"] = 0
+            wl._BOOT = time.time()
+            self.assertFalse(wl._robot_may_start())
+            wl._BOOT = time.time() - wl.START_GRACE_S - 1
+            self.assertTrue(wl._robot_may_start())
+            wl._BOOT = time.time()
+            safe_io._RUN_STATS["runs"] = 1
+            self.assertTrue(wl._robot_may_start())
+        finally:
+            wl._BOOT = old_boot
+            safe_io._RUN_STATS["runs"] = runs
+
+
 # @@END tests_v61_speed

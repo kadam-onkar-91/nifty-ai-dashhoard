@@ -218,12 +218,24 @@ try:
     _REFRESH_IS_LIVE = market_status.get_market_status()["state"] in ("OPEN", "PRE_OPEN")
 except Exception:
     _REFRESH_IS_LIVE = True
-_REFRESH_SEC = 30 if _REFRESH_IS_LIVE else 180
+_REFRESH_SEC = safe_io.refresh_for(_REFRESH_IS_LIVE)   # 30 s live / 180 s closed -- longer ONLY when real runs are slower (so a run is never cut off by its own timer)
 
 
 @st.fragment(run_every=_REFRESH_SEC)
 def _live_dashboard():
     """Nifty page.  Tells the watchlist robot that the page is working, so the robot lets the page finish first (the Nifty page always has priority)."""
+    # The timer must be longer than a run.  If real runs need a longer timer than the one this fragment was started with (by 15 s or more),
+    # restart the page once with the right one (max 2 times per session, so it can never loop).
+    try:
+        _want = safe_io.refresh_for(_REFRESH_IS_LIVE)
+        _n_adapt = st.session_state.get("_refresh_adapts", 0)
+        if _want - _REFRESH_SEC >= 15 and _n_adapt < 2:
+            st.session_state["_refresh_adapts"] = _n_adapt + 1
+            st.rerun()
+    except Exception as _e_rr:
+        if type(_e_rr).__name__ in ("RerunException", "StopException"):
+            raise
+    _run_ok = False
     try:
         safe_io.run_started(False)
         stock_watchlist.page_busy(True)
@@ -231,8 +243,13 @@ def _live_dashboard():
         pass
     try:
         _live_dashboard_body()
+        _run_ok = True
+    except BaseException as _e_run:
+        _run_ok = type(_e_run).__name__ == "RerunException"      # a deliberate rerun is not an interrupt; being stopped by the timer is
+        raise
     finally:
         try:
+            safe_io.note_run_result(_run_ok)
             safe_io.run_aborted(False)
             stock_watchlist.page_busy(False)
         except Exception:

@@ -1,4 +1,8 @@
 
+## v63 -- "page keeps refreshing" fix
+- The 10-stock robot no longer competes with the page: it waits for the page's FIRST finished refresh after a server start (max 3 min), and while the Nifty page or a stock page is refreshing every robot stock pauses at its next engine step.
+- The refresh timer (Nifty page and stock page) stays 30 s live / 180 s closed, but grows automatically (1.4 x real run time + 8 s, +30 s per cut-off run, max 300 s) when real runs are slower than the timer -- before, a run longer than the timer was cut off by its own timer again and again and never finished.  Adaptation restarts the page at most 2 times per session.
+
 ## v62 -- Robot Watchlist (10 stocks) + full Nifty-style research for EVERY stock
 Base = ai_best_trading_tool (Nifty page unchanged).  Added from v61, nothing else:
 - **Any NSE stock**: sidebar searchable list (symbol OR company name, 9,700+ stocks) + free-text box.  Load Stock opens that stock's dashboard in the SAME layout as Nifty 50.
