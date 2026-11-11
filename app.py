@@ -2126,9 +2126,14 @@ def _live_dashboard():
         with st.expander("🗞️ NIFTY 50 News", expanded=False):
             _refresh_nifty_news = st.button("🔄 Refresh NIFTY 50 News", key="refresh_nifty50_news")
             if _refresh_nifty_news or "_nifty50_news_cache" not in st.session_state:
-                _n50_news, _n50_news_status = multi_stock_engine.get_nifty50_news(limit=10)
-                st.session_state["_nifty50_news_cache"] = _n50_news
-                st.session_state["_nifty50_news_status"] = _n50_news_status
+                # SPEED: a brand-new session (page reload / Upstox login redirect) used to WAIT here for the news download.  Now the fetch runs in the
+                # background (shared by all sessions, same Google News feed) and the page continues; the 30 s refresh picks the result up.
+                if _refresh_nifty_news:
+                    _nres = multi_stock_engine.get_nifty50_news(limit=10)
+                else:
+                    _nres = safe_io.guarded("n50_news_ui", multi_stock_engine.get_nifty50_news, 10, timeout=3, ttl=120, default=None)
+                if _nres is not None:
+                    st.session_state["_nifty50_news_cache"], st.session_state["_nifty50_news_status"] = _nres
             _n50_news = st.session_state.get("_nifty50_news_cache", [])
             if not _n50_news:
                 st.info("NIFTY 50 news unavailable from the current RSS source right now.")
@@ -2148,9 +2153,14 @@ def _live_dashboard():
                        "as an aggregate (Nifty ke official index-weighted number se alag).")
             _refresh_nifty_fund = st.button("🔄 Refresh NIFTY 50 Fundamentals (slow — ~50 stocks)", key="refresh_nifty50_fund")
             if _refresh_nifty_fund or "_nifty50_fund_cache" not in st.session_state:
-                with st.spinner("Fetching all 50 constituent fundamentals..."):
-                    st.session_state["_nifty50_fund_cache"] = multi_stock_engine.get_nifty50_fundamentals(limit=50)
-            _n50_fund = st.session_state.get("_nifty50_fund_cache") or {"status": "UNAVAILABLE", "reason": "Not fetched yet — click refresh."}
+                # SPEED: this used to download 50 stocks' fundamentals from Yahoo INSIDE the page run (up to 45 s, every new session, and again after
+                # every failure -- Yahoo answers 401 right now), so everything below it and the Upstox-login page stayed blank.  Same data, same
+                # function -- now fetched in the background (one fetch shared by all sessions); the page never waits for it.
+                _fres = safe_io.guarded("n50_fund_ui", multi_stock_engine.get_nifty50_fundamentals, 50,
+                                        timeout=(40 if _refresh_nifty_fund else 0.5), ttl=(0 if _refresh_nifty_fund else 600), default=None)
+                if _fres is not None:
+                    st.session_state["_nifty50_fund_cache"] = _fres
+            _n50_fund = st.session_state.get("_nifty50_fund_cache") or {"status": "UNAVAILABLE", "reason": "Background me load ho raha hai -- 30 sec me apne aap aa jayega (ya 'Refresh' dabao)."}
             if _n50_fund.get("status") != "AVAILABLE":
                 st.warning(_n50_fund.get("reason") or "NIFTY 50 fundamentals unavailable right now.")
             else:
