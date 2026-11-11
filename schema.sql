@@ -231,3 +231,41 @@ do $$ begin
   end if;
 end $$;
 -- ===== END SUPABASE_MARKET_BRAIN_MIGRATION.sql =====
+
+
+-- ===== Stock dashboard + Robot Watchlist (additive, safe to re-run) =====
+-- Additive only (safe to run many times). Nifty tables are NOT touched.
+CREATE TABLE IF NOT EXISTS stock_ai_setups (
+  id BIGSERIAL PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  timestamp TEXT,
+  direction TEXT,
+  entry DOUBLE PRECISION,
+  stop_loss DOUBLE PRECISION,
+  target DOUBLE PRECISION,
+  confidence_pct DOUBLE PRECISION,
+  factors_json TEXT,
+  status TEXT DEFAULT 'OPEN',
+  exit_price DOUBLE PRECISION,
+  exit_timestamp TEXT
+);
+ALTER TABLE stock_ai_setups ADD COLUMN IF NOT EXISTS exit_price DOUBLE PRECISION;
+ALTER TABLE stock_ai_setups ADD COLUMN IF NOT EXISTS exit_timestamp TEXT;
+CREATE INDEX IF NOT EXISTS idx_stock_ai_setups_symbol_ts ON stock_ai_setups (symbol, timestamp);
+
+-- Robot watchlist (Phase 4)
+CREATE TABLE IF NOT EXISTS stock_watchlist (
+  symbol TEXT PRIMARY KEY,
+  added_at TIMESTAMPTZ DEFAULT now()
+);
+
+
+-- Permanent per-stock learning (shadow trades, market memory, autopsy, gate log ...).  Additive; safe to run more than once.
+create table if not exists public.stock_learning_blobs (
+  symbol text not null,
+  name text not null,
+  payload text not null,
+  rows integer,
+  updated_at text,
+  primary key (symbol, name)
+);

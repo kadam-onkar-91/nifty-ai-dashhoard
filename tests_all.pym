@@ -3188,3 +3188,168 @@ class FarFromLevelIsACost(DbCase):
 if __name__ == "__main__":
     unittest.main()
 # @@END tests_v59_gates
+
+# @@MODULE tests_v61_speed
+"""v61 speed tests: futures-key cache, single-flight Upstox cache, background ML, robot standby bookkeeping, watchlist busy-set, robot keeper."""
+import sys, types, unittest, threading, time
+for _m in ("feedparser", "streamlit", "yfinance", "upstox_client", "supabase", "plotly"):
+    try:
+        __import__(_m)
+    except Exception:
+        sys.modules[_m] = types.ModuleType(_m)
+import pandas as pd
+import market_data
+import ml_engine
+import safe_io
+
+
+class FuturesKeyCacheTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = market_data._resolve_upstox_nifty_future_key
+        market_data._FUT_KEY.update(key=None, debug="x", ts=0.0, fail_ts=0.0, expiry=None)
+        self.calls = []
+
+    def tearDown(self):
+        market_data._resolve_upstox_nifty_future_key = self._orig
+
+    def test_downloaded_once_not_on_every_call(self):
+        def fake():
+            self.calls.append(1)
+            market_data._FUT_KEY_EXPIRY["v"] = pd.Timestamp.now().normalize() + pd.Timedelta(days=10)
+            return "NSE_FO|123", "OK"
+        market_data._resolve_upstox_nifty_future_key = fake
+        for _ in range(6):
+            self.assertEqual(market_data._load_upstox_nifty_future_key()[0], "NSE_FO|123")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(market_data.get_nifty_futures_instrument_key(), "NSE_FO|123")
+
+    def test_failure_backs_off_for_a_while(self):
+        market_data._resolve_upstox_nifty_future_key = lambda: (self.calls.append(1), (None, "boom"))[1]
+        for _ in range(4):
+            self.assertIsNone(market_data._load_upstox_nifty_future_key()[0])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_expired_contract_is_looked_up_again(self):
+        def fake():
+            self.calls.append(1)
+            market_data._FUT_KEY_EXPIRY["v"] = pd.Timestamp.now().normalize() - pd.Timedelta(days=1)    # already expired
+            return "OLD", "OK"
+        market_data._resolve_upstox_nifty_future_key = fake
+        market_data._load_upstox_nifty_future_key()
+        market_data._load_upstox_nifty_future_key()
+        self.assertEqual(len(self.calls), 2)
+
+
+class SingleFlightTests(unittest.TestCase):
+    def test_two_tabs_one_upstox_call(self):
+        market_data._CACHE.clear()
+        calls = []
+
+        def loader():
+            calls.append(1)
+            time.sleep(0.3)
+            return [1, 2, 3]
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(market_data._cached(("sf", 1), 10, 60, loader))) for _ in range(4)]
+        [t.start() for t in ts]; [t.join() for t in ts]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out, [[1, 2, 3]] * 4)
+
+    def test_failed_load_serves_stale_copy(self):
+        market_data._CACHE.clear()
+        market_data._cached(("sf2", 1), 0, 60, lambda: [9])
+        self.assertEqual(market_data._cached(("sf2", 1), 0, 60, lambda: None), [9])
+
+    def test_no_xgboost_training_any_more(self):
+        self.assertFalse(hasattr(market_data, "XGBClassifier"))
+
+
+class HumanVsRobotTests(unittest.TestCase):
+    def setUp(self):
+        safe_io._SESS.update(human_start=0.0, human_done=0.0, robot_done=0.0)
+
+    def test_robot_idles_only_while_a_person_is_running_the_engine(self):
+        self.assertFalse(safe_io.human_active())
+        safe_io.run_started(False)
+        self.assertTrue(safe_io.human_active())                  # a human run is in progress
+        safe_io.run_aborted(False)
+        self.assertFalse(safe_io.human_active())                 # interrupted / crashed -> not "active"
+        safe_io.run_started(False); safe_io.run_completed(False); safe_io.run_aborted(False)
+        self.assertTrue(safe_io.human_active())                  # finished a moment ago
+        safe_io._SESS["human_done"] = time.time() - 1000
+        self.assertFalse(safe_io.human_active())                 # tab gone for a long time -> the robot takes over
+
+    def test_robot_runs_never_make_the_robot_idle(self):
+        safe_io.run_started(True); safe_io.run_completed(True); safe_io.run_aborted(True)
+        self.assertFalse(safe_io.human_active())
+
+    def test_stuck_run_does_not_idle_the_robot_for_ever(self):
+        safe_io._SESS["human_start"] = time.time() - 700
+        self.assertFalse(safe_io.human_active())
+
+    def test_once(self):
+        self.assertTrue(safe_io.once("v61-test-once"))
+        self.assertFalse(safe_io.once("v61-test-once"))
+
+
+class WatchlistBusyTests(unittest.TestCase):
+    def test_busy_is_a_set_of_refreshes(self):
+        import stock_watchlist as w
+        w._PAGE_BUSY.clear()
+        w.page_busy(True)
+        done = threading.Event()
+
+        def other():
+            w.page_busy(True); w.page_busy(False); done.set()    # the OTHER tab finishes first ...
+        threading.Thread(target=other).start(); done.wait(2)
+        self.assertTrue(w._page_is_busy())                       # ... but this tab is still running -> still busy (the old single flag said "idle")
+        w.page_busy(False)
+        self.assertFalse(w._page_is_busy())
+
+    def test_throttle_constants(self):
+        import stock_watchlist as w
+        self.assertGreaterEqual(w.CYCLE_GAP, 60)
+
+
+def _keeper():
+    import os, bundle_loader
+    here = os.path.dirname(os.path.abspath(bundle_loader.__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import keep_open
+    return keep_open
+
+
+class StockAddOnTests(unittest.TestCase):
+    """The multi-stock add-on inside the ai_best_trading_tool base: per-stock engines need `blocking`, the watchlist is capped at 10."""
+
+    def test_ml_engine_accepts_blocking_flag(self):
+        import inspect
+        self.assertIn("blocking", inspect.signature(ml_engine.train_and_backtest).parameters)
+
+    def test_watchlist_is_capped_at_ten(self):
+        import os, tempfile
+        import stock_watchlist as wl
+        old_root, old_path = wl.ROOT, wl.PATH
+        wl.ROOT = tempfile.mkdtemp()
+        wl.PATH = os.path.join(wl.ROOT, "watchlist.json")
+        wl._RUNNER["synced"] = True
+        import threading as _t
+        _orig = _t.Thread
+        wl._mirror = lambda symbols: None
+        try:
+            self.assertEqual(wl.MAX_STOCKS, 10)
+            syms = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH", "III", "JJJ"]
+            wl._save_local(syms)
+            ok, msg = wl.add("KKK")
+            self.assertFalse(ok)
+            self.assertIn("10", msg)
+            self.assertEqual(wl.list_symbols(), syms)
+            wl.remove("JJJ")
+            ok, _ = wl.add("AAA")
+            self.assertFalse(ok)            # already there
+        finally:
+            wl.ROOT, wl.PATH = old_root, old_path
+
+
+# @@END tests_v61_speed

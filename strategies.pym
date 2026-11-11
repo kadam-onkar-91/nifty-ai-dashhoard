@@ -2316,7 +2316,7 @@ _ML_CACHE = {"key": None, "ts": 0.0, "result": None}
 ML_CACHE_MAX_AGE = 240  # seconds
 
 
-def train_and_backtest(df, live_vix=None):
+def train_and_backtest(df, live_vix=None, blocking=False):   # `blocking` is accepted for the per-stock engines (stock_suite); the Nifty path trains inline exactly as before
     try:
         last_ts = str(df.index[-1]) if (df is not None and len(df) > 0) else "none"
         n_rows = len(df) if df is not None else 0

@@ -1,4 +1,14 @@
 
+## v62 -- Robot Watchlist (10 stocks) + full Nifty-style research for EVERY stock
+Base = ai_best_trading_tool (Nifty page unchanged).  Added from v61, nothing else:
+- **Any NSE stock**: sidebar searchable list (symbol OR company name, 9,700+ stocks) + free-text box.  Load Stock opens that stock's dashboard in the SAME layout as Nifty 50.
+- **Same research as Nifty for each stock** (own candles, S/R, SMC/ICT, regime/CPR/liquidity, order flow, option chain when the stock has F&O, multi-timeframe, news, fundamentals, sector + Nifty context)
+  -> 41 strategies -> ML -> Consensus -> AI Trade Decision (self-learning) -> Gemini final review -> Entry/SL/Target -> live SL/target watcher -> WIN/LOSS -> that stock's own learning (shadow trades, market memory, post-mortem, gate log).  Learning is per stock, never mixed with Nifty or another stock.
+- **Robot Watchlist = max 10 stocks** (sidebar).  One background thread runs the full engine for every watchlist stock all through market hours, from the moment the app is open (and while the GitHub robot tab keeps the app awake).  Opening a watchlist stock shows the robot's fresh result at once.
+- The Nifty page always has priority: while it is refreshing, the robot waits for it (it never waits more than ~2 min).  Stocks are re-run every 75 s, only one stock does the CPU-heavy part at a time.
+- Run the `stock_*` and `stock_learning_blobs` blocks of `schema.sql` in Supabase once (additive, safe to re-run) so stock trades + learning survive restarts.
+- Support code taken from v61 because the stock engines need it: `safe_io` helpers, single-flight Upstox cache, `round_number_scale` (price-scaled round-number levels), per-stock sector/Nifty context, XGBoost removed (unused).  `keep_open.py`, the Nifty refresh flow and the Nifty ML are exactly as in the base.
+
 ## Multi-Stock AI Intelligence (v26 upgrade)
 
 This package adds a common NSE equity analysis pipeline while preserving the existing NIFTY dashboard and `ai_trade_setups` table.

@@ -58,9 +58,56 @@ SECTOR_INDEX = {
     "Metal": "^CNXMETAL", "FMCG": "^CNXFMCG", "Energy": "^CNXENERGY",
     "Oil & Gas": "^CNXENERGY", "Realty": "^CNXREALTY", "Media": "^CNXMEDIA"
 }
+# Upstox live index keys for the same sectors (Upstox-first, Yahoo only as fallback)
+_SECTOR_UPSTOX = {"^NSEBANK": "NSE_INDEX|Nifty Bank", "^CNXIT": "NSE_INDEX|Nifty IT", "^CNXPHARMA": "NSE_INDEX|Nifty Pharma",
+                  "^CNXAUTO": "NSE_INDEX|Nifty Auto", "^CNXMETAL": "NSE_INDEX|Nifty Metal", "^CNXFMCG": "NSE_INDEX|Nifty FMCG",
+                  "^CNXENERGY": "NSE_INDEX|Nifty Energy", "^CNXREALTY": "NSE_INDEX|Nifty Realty", "^CNXMEDIA": "NSE_INDEX|Nifty Media",
+                  "^CNXFIN": "NSE_INDEX|Nifty Fin Service"}
+# keyword (lower-case, substring) -> yahoo index.  Handles Upstox/Yahoo sector words like "Technology", "Information Technology",
+# "Consumer Defensive", "Basic Materials", "Communication Services" etc. that the exact-name map above missed (that was the "N/A").
+_SECTOR_WORDS = (("information tech", "^CNXIT"), ("software", "^CNXIT"), ("technology", "^CNXIT"), ("it services", "^CNXIT"), ("it -", "^CNXIT"),
+                 ("bank", "^NSEBANK"), ("financ", "^CNXFIN"), ("insurance", "^CNXFIN"), ("nbfc", "^CNXFIN"),
+                 ("pharma", "^CNXPHARMA"), ("health", "^CNXPHARMA"), ("drug", "^CNXPHARMA"), ("hospital", "^CNXPHARMA"),
+                 ("auto", "^CNXAUTO"), ("metal", "^CNXMETAL"), ("steel", "^CNXMETAL"), ("mining", "^CNXMETAL"), ("basic material", "^CNXMETAL"),
+                 ("fmcg", "^CNXFMCG"), ("consumer defensive", "^CNXFMCG"), ("consumer goods", "^CNXFMCG"), ("food", "^CNXFMCG"),
+                 ("oil", "^CNXENERGY"), ("gas", "^CNXENERGY"), ("energy", "^CNXENERGY"), ("power", "^CNXENERGY"), ("utilit", "^CNXENERGY"),
+                 ("real estate", "^CNXREALTY"), ("realty", "^CNXREALTY"), ("media", "^CNXMEDIA"), ("communication", "^CNXMEDIA"), ("entertain", "^CNXMEDIA"))
+
+
+def _sector_yahoo_index(sector):
+    if not sector:
+        return None
+    if sector in SECTOR_INDEX:
+        return SECTOR_INDEX[sector]
+    low = str(sector).lower()
+    for word, idx in _SECTOR_WORDS:
+        if word in low:
+            return idx
+    return None
+
+
+_INSTR_CACHE = {"ts": 0.0, "v": None}
+_INSTR_LOCK = __import__("threading").Lock()
+INSTR_TTL_S = 6 * 3600     # the instrument master changes once a day at most; it used to be downloaded + looped over (iterrows) on every call
 
 
 def _instrument_map():
+    """Cached for 6 h (single-flight); an empty/failed result is retried after 5 minutes only."""
+    import time as _t
+    now = _t.time()
+    with _INSTR_LOCK:
+        c = _INSTR_CACHE
+        if c["v"] is not None and now - c["ts"] < (INSTR_TTL_S if c["v"] else 300):
+            return c["v"]
+        v = _instrument_map_uncached()
+        if v or c["v"] is None:
+            c["v"], c["ts"] = v, _t.time()
+        else:
+            c["ts"] = _t.time() - INSTR_TTL_S + 300      # failed refresh: keep the old map, retry in 5 min
+        return c["v"]
+
+
+def _instrument_map_uncached():
     """Return NSE equity metadata from Upstox's official instrument master.
 
     Metadata is kept together so the same selected symbol can drive market
@@ -68,8 +115,12 @@ def _instrument_map():
     ISIN from a third-party source.
     """
     try:
+        import io as _io, requests as _rq
         url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
-        d = pd.read_csv(url, compression="gzip")
+        _r = _rq.get(url, timeout=25)
+        _r.raise_for_status()
+        _need = {"tradingsymbol", "instrument_key", "segment", "instrument_type", "isin", "isin_code", "exchange"}
+        d = pd.read_csv(_io.BytesIO(_r.content), compression="gzip", usecols=lambda c_: c_ in _need)
         if "tradingsymbol" not in d.columns or "instrument_key" not in d.columns:
             return {}
         if "segment" in d.columns:
@@ -234,7 +285,7 @@ def _get_nifty50_constituents():
     return NIFTY50_CONSTITUENTS, 'Bundled NIFTY 50 fallback list'
 
 
-def _nifty50_fundamentals(limit=50):
+def _nifty50_fundamentals(limit=50, force=False):
     """Build a transparent NIFTY 50 constituent fundamental snapshot.
 
     Yahoo does not expose the official live NIFTY 50 weight table through this
@@ -243,7 +294,7 @@ def _nifty50_fundamentals(limit=50):
     """
     fields=['marketCap','trailingPE','forwardPE','priceToBook','returnOnEquity','profitMargins','revenueGrowth','earningsGrowth','debtToEquity','dividendYield']
     now=_time.time()
-    if _FUND_CACHE['value'] is not None and now-_FUND_CACHE['ts']<_FUND_TTL and _FUND_CACHE.get('limit')==limit:
+    if (not force) and _FUND_CACHE['value'] is not None and now-_FUND_CACHE['ts']<_FUND_TTL and _FUND_CACHE.get('limit')==limit:
         return _FUND_CACHE['value']
     constituents, constituent_source = _get_nifty50_constituents()
 
@@ -317,6 +368,100 @@ def get_nifty50_fundamentals(limit=50):
 
 
 # ---------------------------------------------------------------------
+# LOAD SPEED: non-blocking access to the slow, slow-moving data (50-stock fundamentals, news).
+# Fundamentals change over weeks/quarters, not seconds, so a copy that is minutes/hours old is still correct -- but it is always shown
+# WITH its age, and it is refreshed in a background thread.  The page never waits for it (it used to wait up to ~50 s on every new visit).
+# A copy is also kept on disk, so a restart of the app process shows the last real snapshot at once while the new one loads.
+# ---------------------------------------------------------------------
+import json as _json
+import os as _os
+import tempfile as _tempfile
+
+_FUND_DISK = _os.path.join(_tempfile.gettempdir(), "nifty50_fundamentals_snapshot_v1.json")
+_FUND_BG = {"thread": None, "last_try": 0.0}
+_FUND_LOCK = _threading.Lock()
+_FUND_RETRY_S = 90          # a failed/empty background load is retried after this many seconds
+
+
+def _fund_read_disk():
+    try:
+        with open(_FUND_DISK, "r", encoding="utf-8") as fh:
+            j = _json.load(fh)
+        v = j.get("value")
+        if isinstance(v, dict) and v.get("status") == "AVAILABLE":
+            return float(j.get("ts", 0.0)), v
+    except Exception:
+        pass
+    return 0.0, None
+
+
+def _fund_write_disk(ts, value):
+    try:
+        tmp = _FUND_DISK + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            _json.dump({"ts": ts, "value": value}, fh)
+        _os.replace(tmp, _FUND_DISK)
+    except Exception:
+        logger.exception("could not write NIFTY 50 fundamentals snapshot (ignored)")
+
+
+def _fund_bg_job(force=False):
+    try:
+        out = _nifty50_fundamentals(limit=50, force=bool(force))
+        if isinstance(out, dict) and out.get("status") == "AVAILABLE" and out.get("coverage", 0) > 0:
+            _fund_write_disk(_time.time(), out)
+    except Exception:
+        logger.exception("NIFTY 50 fundamentals background load failed (ignored)")
+
+
+def get_nifty50_fundamentals_cached(force_refresh=False):
+    """NEVER blocks.  Returns (value_or_None, age_seconds_or_None, loading_bool).
+    value is the newest real snapshot we have (memory -> disk); a refresh runs in a background thread when it is older than the TTL."""
+    now = _time.time()
+    value, ts = _FUND_CACHE.get("value"), _FUND_CACHE.get("ts", 0.0)
+    if value is None or _FUND_CACHE.get("limit") != 50:
+        d_ts, d_val = _fund_read_disk()
+        if d_val is not None:
+            value, ts = d_val, d_ts
+            _FUND_CACHE.update(ts=d_ts, value=d_val, limit=50)      # also serves the normal get_nifty50_fundamentals() path
+    age = (now - ts) if value is not None else None
+    need = force_refresh or value is None or (age is not None and age >= _FUND_TTL)
+    with _FUND_LOCK:
+        t = _FUND_BG["thread"]
+        running = t is not None and t.is_alive()
+        if need and not running and (force_refresh or now - _FUND_BG["last_try"] >= _FUND_RETRY_S):
+            _FUND_BG["last_try"] = now
+            t = _threading.Thread(target=_fund_bg_job, args=(bool(force_refresh),), name="n50-fund-loader", daemon=True)
+            _FUND_BG["thread"] = t
+            t.start()
+            running = True
+    return value, age, running
+
+
+_PREWARM = {"started": False}
+
+
+def prewarm_background():
+    """Start (once per server process) the slow loads in the background so they are ready by the time they are needed."""
+    if _PREWARM["started"]:
+        return False
+    _PREWARM["started"] = True
+
+    def _job():
+        try:
+            get_nifty50_fundamentals_cached()
+        except Exception:
+            logger.exception("prewarm: fundamentals (ignored)")
+        try:
+            _nifty_news(limit=10)
+        except Exception:
+            logger.exception("prewarm: news (ignored)")
+
+    _threading.Thread(target=_job, name="n50-prewarm", daemon=True).start()
+    return True
+
+
+# ---------------------------------------------------------------------
 # Two soft confluence factors for ai_trade_decision.py / trade_learning.py
 # -- NIFTY 50-specific news and fundamentals, folded into the SAME weighted
 # confluence score as every other factor (order flow, VWAP, regime, etc.),
@@ -387,24 +532,78 @@ def get_nifty50_fundamentals_bias(fund=None):
     return {'label': label, 'score': score}
 
 
-def _index_context():
+def _upstox_index_live(instrument_key, access_token, yf_ticker=None):
+    """(ltp, change_pct) of an index straight from Upstox (live).  Change % uses the last COMPLETED day's close (Yahoo, cached);
+    if that is missing, Upstox's own net_change is used.  Returns None if Upstox gives nothing."""
+    if not access_token or not instrument_key:
+        return None
     try:
-        d=yf.download('^NSEI',period='5d',interval='1d',progress=False,auto_adjust=False)
-        if isinstance(d.columns,pd.MultiIndex): d.columns=d.columns.get_level_values(0)
-        c=d['Close'].dropna()
-        return {'nifty_last':float(c.iloc[-1]),'nifty_change_pct':float((c.iloc[-1]/c.iloc[-2]-1)*100) if len(c)>1 else None,'source':'Yahoo Finance'}
-    except Exception: return {'nifty_last':None,'nifty_change_pct':None,'source':'UNAVAILABLE'}
+        import urllib.parse
+        key = urllib.parse.quote(instrument_key, safe="|")
+        d = _upstox_json(f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={key}", access_token, timeout=6)
+        row = next(iter((d or {}).get("data", {}).values()), None)
+        if not row or row.get("last_price") in (None, 0):
+            return None
+        ltp = float(row["last_price"])
+        prev = None
+        try:
+            import data_feeds
+            prev = data_feeds._get_prev_close(yf_ticker) if yf_ticker else None
+        except Exception:
+            prev = None
+        if prev:
+            return round(ltp, 2), round((ltp - prev) / prev * 100, 2)
+        nc = row.get("net_change")
+        if nc is not None and ltp - float(nc) > 0:
+            return round(ltp, 2), round(float(nc) / (ltp - float(nc)) * 100, 2)
+        return round(ltp, 2), None
+    except Exception:
+        return None
 
 
-def _sector_context(sector):
-    idx=SECTOR_INDEX.get(sector)
-    if not idx: return {'status':'UNAVAILABLE','reason':'No mapped sector index'}
+def _yahoo_index_daily(ticker):
     try:
-        d=yf.download(idx,period='5d',interval='1d',progress=False,auto_adjust=False)
-        if isinstance(d.columns,pd.MultiIndex): d.columns=d.columns.get_level_values(0)
-        c=d['Close'].dropna()
-        return {'status':'AVAILABLE','index':idx,'last':float(c.iloc[-1]),'change_pct':float((c.iloc[-1]/c.iloc[-2]-1)*100) if len(c)>1 else None}
-    except Exception: return {'status':'UNAVAILABLE','index':idx}
+        d = yf.download(ticker, period='5d', interval='1d', progress=False, auto_adjust=False)
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = d.columns.get_level_values(0)
+        c = d['Close'].dropna()
+        return float(c.iloc[-1]), (float((c.iloc[-1] / c.iloc[-2] - 1) * 100) if len(c) > 1 else None)
+    except Exception:
+        return None
+
+
+def _index_context(access_token=None):
+    """Nifty 50 for the stock dashboard.  Upstox LIVE first (the same price the Nifty dashboard shows); Yahoo only as a labelled fallback."""
+    v = _upstox_index_live("NSE_INDEX|Nifty 50", access_token, "^NSEI")
+    if v:
+        return {'nifty_last': v[0], 'nifty_change_pct': v[1], 'source': 'Upstox Live'}
+    y = _yahoo_index_daily('^NSEI')
+    if y:
+        return {'nifty_last': y[0], 'nifty_change_pct': y[1], 'source': 'Yahoo Finance (delayed)'}
+    return {'nifty_last': None, 'nifty_change_pct': None, 'source': 'UNAVAILABLE'}
+
+
+def _banknifty_context(access_token=None):
+    v = _upstox_index_live("NSE_INDEX|Nifty Bank", access_token, "^NSEBANK")
+    if v:
+        return {'last': v[0], 'change_pct': v[1], 'source': 'Upstox Live'}
+    y = _yahoo_index_daily('^NSEBANK')
+    if y:
+        return {'last': y[0], 'change_pct': y[1], 'source': 'Yahoo Finance (delayed)'}
+    return {'last': None, 'change_pct': None, 'source': 'UNAVAILABLE'}
+
+
+def _sector_context(sector, access_token=None):
+    idx = _sector_yahoo_index(sector)
+    if not idx:
+        return {'status': 'UNAVAILABLE', 'reason': f'No mapped sector index for "{sector}"'}
+    v = _upstox_index_live(_SECTOR_UPSTOX.get(idx), access_token, idx)
+    if v:
+        return {'status': 'AVAILABLE', 'index': idx.lstrip('^'), 'last': v[0], 'change_pct': v[1], 'source': 'Upstox Live'}
+    y = _yahoo_index_daily(idx)
+    if y:
+        return {'status': 'AVAILABLE', 'index': idx.lstrip('^'), 'last': y[0], 'change_pct': y[1], 'source': 'Yahoo Finance (delayed)'}
+    return {'status': 'UNAVAILABLE', 'index': idx}
 
 
 def _upstox_json(url, access_token, params=None, timeout=8):
@@ -435,8 +634,15 @@ def _upstox_fundamentals(isin, access_token):
     }
     out = {"status": "AVAILABLE", "source": "Upstox Company Fundamentals", "isin": isin}
     got = 0
-    for name, url in endpoints.items():
-        data = _upstox_json(url, access_token, timeout=8)
+    # the 8 endpoints are fetched in PARALLEL (before: one by one, up to 8 x 8 s)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as _ex:
+        _futs = {name: _ex.submit(_upstox_json, url, access_token, None, 8) for name, url in endpoints.items()}
+    for name, fut in _futs.items():
+        try:
+            data = fut.result()
+        except Exception:
+            data = None
         if data and "data" in data:
             out[name] = data["data"]
             got += 1

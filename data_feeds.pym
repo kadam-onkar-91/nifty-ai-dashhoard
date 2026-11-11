@@ -11,7 +11,6 @@ import threading
 import time
 import urllib.parse
 import yfinance as yf
-from xgboost import XGBClassifier
 from datetime import datetime, timedelta
 import indicators  # Custom indicators module
 
@@ -32,21 +31,37 @@ INTRADAY_STALE_OK_S = 90     # if Upstox refuses (429) keep serving the last goo
 LTP_TTL_S = 2
 
 
+_KEY_LOCKS = {}
+
+
 def _cached(key, ttl, stale_ok_s, loader):
-    """Process-wide cache: fresh hit -> no Upstox call.  loader() returns None on FAILURE (then a not-too-old copy is served instead)."""
+    """Process-wide cache: fresh hit -> no Upstox call.  loader() returns None on FAILURE (then a not-too-old copy is served instead).
+    SINGLE-FLIGHT: when two tabs (yours + the robot tab) miss at the same moment, only ONE of them calls Upstox; the other waits for that
+    answer instead of sending a duplicate request (fewer 429s, half the load)."""
+    def _hit_now():
+        with _UPSTOX_LOCK:
+            return _CACHE.get(key)
     now = time.time()
-    with _UPSTOX_LOCK:
-        hit = _CACHE.get(key)
+    hit = _hit_now()
     if hit and now - hit[0] < ttl:
         return hit[1]
-    val = loader()
-    if val is not None:
-        with _UPSTOX_LOCK:
-            _CACHE[key] = (now, val)
-            if len(_CACHE) > 200:
-                for k in sorted(_CACHE, key=lambda k_: _CACHE[k_][0])[:50]:
-                    _CACHE.pop(k, None)
-        return val
+    with _UPSTOX_LOCK:
+        klock = _KEY_LOCKS.setdefault(key, threading.Lock())
+    with klock:
+        now = time.time()
+        hit = _hit_now()
+        if hit and now - hit[0] < ttl:           # another tab filled it while we waited for the lock
+            return hit[1]
+        val = loader()
+        if val is not None:
+            with _UPSTOX_LOCK:
+                _CACHE[key] = (time.time(), val)
+                if len(_CACHE) > 200:
+                    for k in sorted(_CACHE, key=lambda k_: _CACHE[k_][0])[:50]:
+                        _CACHE.pop(k, None)
+                if len(_KEY_LOCKS) > 400:
+                    _KEY_LOCKS.clear()
+            return val
     if hit and now - hit[0] <= stale_ok_s:
         return hit[1]
     return None
@@ -97,7 +112,7 @@ def _upstox_get_json(url, access_token, where, timeout=8, tries=1):
     return None
 
 
-def _load_upstox_nifty_future_key():
+def _resolve_upstox_nifty_future_key():
     """Finds the current near-month Nifty 50 index futures contract from
     Upstox's official instrument master. Returns (instrument_key_or_None,
     debug_reason).
@@ -115,8 +130,13 @@ def _load_upstox_nifty_future_key():
     futures are genuinely, continuously traded and carry real volume.
     """
     try:
+        import io as _io
         url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
-        df = pd.read_csv(url, compression="gzip")
+        # explicit timeout (pd.read_csv(url) has none and could hang a worker for minutes) + only the 6 columns that are needed
+        _resp = requests.get(url, timeout=20)
+        _resp.raise_for_status()
+        _need = {"instrument_key", "tradingsymbol", "name", "expiry", "segment", "instrument_type"}
+        df = pd.read_csv(_io.BytesIO(_resp.content), compression="gzip", usecols=lambda c: c in _need)
 
         if 'segment' not in df.columns or 'instrument_type' not in df.columns:
             return None, f"Instrument master missing expected columns: {list(df.columns)}"
@@ -152,10 +172,49 @@ def _load_upstox_nifty_future_key():
         if nifty_rows.empty or 'instrument_key' not in nifty_rows.columns:
             return None, "Matched NIFTY future rows but couldn't resolve a valid near-month instrument_key"
 
+        try:
+            _FUT_KEY_EXPIRY["v"] = pd.Timestamp(nifty_rows.iloc[0]['expiry_parsed']).normalize() if 'expiry_parsed' in nifty_rows.columns else None
+        except Exception:
+            _FUT_KEY_EXPIRY["v"] = None
         return nifty_rows.iloc[0]['instrument_key'], "OK"
     except Exception as e:
         logger.exception("Broad exception caught; fallback path executed")
         return None, f"Futures instrument lookup failed: {type(e).__name__}: {e}"
+
+
+_FUT_KEY = {"key": None, "debug": "not resolved yet", "ts": 0.0, "fail_ts": 0.0, "expiry": None}
+_FUT_KEY_EXPIRY = {"v": None}
+_FUT_KEY_LOCK = threading.Lock()
+FUT_KEY_TTL_S = 6 * 3600     # the near-month futures contract changes once a month -> one lookup per 6 h, not one download per refresh
+FUT_KEY_RETRY_S = 300        # after a failed lookup do not hammer Upstox: try again after 5 minutes
+
+
+def _fut_key_expired(st_):
+    try:
+        return st_["expiry"] is not None and pd.Timestamp.now().normalize() > st_["expiry"]
+    except Exception:
+        return False
+
+
+def _load_upstox_nifty_future_key():
+    """Cached wrapper (see _resolve_upstox_nifty_future_key): the full NSE instrument master (a multi-MB .csv.gz) used to be downloaded and
+    parsed on EVERY call -- fut_volume + order_flow, each refresh, each open tab -> the 'fut_volume / order_flow timed out' lines in the log and
+    a big share of the CPU.  Now: one download per 6 h (single-flight, shared by every tab), 5-minute back-off after a failure, and the last
+    good contract keeps being served if a refresh of the lookup fails (until that contract has expired)."""
+    now = time.time()
+    with _FUT_KEY_LOCK:
+        st_ = _FUT_KEY
+        have = bool(st_["key"]) and not _fut_key_expired(st_)
+        if have and now - st_["ts"] < FUT_KEY_TTL_S:
+            return st_["key"], st_["debug"]
+        if st_["fail_ts"] and now - st_["fail_ts"] < FUT_KEY_RETRY_S:
+            return (st_["key"] if have else None), st_["debug"]
+        key, debug = _resolve_upstox_nifty_future_key()
+        if key:
+            st_.update(key=key, debug=debug, ts=time.time(), fail_ts=0.0, expiry=_FUT_KEY_EXPIRY.get("v"))
+            return key, debug
+        st_.update(fail_ts=time.time(), debug=debug)
+        return (st_["key"] if have else None), debug
 
 
 def get_nifty_futures_instrument_key():
@@ -306,7 +365,7 @@ def fetch_live_market_data(access_token):
         # strategy/AI decision can mistake Yahoo data for the authenticated
         # Upstox feed requested by the trading engine.
         upstox_note = last_upstox_error() or upstox_note
-        df = yf.download("^NSEI", period="5d", interval="5m", progress=False)
+        df = yf.download("^NSEI", period="5d", interval="5m", progress=False, timeout=8)
         market_source = "YAHOO_FALLBACK_NON_TRADABLE"
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -379,37 +438,14 @@ def fetch_live_market_data(access_token):
             logger.exception("Broad exception caught; fallback path executed")
             pass
 
-    # Step 5: Advanced Machine Learning Setup (XGBoost + Memory)
+    # Step 5: SPEED FIX -- this used to TRAIN an XGBoost model (150 trees) on every single refresh, and nobody ever used the model
+    # (app.py only assigns it; the real, walk-forward validated model is ml_engine, cached per candle).  Removed: 3-10 s faster per refresh
+    # and no xgboost install/import at all.  The 4-value return contract stays the same (model is None).
     df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
-    model_df = df.iloc[:-1].copy()
+    model = None
+    feature_cols = [c for c in ('EMA_20', 'EMA_50', 'ATR', 'RSI', 'MACD', 'BB_Upper', 'BB_Lower', 'Close_Lag1', 'Close_Lag2',
+                                'RSI_Lag1', 'MACD_Lag1') if c in df.columns]
 
-    # Expanded feature list including memory lag columns
-    feature_cols = [
-        'EMA_20', 'EMA_50', 'ATR', 'RSI', 'MACD', 
-        'BB_Upper', 'BB_Lower', 'Close_Lag1', 'Close_Lag2', 
-        'RSI_Lag1', 'MACD_Lag1'
-    ]
-    feature_cols = [col for col in feature_cols if col in model_df.columns]
-    
-    if not feature_cols:
-        model_df['Dummy_Feature'] = model_df['Close'].pct_change().fillna(0)
-        feature_cols = ['Dummy_Feature']
-
-    X = model_df[feature_cols]
-    y = model_df['Target']
-
-    # Train Advanced XGBoost Model with Regularization & Memory
-    model = XGBClassifier(
-        n_estimators=150,        # More trees for deeper pattern matching
-        max_depth=4,             # Optimized depth to prevent fake noise/overfitting
-        learning_rate=0.03,      # Gradual learning for high accuracy
-        subsample=0.8,           # Random sampling for robustness
-        colsample_bytree=0.8,    # Feature diversity
-        random_state=42,
-        eval_metric='logloss'
-    )
-    model.fit(X, y)
-    
     # Persist source metadata on the dataframe without changing the public
     # four-value return contract used throughout the dashboard.
     df.attrs['market_source'] = market_source
@@ -452,7 +488,7 @@ def fetch_daily_candles(access_token=None, days_back=180):
                 df = None
     if df is None or df.empty or len(df) < 20:
         try:
-            y = yf.download("^NSEI", period="6mo", interval="1d", progress=False)
+            y = yf.download("^NSEI", period="6mo", interval="1d", progress=False, timeout=8)
             if isinstance(y.columns, pd.MultiIndex):
                 y.columns = y.columns.get_level_values(0)
             y = y[["Open", "High", "Low", "Close"]].apply(pd.to_numeric, errors="coerce").dropna()
@@ -2239,12 +2275,16 @@ def enabled() -> bool:
 
 # ----------------------------------------------------------------------------- data
 @st.cache_data(ttl=CANDLE_TTL, show_spinner=False)
-def _history(token: str):
+def _history(token: str, instrument_key: str | None = None):
+    if instrument_key:        # a selected stock (same chart, that stock's own candles)
+        return market_data.fetch_candles_for_timeframe(token, "minutes", str(INTERVAL_MIN), days_back=6, instrument_key=instrument_key)
     return market_data.fetch_candles_for_timeframe(token, "minutes", str(INTERVAL_MIN), days_back=6)
 
 
 @st.cache_data(ttl=1, show_spinner=False)
-def _ltp(token: str):
+def _ltp(token: str, instrument_key: str | None = None):
+    if instrument_key:
+        return market_data._fetch_upstox_ltp(token, instrument_key)
     return market_data._fetch_upstox_ltp(token)
 
 
@@ -2297,14 +2337,14 @@ def _session_vwap(df: pd.DataFrame):
 
 
 # ----------------------------------------------------------------------------- figure
-def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None):
+def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None, name: str = "Nifty 50", is_stock: bool = False):
     d = df.tail(MAX_CANDLES)
     ema = d["Close"].ewm(span=20, adjust=False).mean()
     vwap, real_vol = _session_vwap(d)
 
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
-        x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name=f"Nifty 50 · {INTERVAL_MIN}m",
+        x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name=f"{name} · {INTERVAL_MIN}m",
         increasing=dict(line=dict(color=UP, width=1), fillcolor=UP),
         decreasing=dict(line=dict(color=DOWN, width=1), fillcolor=DOWN),
         whiskerwidth=0.4))
@@ -2316,7 +2356,7 @@ def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None):
 
     if poc:
         fig.add_hline(y=poc, line_width=1.2, line_color="#FFEA00", opacity=0.7,
-                      annotation_text=f"POC {poc:,.0f}", annotation_position="top left",
+                      annotation_text=(f"POC {poc:,.2f}" if is_stock else f"POC {poc:,.0f}"), annotation_position="top left",
                       annotation_font_color="#FFEA00")
     if ltp:
         last_up = d["Close"].iloc[-1] >= d["Open"].iloc[-1]
@@ -2327,11 +2367,11 @@ def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None):
 
     vis = d.tail(VISIBLE_CANDLES)
     lo, hi = float(vis["Low"].min()), float(vis["High"].max())
-    pad = max((hi - lo) * 0.08, 5.0)
+    pad = max((hi - lo) * 0.08, (hi * 0.0005) if is_stock else 5.0)
     x_end = d.index[-1] + pd.Timedelta(minutes=INTERVAL_MIN * 5)
 
     fig.update_layout(
-        template="plotly_dark", height=520, uirevision=f"nifty-live-{INTERVAL_MIN}m",
+        template="plotly_dark", height=520, uirevision=f"{name}-live-{INTERVAL_MIN}m",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=4, r=4, t=36, b=8), hovermode="x unified", dragmode="pan",
         xaxis_rangeslider_visible=False,
@@ -2344,7 +2384,7 @@ def build_figure(df: pd.DataFrame, ltp: float | None, poc: float | None):
             dict(bounds=[15.5, 9.25], pattern="hour"),    # overnight (NSE 09:15 - 15:30)
         ])
     fig.update_yaxes(range=[lo - pad, hi + pad], side="right", showgrid=True,
-                     gridcolor="rgba(255,255,255,.06)", tickformat=",.0f")
+                     gridcolor="rgba(255,255,255,.06)", tickformat=(",.2f" if is_stock else ",.0f"))
     return fig
 
 
@@ -2379,7 +2419,7 @@ def _header(ltp, prev_day_close, is_open):
 """, unsafe_allow_html=True)
 
 
-def _body(was_open: bool):
+def _body(was_open: bool, instrument_key: str | None = None, name: str = "Nifty 50"):
     state = market_status.get_market_status()["state"]
     is_open = state == "OPEN"
     if is_open != was_open:          # market just opened/closed -> re-pick refresh speed once
@@ -2395,7 +2435,7 @@ def _body(was_open: bool):
         st.info("⏳ Live chart: broker login hone ka wait... (dashboard login hote hi chalu ho jaayega)")
         return
 
-    hist = _history(token)
+    hist = _history(token, instrument_key)
     if hist is None or len(hist) == 0:
         st.warning("5-minute candles abhi broker se nahi mile -- thodi der mein dobara try hoga.")
         return
@@ -2403,11 +2443,12 @@ def _body(was_open: bool):
     df = _to_naive_ist(hist)
     ltp = None
     if is_open:
-        ltp = _ltp(token)
+        ltp = _ltp(token, instrument_key)
         if ltp:
             now_naive = pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None)
-            df, st.session_state["_lc_forming"] = apply_live_tick(
-                df, float(ltp), now_naive, st.session_state.get("_lc_forming"))
+            _fk = "_lc_forming" if not instrument_key else f"_lc_forming_{name}"
+            df, st.session_state[_fk] = apply_live_tick(
+                df, float(ltp), now_naive, st.session_state.get(_fk))
     if ltp is None:
         ltp = float(df["Close"].iloc[-1])
 
@@ -2417,8 +2458,8 @@ def _body(was_open: bool):
 
     _header(ltp, prev_day_close, is_open)
     st.plotly_chart(
-        build_figure(df, ltp, st.session_state.get("_live_poc")),
-        width="stretch", key="live_candle_chart",
+        build_figure(df, ltp, st.session_state.get("_live_poc" if not instrument_key else f"_live_poc_{name}"), name=name, is_stock=bool(instrument_key)),
+        width="stretch", key="live_candle_chart" if not instrument_key else f"live_candle_chart_{name}",
         config={"displaylogo": False, "scrollZoom": True,
                 "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d"]})
     st.caption(f"{INTERVAL_MIN}-minute candles · Upstox live feed · chalti hui candle har "
@@ -2426,7 +2467,7 @@ def _body(was_open: bool):
                f"{INTERVAL_MIN}-minute candles · Upstox · market band hai, aakhri session dikh raha hai")
 
 
-def render() -> bool:
+def render(instrument_key: str | None = None, name: str = "Nifty 50") -> bool:
     """One-line switch + the live 5-minute chart.  Returns False if the feature is disabled (caller then keeps its old chart);
     True otherwise -- also when the switch is OFF, so the old chart does not pop up in its place."""
     if not enabled():
@@ -2437,7 +2478,7 @@ def render() -> bool:
             return True
         is_open = market_status.get_market_status()["state"] == "OPEN"
         frag = st.fragment(run_every=TICK_SECONDS if is_open else None)(_body)
-        frag(is_open)
+        frag(is_open, instrument_key, name)
         return True
     except Exception:
         import logging
