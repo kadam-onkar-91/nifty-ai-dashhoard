@@ -273,8 +273,14 @@ def fetch_live_market_data(access_token):
 
     # Step 1: Try fetching data from Upstox API (real, live, broker feed)
     if access_token:
-        live_price = _fetch_upstox_ltp(access_token)
-        df = _fetch_upstox_candles(access_token)
+        # SPEED: the live price and the candles are two independent Upstox calls -- they used to run one AFTER the other (this step took 7-10 s);
+        # now both run at the same moment.  Same calls, same data, same fallbacks.
+        from concurrent.futures import ThreadPoolExecutor as _UpPool
+        with _UpPool(max_workers=2, thread_name_prefix="upstox-fetch") as _up_ex:
+            _f_ltp = _up_ex.submit(_fetch_upstox_ltp, access_token)
+            _f_can = _up_ex.submit(_fetch_upstox_candles, access_token)
+            live_price = _f_ltp.result()
+            df = _f_can.result()
         # LTP call failed but fresh Upstox candles arrived: the newest candle's close IS the live price (within 10 min)
         if live_price is None and df is not None and not df.empty:
             try:
@@ -1332,6 +1338,30 @@ def _fetch_full50_yfinance():
         return None
 
 
+@st.cache_data(ttl=90, show_spinner=False)
+def _fetch_yf_subset(base_symbols):
+    """Yahoo daily change for ONLY the given symbols (tuple of names without .NS).  Used to top up the few stocks Upstox did not return:
+    it used to download ALL 50 from Yahoo for that (8+ s, and Yahoo answered 401 / 429).  Same Yahoo numbers, same formula -> {symbol: row}."""
+    out = {}
+    want = [t for t in NIFTY50_YF if t.replace(".NS", "") in set(base_symbols)]
+    if not want:
+        return out
+    try:
+        data = yf.download(tickers=want, period="5d", interval="1d", group_by="ticker", progress=False, threads=True)
+        for sym in want:
+            try:
+                closes = (data[sym] if len(want) > 1 else data[sym] if sym in getattr(data, "columns", []) else data)["Close"].dropna()
+                if len(closes) < 2:
+                    continue
+                chg = ((closes.iloc[-1] - closes.iloc[-2]) / closes.iloc[-2]) * 100
+                out[sym.replace(".NS", "")] = {"Symbol": sym.replace(".NS", ""), "Change (%)": round(float(chg), 2)}
+            except Exception:
+                continue
+    except Exception:
+        logger.exception("Yahoo top-up failed (ignored)")
+    return out
+
+
 def get_full_nifty50_breadth(access_token=None):
     """
     REAL market breadth across all 50 Nifty index constituents. Tries live
@@ -1354,8 +1384,7 @@ def get_full_nifty50_breadth(access_token=None):
         base_symbols = [s.replace(".NS", "") for s in NIFTY50_YF]
         missing = [s for s in base_symbols if s not in have]
         if missing:
-            yf_rows = _fetch_full50_yfinance() or []
-            yf_map = {r["Symbol"]: r for r in yf_rows}
+            yf_map = _fetch_yf_subset(tuple(missing))
             topped_up = [sym for sym in missing if sym in yf_map]
             for sym in topped_up:
                 rows.append(yf_map[sym])
