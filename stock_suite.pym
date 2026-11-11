@@ -2214,15 +2214,26 @@ _GLOBAL = {"t": 0.0, "v": None, "tn": 0.0, "sent": None, "head": ""}
 _GLOBAL_LOCK = threading.Lock()
 _RESULTS = {}                # symbol -> {"t","ctx","extra","gscore"}  (latest robot result, read by the dashboard)
 _INFLIGHT = {}               # symbol -> Future
-_PAGE_BUSY = {"since": 0.0}  # set by the Nifty page while it is loading -> the robot lets it finish first (bounded wait)
+_PAGE_BUSY = {"since": 0.0, "n": 0}  # set by the Nifty page while it is loading -> the robot lets it finish first (bounded wait)
 _HEAVY = threading.Semaphore(1)   # at most 2 stocks run the CPU-heavy part (41 strategies + ML + decision) at the same moment
 
 
 def page_busy(flag):
-    _PAGE_BUSY["since"] = time.time() if flag else 0.0
+    # COUNTER, not a single flag: with two pages open (your phone + the keep-open robot tab) the first one to finish used to clear the flag
+    # while the other was still loading, so the watchlist robot started its CPU-heavy work in the middle of the page load.
+    now = time.time()
+    if flag:
+        if not _PAGE_BUSY["since"] or now - _PAGE_BUSY["since"] > 400:
+            _PAGE_BUSY["n"] = 0                         # a run that was cut off never called page_busy(False) -> forget it
+        _PAGE_BUSY["n"] += 1
+        _PAGE_BUSY["since"] = now
+    else:
+        _PAGE_BUSY["n"] = max(0, _PAGE_BUSY["n"] - 1)
+        if _PAGE_BUSY["n"] == 0:
+            _PAGE_BUSY["since"] = 0.0
 
 
-def _yield_to_page(max_wait=45.0):
+def _yield_to_page(max_wait=75.0):
     t0 = time.time()
     while time.time() - t0 < max_wait:
         s = _PAGE_BUSY["since"]

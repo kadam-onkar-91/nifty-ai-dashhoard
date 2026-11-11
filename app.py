@@ -359,21 +359,21 @@ def _live_dashboard():
             return _load_pool.submit(_job)
 
         def _bank_sensex_job():
-            _nc = safe_io.guarded("nifty_change", index_correlation.get_nifty_change_pct, live_price, timeout=8, swr=True, default=None)
-            return _nc, safe_io.guarded("bank_sensex", index_correlation.get_bank_nifty_sensex, access_token, _nc, timeout=8, swr=True,
+            _nc = safe_io.guarded("nifty_change", index_correlation.get_nifty_change_pct, live_price, timeout=8, default=None)
+            return _nc, safe_io.guarded("bank_sensex", index_correlation.get_bank_nifty_sensex, access_token, _nc, timeout=8,
                                         default=([], "Bank Nifty / Sensex data timed out (retrying in background)."))
 
         _f_oc = _bg(option_chain.generate_option_chain_data, live_price)
-        _f_h = _bg(safe_io.guarded, "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=8, swr=True,
+        _f_h = _bg(safe_io.guarded, "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=8,
                    default=market_breadth.unavailable_heavyweights())
-        _f_50 = _bg(safe_io.guarded, "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=8, swr=True,
+        _f_50 = _bg(safe_io.guarded, "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=8,
                     default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
         _f_bank = _bg(_bank_sensex_job)
         # ONE shared fetch for the Nifty page, the watchlist robot and the stock dashboard (same key + ttl): before, each of them downloaded the
         # same 20+ Yahoo tickers on its own every 30 s, which got Yahoo to throttle ("timed out", "Invalid Crumb") and slowed everything.
-        _f_gnews = _bg(safe_io.guarded, "global_news", global_news.get_global_market_sentiment, timeout=8, ttl=170, swr=True,
+        _f_gnews = _bg(safe_io.guarded, "global_news", global_news.get_global_market_sentiment, timeout=8, ttl=170,
                        default=(pd.DataFrame(), "Global headline unavailable right now."))
-        _f_gmk = _bg(safe_io.guarded, "global_markets", global_markets.get_global_market_indices, timeout=8, ttl=25, swr=True, default=pd.DataFrame())
+        _f_gmk = _bg(safe_io.guarded, "global_markets", global_markets.get_global_market_indices, timeout=8, ttl=25, default=pd.DataFrame())
         _load_pool.shutdown(wait=False)
 
         fvg, ob, sweeps = smart_money.detect_smc_zones(df)          # (CPU work, overlaps with the fetches above)
@@ -441,7 +441,7 @@ def _live_dashboard():
             iv_source = atm_rows if not atm_rows.empty else df_option_chain
             mean_iv = iv_source['IV (%)'].mean()
             current_atm_iv = float(mean_iv) if pd.notna(mean_iv) and mean_iv > 0 else None
-        iv_percentile = safe_io.guarded("iv_percentile", option_chain.get_iv_percentile, current_atm_iv, timeout=5, ttl=60, swr=True, default=None)
+        iv_percentile = safe_io.guarded("iv_percentile", option_chain.get_iv_percentile, current_atm_iv, timeout=5, ttl=60, default=None)
         sector_breadth = market_breadth.get_sector_breadth(df_full50)
 
         # -------------------------------------------------------------
@@ -1478,7 +1478,7 @@ def _live_dashboard():
             # not a separate gate -- see ai_trade_decision.py / trade_learning.py.
             _n50_news_for_ai = st.session_state.get("_nifty50_news_cache")
             if _n50_news_for_ai is None:
-                _n50_res = safe_io.guarded("n50_news_ai", multi_stock_engine.get_nifty50_news, 10, timeout=4, ttl=300, swr=True, default=([], "timeout"))
+                _n50_res = safe_io.guarded("n50_news_ai", multi_stock_engine.get_nifty50_news, 10, timeout=4, ttl=300, default=([], "timeout"))
                 _n50_news_for_ai = (_n50_res or ([], ""))[0]
             _n50_news_sent = multi_stock_engine.get_nifty50_news_sentiment(_n50_news_for_ai)
             _n50_fund_bias = multi_stock_engine.get_nifty50_fundamentals_bias(
