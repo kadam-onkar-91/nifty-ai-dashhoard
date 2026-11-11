@@ -235,6 +235,26 @@ def _live_dashboard():
         pass
     _sp = safe_io.Stepper(st.empty())
     _sp.step("Broker login + live candles")
+    # SPEED (cold start): the learning history (every trade from Supabase + its factor JSON) was first read in the MIDDLE of the page run, one
+    # step after another (the "AI trade decision" and "Learning" steps took 8-15 s on a fresh start).  Start reading it NOW in a background thread,
+    # while the broker / market data loads -- it only fills the same caches those steps read anyway, so the numbers are identical.
+    try:
+        import threading as _thr
+        _pw = safe_io.__dict__.setdefault("_LEARN_PREWARM", {"t": 0.0})   # lives in a module, not in the script (the script restarts every run)
+        if time.time() - _pw["t"] > 60:
+            _pw["t"] = time.time()
+
+            def _prewarm_learning():
+                for _fn, _kw in ((trade_learning.get_overall_track_record, {}), (trade_learning.get_factor_reliability, {}),
+                                 (trade_learning.get_learning_summary, {}), (trade_learning._labelled_rows_full, {}),
+                                 (trade_learning.get_recent_setups, {"limit": 20})):
+                    try:
+                        _fn(**_kw)
+                    except Exception:
+                        pass
+            _thr.Thread(target=_prewarm_learning, daemon=True, name="learn-prewarm").start()
+    except Exception:
+        pass
     if 'access_token' not in st.session_state:
         st.session_state.access_token = None
 
