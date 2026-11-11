@@ -2248,10 +2248,13 @@ logger = get_logger(__name__)
 ROOT = os.environ.get("STOCK_DATA_DIR", "stock_data")
 PATH = os.path.join(ROOT, "watchlist.json")
 TABLE = "stock_watchlist"
-CYCLE_GAP = 30.0            # every watchlist stock is re-run every 30 s (same cadence as the Nifty 50 dashboard); ticks are handled by the tick watcher
-WORKERS = 2                 # stocks processed at the same time.  More workers only fight the dashboard for the CPU (Python GIL) and make the PAGE slow;
-                            # 4 still finishes 10 stocks inside the 30 s cycle once the data caches are warm.
-RESULT_MAX_AGE = 40.0       # the dashboard re-uses the robot's result when it is younger than this -> instant stock loading
+CYCLE_GAP = 75.0            # every watchlist stock is re-run 75 s after its previous run STARTED.  (Was 30 s with 2 workers: 7 stocks x 41 strategies + ML +
+                            # decision kept the small shared server busy all the time and made the Nifty page 2-3x slower.  Strategies work on 5-minute
+                            # candles and SL / target are watched on the live tick by tick_guard, so 75 s loses nothing.)
+WORKERS = 2                 # stocks in flight at the same time; the CPU-heavy part is still one-at-a-time (_HEAVY), so the 2nd worker only overlaps network waits
+DUTY_PAUSE = 0.6            # while a person is looking at the dashboard, each worker rests 0.6 x the time its stock took (max 12 s) -> the page keeps getting CPU
+PAGE_WAIT_MAX = 120.0       # a watchlist stock waits for a running Nifty refresh to finish (at most this long) before it starts its heavy part
+RESULT_MAX_AGE = 90.0       # the dashboard re-uses the robot's result when it is younger than this -> instant stock loading
 GLOBAL_TTL = 30.0           # global markets / VIX refreshed every 30 s; global news every 3 min (changes slowly)
 POST_CLOSE_UNTIL = (15, 50)  # one last pass after the close so the day's candles get labelled
 _LOCK = threading.RLock()
@@ -2262,19 +2265,34 @@ _GLOBAL = {"t": 0.0, "v": None, "tn": 0.0, "sent": None, "head": ""}
 _GLOBAL_LOCK = threading.Lock()
 _RESULTS = {}                # symbol -> {"t","ctx","extra","gscore"}  (latest robot result, read by the dashboard)
 _INFLIGHT = {}               # symbol -> Future
-_PAGE_BUSY = {"since": 0.0}  # set by the Nifty page while it is loading -> the robot lets it finish first (bounded wait)
-_HEAVY = threading.Semaphore(1)   # at most 2 stocks run the CPU-heavy part (41 strategies + ML + decision) at the same moment
+_PAGE_BUSY = {}              # thread id -> start time of a running dashboard refresh (a SET of refreshes: your tab + the robot tab can run together; the old single
+                             # flag was cleared by whichever finished first while the other was still running)
+_HEAVY = threading.Semaphore(1)   # at most 1 stock runs the CPU-heavy part (41 strategies + ML + decision) at a time
 
 
 def page_busy(flag):
-    _PAGE_BUSY["since"] = time.time() if flag else 0.0
+    tid = threading.get_ident()
+    with _LOCK:
+        if flag:
+            _PAGE_BUSY[tid] = time.time()
+        else:
+            _PAGE_BUSY.pop(tid, None)
 
 
-def _yield_to_page(max_wait=45.0):
+def _page_is_busy():
+    now = time.time()
+    with _LOCK:
+        for tid, t0 in list(_PAGE_BUSY.items()):
+            if now - t0 > 400:                     # a refresh that "never finished" must not starve the robot for ever
+                _PAGE_BUSY.pop(tid, None)
+        return bool(_PAGE_BUSY)
+
+
+def _yield_to_page(max_wait=None):
+    max_wait = PAGE_WAIT_MAX if max_wait is None else max_wait
     t0 = time.time()
     while time.time() - t0 < max_wait:
-        s = _PAGE_BUSY["since"]
-        if not s or time.time() - s > 400:        # page idle (or stuck for ages -> never starve the robot because of it)
+        if not _page_is_busy():
             return
         time.sleep(0.4)
 
@@ -2541,6 +2559,12 @@ def _loop():
 
 def _run_and_stamp(sym, token):
     row = run_once(sym, token)
+    try:                                                   # a person is on the dashboard -> rest a little after every stock so the page keeps getting the CPU
+        import safe_io
+        if safe_io.human_active():
+            time.sleep(min(12.0, DUTY_PAUSE * float(row.get("ms") or 0) / 1000.0))
+    except Exception:
+        pass
     with _LOCK:
         cur = _STATUS.setdefault(sym, {})
         t = cur.get("_t", time.time())

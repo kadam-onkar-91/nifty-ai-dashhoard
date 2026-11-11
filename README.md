@@ -1,4 +1,15 @@
 
+## v61 -- speed release (slow refresh / slow first load)
+What was slow (found from the Streamlit Cloud log + code, not guessed):
+1. **Your tab + the GitHub robot tab both ran the whole heavy pipeline at the same time** on one small shared server (every step appeared twice in the log) -> every run 2-5x slower, 140-340 s totals.  Now the robot tab opens the app with `?robot=1`; while a person's tab is running the engine, the robot tab shows a light STANDBY page (it still prints the IST heartbeat) and takes over the moment your tab is gone.
+2. **keep_open.py reloaded a page that was only busy** (clock "180 s behind") and every reload started one more heavy session.  Now: reload only after 4 late checks in a row and a clock more than 420 s old (a broken page is still reloaded on the 2nd check); periodic refresh every 120 min instead of 30.
+3. **The whole NSE instrument master (multi-MB .csv.gz) was downloaded + parsed on every refresh** just to find the Nifty futures key (`fut_volume` / `order_flow` "timed out" lines).  Now one lookup per 6 h, shared by all tabs, with a 5-minute back-off after a failure.
+4. **An XGBoost model (150 trees) was trained on every refresh** inside "Broker login + live candles" and nobody used it.  Removed (xgboost is no longer needed at all, so the 320 MB nvidia-nccl download on every deploy is gone too).
+5. The walk-forward ML now trains in ONE background thread per new candle (no more waiting 5-60 s for it, the previous candle's result is used meanwhile; VIX no longer forces extra re-trains).  The per-stock engines called `train_and_backtest(..., blocking=True)` which did not exist -> fixed.
+6. Upstox calls are single-flight (two tabs asking at once = one request), `multi_asset` instrument map is cached, and the 7-stock Robot Watchlist now waits for a running Nifty refresh (the old busy flag was a single bool that whichever tab finished first cleared), rests while a person is on the page, and runs every 75 s instead of 30 s.
+7. Cold start: instrument map, futures key, global markets/news, candles and ML training are prewarmed in parallel the moment the server starts.
+8. The log now prints the LAST step and four more "Panels: ..." steps, so the previously invisible 20-30 s after "Consensus engine" can be located exactly in the next log.
+
 ## Multi-Stock AI Intelligence (v26 upgrade)
 
 This package adds a common NSE equity analysis pipeline while preserving the existing NIFTY dashboard and `ai_trade_setups` table.

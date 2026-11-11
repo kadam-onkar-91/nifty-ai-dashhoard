@@ -64,6 +64,15 @@ for _n in ("streamlit.runtime.scriptrunner_utils.script_run_context", "streamlit
 # Page Configuration
 st.set_page_config(page_title="Nifty 50 Real-Time AI Predictor", page_icon="⚡", layout="wide")
 
+# Robot tab (GitHub Actions keep_open.py opens the app with ?robot=1).  Remembered in session_state because the query string can be cleared
+# later (the Upstox login redirect clears it).
+if "_is_robot" not in st.session_state:
+    try:
+        st.session_state["_is_robot"] = str(st.query_params.get("robot", "")).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        st.session_state["_is_robot"] = False
+_IS_ROBOT = bool(st.session_state.get("_is_robot"))
+
 st.markdown("""
     <style>
     @media (max-width: 768px) {
@@ -222,6 +231,57 @@ else:
 # fragment (see bottom of file) means it now only re-renders when you
 # actually interact with it -- never on the 30s timer.
 # -------------------------------------------------------------
+# -------------------------------------------------------------
+# COLD-START PREWARM (once per server process, in a background thread).  The first page after a start used to do ALL of this one step after
+# the other while you waited: instrument master download, global markets/news, candles, ML training.  Now they start together the moment the
+# server starts (the page reuses the very same cached / single-flight results, nothing is computed twice).  Every step is optional: a failure
+# here only means the page does that step itself, exactly as before.
+# -------------------------------------------------------------
+def _prewarm_process():
+    import threading as _th
+    from concurrent.futures import ThreadPoolExecutor as _PW
+
+    def _t(label, fn):
+        _t0 = time.time()
+        try:
+            fn()
+            print(f"[PREWARM] {label}: {time.time() - _t0:.1f}s", flush=True)
+        except Exception as _e:
+            print(f"[PREWARM] {label} skipped: {type(_e).__name__}: {_e}", flush=True)
+
+    def _candles_and_ml():
+        _tok = None
+        try:
+            _tok = upstox_auth._stored_token() or upstox_auth._analytics_token()
+        except Exception:
+            _tok = None
+        if not _tok:
+            return
+        _df, _m, _f, _lp = market_data.fetch_live_market_data(_tok)
+        if _df is not None and not _df.empty:
+            _t("daily candles", lambda: market_data.fetch_daily_candles(_tok))
+            ml_engine.train_and_backtest(_df)             # starts the single-flight background training; the page joins it
+
+    _jobs = [
+        ("futures key", lambda: market_data._load_upstox_nifty_future_key()),
+        ("NSE equity map", lambda: market_breadth._load_upstox_nse_equity_map()),
+        ("global markets", lambda: safe_io.guarded("global_markets", global_markets.get_global_market_indices, timeout=30, ttl=25, default=pd.DataFrame())),
+        ("global news", lambda: safe_io.guarded("global_news", global_news.get_global_market_sentiment, timeout=30, ttl=170,
+                                                default=(pd.DataFrame(), "Global headline unavailable right now."))),
+        ("candles + ML", _candles_and_ml),
+    ]
+    with _PW(max_workers=4, thread_name_prefix="prewarm") as _pool:
+        for _label, _fn in _jobs:
+            _pool.submit(_t, _label, _fn)
+
+
+try:
+    if safe_io.once("prewarm_process"):
+        import threading as _th_pw
+        _th_pw.Thread(target=_prewarm_process, name="prewarm", daemon=True).start()
+except Exception:
+    logger.exception("prewarm could not start (ignored)")
+
 # Adaptive refresh: 30s while NSE is open/pre-open (live data matters); 180s when closed,
 # because nothing changes then and every refresh re-runs the whole heavy pipeline (~10-20s).
 try:
@@ -231,8 +291,38 @@ except Exception:
 _REFRESH_SEC = safe_io.suggested_refresh(_REFRESH_IS_LIVE)   # 30 s live / 180 s closed, but NEVER shorter than a refresh really takes (a timer shorter than the run kept interrupting it -> the page never finished)
 
 
+def _robot_standby_view():
+    """Light page for the robot tab while a person's tab is running the engine.  It still prints the 'IST Time: ...' heartbeat that
+    keep_open.py checks, so the robot knows this tab is alive."""
+    try:
+        _ms = market_status.get_market_status()
+        _line = f"{_ms['label']} | IST Time: {_ms['now_ist'].strftime('%d-%b-%Y %H:%M:%S')}"
+    except Exception:
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        _line = "IST Time: " + (_dt.now(_tz.utc) + _td(hours=5, minutes=30)).strftime("%d-%b-%Y %H:%M:%S")
+    st.info("🤖 Robot tab STANDBY -- " + _line + " -- engine abhi aapke apne tab mein chal raha hai, isliye yeh tab CPU nahi kha raha "
+            "(dashboard tez rehta hai). Aapka tab band hote hi yeh robot tab khud poora engine sambhal leta hai.")
+
+
 @st.fragment(run_every=_REFRESH_SEC)
 def _live_dashboard():
+    """Entry point of the live dashboard fragment.  The robot tab idles while a human tab is running the engine (no double work on the same
+    small server); everything else runs the normal pipeline (_live_dashboard_body)."""
+    if _IS_ROBOT and safe_io.human_active():
+        _robot_standby_view()
+        return
+    safe_io.run_started(_IS_ROBOT)
+    try:
+        _live_dashboard_body()
+    finally:
+        safe_io.run_aborted(_IS_ROBOT)                  # a run that ended (finished / interrupted / crashed) is never 'in progress'
+        try:
+            stock_watchlist.page_busy(False)
+        except Exception:
+            pass
+
+
+def _live_dashboard_body():
     # Shows which step is running right now (so a slow data source is visible instead of a silent spinner) and,
     # once loaded, the slowest steps of this refresh.
     try:
@@ -1734,6 +1824,7 @@ def _live_dashboard():
         except Exception:
             logger.exception('market brain failed (ignored)')
 
+        _sp.step("Panels: shadow trades / gates / timeline / track record")
         with st.expander("🕶️ Shadow trades -- jo setups block hue, unka result (bina paisa lagaye seekhna)", expanded=False):
             try:
                 _sh = shadow_trades.summary()
@@ -1902,6 +1993,7 @@ def _live_dashboard():
         # for the candidate-only FINAL SAFETY REVIEW above and the chat box,
         # so a no-setup market consumes no Gemini trade-review quota.
         # -------------------------------------------------------------
+        _sp.step("Panels: reasoning report + order-flow chart + sniper + F&O")
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("🦅 Multi-Factor Hybrid AI Deep Reasoning Report", expanded=False):
             ai_report_text = ai_engine.generate_llm_reasoning(
@@ -2008,6 +2100,7 @@ def _live_dashboard():
         # Full 50-stock breadth shown first (how many of the actual 50 are up
         # vs down), then the best-weighted heavyweights table underneath.
         # -------------------------------------------------------------
+        _sp.step("Panels: breadth / Bank Nifty / indicators / option chain")
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("📈 Nifty Internal Breadth & Heavyweights Tracker", expanded=False):
 
@@ -2101,6 +2194,7 @@ def _live_dashboard():
                     logger.exception("Broad exception caught; fallback path executed")
                     st.dataframe(df_option_chain, width="stretch")
 
+        _sp.step("Panels: SMC + news + fundamentals")
         st.markdown("<br>", unsafe_allow_html=True)
         st.subheader("🏦 Smart Money Concepts & Market Structure (BOS / CHoCH)")
         if market_structure:
@@ -2223,6 +2317,7 @@ def _live_dashboard():
 
 
     _total_sec, _ = _sp.done()
+    safe_io.run_completed(_IS_ROBOT)
     try:
         stock_watchlist.page_busy(False)
     except Exception:
