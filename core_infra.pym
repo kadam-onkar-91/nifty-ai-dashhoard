@@ -71,8 +71,14 @@ def _attach_streamlit_ctx(ctx):
         pass
 
 
-def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
-    """Call fn(*args, **kwargs) but never wait longer than `timeout` seconds.  See module docstring."""
+SWR_WAIT = 0.8      # seconds a stale-while-revalidate call waits for the fresh value before it returns the last good one
+
+
+def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, swr=False, **kwargs):
+    """Call fn(*args, **kwargs) but never wait longer than `timeout` seconds.  See module docstring.
+    swr=True (stale-while-revalidate, only for slow NON-price sources such as breadth / news / global markets): once a good value exists the
+    call waits at most SWR_WAIT s for the fresh one and otherwise returns the last good value at once -- the fetch keeps running in the
+    background and is used on the very next refresh.  The page no longer waits 8 s on every refresh when Yahoo is slow."""
     now = time.time()
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
@@ -84,6 +90,8 @@ def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
         if ttl and st["has"] and now - st["ts"] < ttl:
             return st["value"]
         fut = st["fut"]
+        if swr and st["has"] and now - st["ts"] < 900:
+            timeout = min(timeout, SWR_WAIT)
         if fut is None or fut.done():
             t0 = time.time()
 
@@ -178,6 +186,10 @@ class Stepper:
         now = time.time()
         if self.cur is not None:
             self.rows.append((self.cur, now - self.last_t))
+            try:                               # the LAST step used to be missing from the log (that hid the slowest part of the page)
+                print(f"[STEP] {self.cur}: {now - self.last_t:.1f}s (total {now - self.t0:.0f}s)", flush=True)
+            except Exception:
+                pass
             self.cur = None
         total = now - self.t0
         try:
