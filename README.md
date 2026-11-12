@@ -1,4 +1,11 @@
 
+## v64 -- watchlist speed + honest scheduling (from the live logs)
+Live logs showed: Nifty/stock refresh 130-416 s, only 3 of 7 watchlist stocks had finished even ONE run in 30 min, and Supabase `SSLEOFError` on every call.
+- **Supabase**: all Supabase calls now go through one shared session (`sb_http`) with short timeouts and a circuit breaker -- after 3 failures in a row Supabase is skipped for 60 s and the local database is used (callers already fall back), instead of every call waiting ~10 s ("AI trade decision: 100 s").  The watchlist panel warns while it is paused.
+- **Robot schedule**: each watchlist stock runs ONCE per 5-minute candle (+20 s, staggered), ONE stock at a time (was: every 75 s, 2 at a time -> the same answer on the same candle, CPU 100 % busy).  SL / target are still watched on the live tick.  A stock run that hangs > 8 min is given up (robot carries on).  The robot rests after each heavy step while a page is on screen.
+- **Stock page**: a watchlist stock opens from the robot's result (< 5.5 min old) -- no recomputation.
+- **Sidebar**: shows real status (running / error / no setup / open trade) and IST times; old text "har 30 sec" removed.
+
 ## v63 -- "page keeps refreshing" fix
 - The 10-stock robot no longer competes with the page: it waits for the page's FIRST finished refresh after a server start (max 3 min), and while the Nifty page or a stock page is refreshing every robot stock pauses at its next engine step.
 - The refresh timer (Nifty page and stock page) stays 30 s live / 180 s closed, but grows automatically (1.4 x real run time + 8 s, +30 s per cut-off run, max 300 s) when real runs are slower than the timer -- before, a run longer than the timer was cut off by its own timer again and again and never finished.  Adaptation restarts the page at most 2 times per session.

@@ -1680,3 +1680,142 @@ def evaluate_risk_state(closed_trades, capital,
         "block_reasons": blocks,
     }
 # @@END risk_engine
+
+
+# @@MODULE sb_http
+"""
+sb_http.py -- ONE shared, resilient HTTP client for every Supabase call (drop-in for `requests`: `import sb_http as requests`).
+
+Why: every Supabase call used a fresh TLS connection and waited up to 10 s.  When the server was busy (7 watchlist stocks + the page) Supabase
+cut connections ("SSLEOFError ... UNEXPECTED_EOF_WHILE_READING") and EVERY call then waited its full timeout before falling back to the local
+file -- a single page refresh could lose 60-100 s in "AI trade decision".  Now:
+  * one shared requests.Session (connection pooling: no new TLS handshake per call),
+  * short timeouts (connect 4 s, read 8 s),
+  * one quick retry for GET on a connection error,
+  * CIRCUIT BREAKER: after 3 failures in a row Supabase is skipped for 60 s (callers already fall back to the local database), then tried again.
+Everything that is not a supabase.co URL goes straight to the normal `requests`.
+"""
+import threading
+import time
+
+import requests as _rq
+from requests.adapters import HTTPAdapter
+
+from app_logging import get_logger
+
+logger = get_logger(__name__)
+
+CONNECT_T, READ_T = 4.0, 8.0
+FAIL_LIMIT, OPEN_SECS = 3, 60.0
+_LOCK = threading.Lock()
+_SESSION = {"s": None}
+_B = {"fails": 0, "open_until": 0.0, "opened": 0, "last_err": ""}
+
+
+def _is_sb(url):
+    u = str(url or "")
+    return ".supabase.co" in u or ".supabase.in" in u
+
+
+def _session():
+    with _LOCK:
+        if _SESSION["s"] is None:
+            s = _rq.Session()
+            ad = HTTPAdapter(pool_connections=4, pool_maxsize=16, max_retries=0)
+            s.mount("https://", ad)
+            s.mount("http://", ad)
+            _SESSION["s"] = s
+        return _SESSION["s"]
+
+
+def _reset_session():
+    with _LOCK:
+        old, _SESSION["s"] = _SESSION["s"], None
+    try:
+        if old is not None:
+            old.close()
+    except Exception:
+        pass
+
+
+def breaker_open():
+    return time.time() < _B["open_until"]
+
+
+def status():
+    return {"open": breaker_open(), "fails": _B["fails"], "opened_times": _B["opened"], "last_error": _B["last_err"],
+            "retry_in_s": max(0, int(_B["open_until"] - time.time()))}
+
+
+def _ok():
+    _B["fails"] = 0
+
+
+def _fail(err):
+    _B["fails"] += 1
+    _B["last_err"] = f"{type(err).__name__}: {str(err)[:120]}"
+    if _B["fails"] >= FAIL_LIMIT and not breaker_open():
+        _B["open_until"] = time.time() + OPEN_SECS
+        _B["opened"] += 1
+        _B["fails"] = 0
+        logger.warning("Supabase failed %d times in a row -> paused for %.0f s, local database is used meanwhile (%s)", FAIL_LIMIT, OPEN_SECS, _B["last_err"])
+
+
+def request(method, url, **kw):
+    if not _is_sb(url):
+        return _rq.request(method, url, **kw)
+    if breaker_open():
+        raise _rq.exceptions.ConnectionError(f"supabase paused for {max(0, int(_B['open_until'] - time.time()))} s after repeated failures (local database in use)")
+    t = kw.pop("timeout", None)
+    if isinstance(t, (int, float)):
+        kw["timeout"] = (CONNECT_T, min(float(t), READ_T))
+    elif t is None:
+        kw["timeout"] = (CONNECT_T, READ_T)
+    else:
+        kw["timeout"] = t
+    last = None
+    for attempt in range(2 if str(method).upper() == "GET" else 1):
+        try:
+            r = _session().request(method, url, **kw)
+            if r.status_code >= 500:
+                _fail(RuntimeError(f"HTTP {r.status_code}"))
+            else:
+                _ok()
+            return r
+        except (_rq.exceptions.SSLError, _rq.exceptions.ConnectionError, _rq.exceptions.Timeout) as e:
+            last = e
+            _reset_session()                       # a half-dead pooled connection is the usual reason -> next call opens a fresh one
+            time.sleep(0.25)
+    _fail(last)
+    raise last
+
+
+def get(url, **kw):
+    return request("GET", url, **kw)
+
+
+def post(url, **kw):
+    return request("POST", url, **kw)
+
+
+def patch(url, **kw):
+    return request("PATCH", url, **kw)
+
+
+def put(url, **kw):
+    return request("PUT", url, **kw)
+
+
+def delete(url, **kw):
+    return request("DELETE", url, **kw)
+
+
+def head(url, **kw):
+    return request("HEAD", url, **kw)
+
+
+def __getattr__(name):                             # requests.exceptions, requests.Session, ... keep working
+    if name.startswith("__"):
+        raise AttributeError(name)
+    return getattr(_rq, name)
+# @@END sb_http

@@ -291,7 +291,7 @@ import sqlite3
 import time
 import threading
 
-import requests
+import sb_http as requests   # shared Supabase session + circuit breaker (non-Supabase URLs behave exactly like requests)
 
 from app_logging import get_logger
 
@@ -1609,6 +1609,11 @@ def _run(ctx, state, gemini_keys, extra=None):
             return default
         finally:
             p2["timings"].append((name, round((time.time() - t0) * 1000)))
+            try:
+                import stock_watchlist as _wl2
+                _wl2.throttle_if_robot(time.time() - t0)       # robot worker rests a bit after a heavy step while a page is on screen
+            except Exception:
+                pass
 
     try:
         fam = stock_family.get_family(sym)
@@ -2244,7 +2249,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import requests
+import sb_http as requests   # shared Supabase session + circuit breaker (non-Supabase URLs behave exactly like requests)
 
 from app_logging import get_logger
 
@@ -2254,13 +2259,16 @@ ROOT = os.environ.get("STOCK_DATA_DIR", "stock_data")
 PATH = os.path.join(ROOT, "watchlist.json")
 TABLE = "stock_watchlist"
 MAX_STOCKS = 10            # the Robot Watchlist holds at most 10 stocks; each one runs the full Nifty-style research + engine all through market hours
-CYCLE_GAP = 75.0            # every watchlist stock is re-run 75 s after its previous run STARTED.  (Was 30 s with 2 workers: 7 stocks x 41 strategies + ML +
-                            # decision kept the small shared server busy all the time and made the Nifty page 2-3x slower.  Strategies work on 5-minute
-                            # candles and SL / target are watched on the live tick by tick_guard, so 75 s loses nothing.)
-WORKERS = 2                 # stocks in flight at the same time; the CPU-heavy part is still one-at-a-time (_HEAVY), so the 2nd worker only overlaps network waits
-DUTY_PAUSE = 0.6            # while a person is looking at the dashboard, each worker rests 0.6 x the time its stock took (max 12 s) -> the page keeps getting CPU
+SLOT_SEC = 300.0            # a stock's heavy engine (41 strategies + ML + consensus + AI decision + Gemini) runs ONCE per 5-minute candle.  Strategies work on closed 5-minute
+                            # candles; SL / target are watched on the live tick by tick_guard all the time.  (Running it every 30-75 s repeated the same answer on the same candle
+                            # and kept the small shared server so busy that one Nifty refresh took 2-5 minutes.)  300 divides the IST offset, so slots line up with the NSE candles.
+SLOT_DELAY = 20.0           # wait this long after a candle closes (the new candle has to be published) before the stock's turn can start
+WORKERS = 1                 # ONE stock at a time (two threads only fight for the same CPU core / GIL and slow the page)
+ROBOT_REST = 0.5            # while a person / the keep-open tab is on the dashboard: after every engine step the robot rests 0.5 x the time that step took
+STUCK_S = 480.0             # a stock run that is still going after 8 minutes is given up (the robot carries on with the others)
+DUTY_PAUSE = 0.3            # after a whole stock run (page open): rest 0.3 x its time (max 6 s)
 PAGE_WAIT_MAX = 120.0       # a watchlist stock waits for a running Nifty refresh to finish (at most this long) before it starts its heavy part
-RESULT_MAX_AGE = 90.0       # the dashboard re-uses the robot's result when it is younger than this -> instant stock loading
+RESULT_MAX_AGE = 330.0      # the dashboard re-uses the robot's result while it is younger than one candle slot (+30 s) -> a watchlist stock opens instantly, no recomputation
 GLOBAL_TTL = 30.0           # global markets / VIX refreshed every 30 s; global news every 3 min (changes slowly)
 POST_CLOSE_UNTIL = (15, 50)  # one last pass after the close so the day's candles get labelled
 _LOCK = threading.RLock()
@@ -2304,6 +2312,37 @@ def yield_if_robot(max_wait=45.0):
             _yield_to_page(max_wait)
     except Exception:
         pass
+
+
+def throttle_if_robot(dt):
+    """After an engine step: the robot's worker rests a fraction of the step time while a dashboard is on screen, so the page keeps getting the CPU."""
+    try:
+        if dt > 0.25 and threading.current_thread().name.startswith("wl"):
+            import safe_io
+            if safe_io.human_active():
+                time.sleep(min(6.0, ROBOT_REST * dt))
+    except Exception:
+        pass
+
+
+def slot_of(ts):
+    return int(ts // SLOT_SEC)
+
+
+def is_due(idx, n, last_slot, now_ts, first_t0=None):
+    """Is stock number `idx` (of `n`) due now?  Never run -> staggered start (15 s apart).  Otherwise once per 5-minute slot, a little after the candle
+    closed, each stock a few seconds after the previous one so the load is spread over the slot instead of arriving all at once."""
+    if last_slot is None:
+        return first_t0 is None or (now_ts - first_t0) >= idx * 15.0
+    if slot_of(now_ts) == last_slot:
+        return False
+    stagger = min(25.0, 200.0 / max(1, n))
+    return (now_ts % SLOT_SEC) >= SLOT_DELAY + idx * stagger
+
+
+def _ist_hms(ts=None):
+    from datetime import datetime, timezone, timedelta
+    return datetime.fromtimestamp(ts if ts is not None else time.time(), timezone(timedelta(hours=5, minutes=30))).strftime("%H:%M:%S")
 
 
 def _robot_may_start():
@@ -2487,7 +2526,7 @@ def fresh_result(sym, max_age=None, capital=None, risk_pct=None):
 def run_once(sym, token=None):
     """One full headless pass for one stock.  Returns the status row.  Never raises."""
     import stock_pipeline, stock_engine, stock_family, stock_phase3_ui
-    row = {"symbol": sym, "last_run": time.strftime("%H:%M:%S"), "ok": False, "gate": "", "direction": "", "open": "", "error": "", "ms": 0}
+    row = {"symbol": sym, "last_run": _ist_hms(), "ok": False, "gate": "", "direction": "", "open": "", "error": "", "ms": 0}
     t0 = time.time()
     try:
         _yield_to_page()                                   # the first pass builds the stock's engines (heavy) -> let the page load first
@@ -2536,14 +2575,18 @@ def run_once(sym, token=None):
         row["ms"] = round((time.time() - t0) * 1000)
         with _LOCK:
             row["_t"] = (_STATUS.get(sym) or {}).get("_t", time.time())
+            row["slot"] = (_STATUS.get(sym) or {}).get("slot")
             _STATUS[sym] = row
     return row
 
 
 def _loop():
-    """Every stock is scheduled on its own: it is re-run CYCLE_GAP (30 s) after its previous run STARTED, never waiting for a slower stock."""
+    """Every stock runs ONCE per 5-minute candle (staggered over the slot, one stock at a time) -- see SLOT_SEC.  A stock that never ran yet starts right away
+    (15 s apart).  A run that hangs for STUCK_S is given up so one bad stock can never freeze the others."""
     done_after_close = {}
     pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="wl")
+    first_t0 = {"t": None}
+    submitted = {}
     while True:
         try:
             time.sleep(0.5)
@@ -2559,6 +2602,7 @@ def _loop():
             now = mk.get("now_ist")
             after_close = False
             if state != "OPEN":
+                first_t0["t"] = None
                 try:
                     after_close = (now.hour, now.minute) <= POST_CLOSE_UNTIL and now.weekday() < 5 and now.hour >= 15
                 except Exception:
@@ -2566,25 +2610,48 @@ def _loop():
                 if not after_close:
                     time.sleep(20)
                     continue
+            if first_t0["t"] is None:
+                first_t0["t"] = time.time()
             token = None
             try:
                 token = __import__("upstox_auth")._stored_token()
             except Exception:
                 pass
-            for s in syms:
+            # watchdog: give up a run that hangs, start a fresh worker pool (the stuck thread is abandoned, it cannot be killed)
+            for s_, f_ in list(_INFLIGHT.items()):
+                if f_ is not None and not f_.done() and time.time() - submitted.get(s_, time.time()) > STUCK_S:
+                    logger.warning("watchlist run for %s is stuck for > %.0f s -> given up, robot carries on", s_, STUCK_S)
+                    with _LOCK:
+                        _STATUS.setdefault(s_, {}).update(error=f"run atka (>{int(STUCK_S // 60)} min) -- dobara try hoga", ok=False, last_run=_ist_hms())
+                    _INFLIGHT.pop(s_, None)
+                    try:
+                        pool.shutdown(wait=False)
+                    except Exception:
+                        pass
+                    pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="wl")
+            running = sum(1 for f_ in _INFLIGHT.values() if f_ is not None and not f_.done())
+            if running >= WORKERS:
+                continue
+            n = len(syms)
+            order = sorted(range(n), key=lambda i: (_STATUS.get(syms[i]) or {}).get("_t", 0.0))      # the stock that waited longest goes first
+            for i in order:
+                s = syms[i]
                 f = _INFLIGHT.get(s)
                 if f is not None and not f.done():
                     continue                                   # still running -> never stack a second run of the same stock
                 if after_close and done_after_close.get(s) == str(now.date()):
                     continue
-                last = (_STATUS.get(s) or {}).get("_t", 0.0)
-                if time.time() - last < CYCLE_GAP:
-                    continue
+                st_ = _STATUS.get(s) or {}
+                if not after_close and not is_due(i, n, st_.get("slot"), time.time(), first_t0["t"]):
+                    continue                                   # (after the close every stock gets ONE last pass, which labels the day's candles)
                 with _LOCK:
                     _STATUS.setdefault(s, {})["_t"] = time.time()
+                    _STATUS[s]["slot"] = slot_of(time.time())
                 if after_close:
                     done_after_close[s] = str(now.date())
+                submitted[s] = time.time()
                 _INFLIGHT[s] = pool.submit(_run_and_stamp, s, token)
+                break                                          # ONE new stock per loop turn; the pool takes WORKERS at a time
         except Exception:
             logger.exception("watchlist loop error (ignored)")
             time.sleep(5)
@@ -2595,7 +2662,7 @@ def _run_and_stamp(sym, token):
     try:                                                   # a person is on the dashboard -> rest a little after every stock so the page keeps getting the CPU
         import safe_io
         if safe_io.human_active():
-            time.sleep(min(12.0, DUTY_PAUSE * float(row.get("ms") or 0) / 1000.0))
+            time.sleep(min(6.0, DUTY_PAUSE * float(row.get("ms") or 0) / 1000.0))
     except Exception:
         pass
     with _LOCK:
@@ -2634,7 +2701,7 @@ def sidebar_panel():
     syms = list_symbols()
     with st.expander(f"⭐ Robot Watchlist ({len(syms)} stocks) -- market me khud trade", expanded=False):
         st.caption("Yahan max 10 stocks add kar sakte ho. Unki poori research + AI Trade Decision + Gemini review market OPEN hote hi khud chalega (app band ho tab bhi, "
-                   "jab tak GitHub robot tab app jagaye rakhe). Har stock har 30 second me naye data se dobara chalta hai (Nifty 50 jaisa). Trade lock, SL/target, win/loss sab record hota hai aur har stock apni learning se behtar hota hai. "
+                   "jab tak GitHub robot tab app jagaye rakhe). Har stock har naye 5-minute candle par ek baar poori research + decision chalata hai (ek ke baad ek, taaki Nifty page tez rahe); SL/target har waqt live price par dekhe jaate hain. Trade lock, win/loss sab record hota hai aur har stock apni learning se behtar hota hai. "
                    "Telegram par har trade ka alert aata hai.")
         txt = st.text_input("Stock naam / symbol", key="wl_add_text", placeholder="RELIANCE, TCS, INFY (comma se kai ek saath)", label_visibility="collapsed")
         if st.button("➕ Watchlist me add karo", key="wl_add_btn", width="stretch") and txt.strip():
@@ -2648,9 +2715,21 @@ def sidebar_panel():
         for s in syms:
             r = stat.get(s) or {}
             a, b, c = st.columns([3, 1, 1])
-            line = f"**{s}**" + (f" · {r.get('open')}" if r.get("open") else (f" · {r.get('gate')}" if r.get("gate") else " · pehla run baaki"))
-            if r.get("error") and not r.get("ok"):
-                line += " ⚠️"
+            _f = _INFLIGHT.get(s)
+            _running = _f is not None and not _f.done()
+            if r.get("open"):
+                tail = f" · {r.get('open')}"
+            elif _running:
+                tail = " · ⏳ research chal rahi hai"
+            elif r.get("error") and not r.get("ok"):
+                tail = f" · ⚠️ {str(r.get('error'))[:60]}"
+            elif r.get("gate"):
+                tail = f" · {r.get('gate')}"
+            elif r.get("last_run"):
+                tail = " · koi trade nahi (setup nahi bana)"
+            else:
+                tail = " · ⏳ pehla run line me"
+            line = f"**{s}**" + tail
             a.markdown(line)
             if b.button("Load", key=f"wl_load_{s}", width="stretch"):
                 st.session_state["active_symbol"] = s
@@ -2671,8 +2750,15 @@ def sidebar_panel():
         except Exception:
             pass
         alive = (_RUNNER["thread"] is not None and _RUNNER["thread"].is_alive())
-        st.caption(("🟢 Robot thread chal raha hai" if alive else "🔴 Robot thread band") + " · market OPEN me har stock har 30 sec me refresh · "
+        st.caption(("🟢 Robot thread chal raha hai" if alive else "🔴 Robot thread band") + f" · market OPEN me har stock har naye 5-min candle par ek baar (agla candle ~{int(SLOT_SEC - time.time() % SLOT_SEC)} sec me) · "
                    "Nifty 50 apne purane robot se chalta rahega.")
+        try:
+            import sb_http
+            _sb = sb_http.status()
+            if _sb["open"]:
+                st.warning(f"⚠️ Supabase abhi baar-baar fail ho raha hai -- {_sb['retry_in_s']} sec ke liye local database use ho raha hai (data safe hai, baad me sync hota hai). Error: {_sb['last_error']}")
+        except Exception:
+            pass
 # @@END stock_watchlist
 
 # @@MODULE stock_dashboard

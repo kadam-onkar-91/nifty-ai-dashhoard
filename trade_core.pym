@@ -33,7 +33,7 @@ logger = get_logger(__name__)
 
 import sqlite3
 import json
-import requests
+import sb_http as requests   # shared Supabase session + circuit breaker (non-Supabase URLs behave exactly like requests)
 from datetime import datetime, timedelta, time as _dtime
 
 import edge_model
@@ -1376,7 +1376,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta
 
-import requests
+import sb_http as requests   # shared Supabase session + circuit breaker (non-Supabase URLs behave exactly like requests)
 
 import trade_learning as tl
 
