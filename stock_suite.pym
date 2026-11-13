@@ -799,7 +799,7 @@ def _patch(name, src, symbol, misses):
         src = re.sub(old, new, src) if regex else src.replace(old, new)
 
     if name == "ai_trade_decision":
-        sub("sl_distance = min(28.0, max(20.0, round(0.9 * float(atr), 1))) if atr else 20.0",
+        sub("sl_distance = min(MAX_SL_PTS, max(MIN_SL_PTS, round(SL_ATR_MULT * float(atr), 1))) if atr else MIN_SL_PTS",
             "sl_distance = min(MAX_SL_PTS, max(MIN_SL_PTS, round(0.9 * float(atr), 4))) if atr else MIN_SL_PTS")
         sub(r"sl_distance = 20\.0", "sl_distance = MIN_SL_PTS", regex=True)
         sub("round(_d_edge + 0.25 * float(atr), 1)", "round(_d_edge + 0.25 * float(atr), 4)")

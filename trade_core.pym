@@ -1041,6 +1041,12 @@ import time as _time
 SEGMENT_MIN_SAMPLES = 8          # resolved trades before a single segment can be judged
 SEGMENT_COMBO_MIN_SAMPLES = 6    # playbook+grade combo needs fewer (it is more specific)
 SEGMENT_BLOCK_WINRATE = 30.0     # below this win-rate (with enough samples) the segment is paused
+# v62 LANE SCORECARD: the relief lanes (momentum / tape / evidence / live_dom / reaction) waive part of the learned bar.  Their own record now
+# decides whether they may keep doing so: a lane with >= LANE_MIN_SAMPLES resolved real trades and a win rate below LANE_BLOCK_WINRATE is paused
+# (those setups are still tracked as shadow trades).  The plain 'base' lane is never paused, so the engine can not freeze completely.
+LANE_GUARD = True
+LANE_MIN_SAMPLES = 8
+LANE_BLOCK_WINRATE = 34.0
 PROBE_MIN_SAMPLES = 6
 PROBE_PAUSE_WINRATE = 35.0       # probes pause themselves below this win-rate
 RECENT_WINDOW = 10               # last N resolved non-probe trades define "current form"
@@ -1091,6 +1097,7 @@ def get_segment_stats(force=False):
                 if meta.get(key):
                     bump(f"{key}={meta[key]}", win)
             bump(f"probe={bool(meta.get('probe'))}", win)
+            bump(f"lane={meta.get('lane') or 'base'}", win)
             if meta.get("playbook") and meta.get("grade"):
                 bump(f"combo={meta['playbook']}|{meta['grade']}", win)
     except Exception:
@@ -1140,6 +1147,8 @@ def segment_gate(meta):
         checks.append((f"combo={meta['playbook']}|{meta['grade']}", SEGMENT_COMBO_MIN_SAMPLES, SEGMENT_BLOCK_WINRATE))
     if meta.get("probe"):
         checks.append(("probe=True", PROBE_MIN_SAMPLES, PROBE_PAUSE_WINRATE))
+    if LANE_GUARD and meta.get("lane") and meta.get("lane") != "base":
+        checks.append((f"lane={meta['lane']}", LANE_MIN_SAMPLES, LANE_BLOCK_WINRATE))
     for key, min_n, floor in checks:
         d = stats.get(key)
         if d and d["n"] >= min_n and d["win_rate"] is not None and d["win_rate"] < floor:

@@ -42,12 +42,17 @@ MIN_EV_R = 0.05                 # expected value (in R) a trade must show to be 
 DROUGHT_EV_RELIEF = 0.06        # in a dry spell the bar eases a little, but never below ~break-even
 DROUGHT_AFTER_MIN = 120         # "dry spell" = no setup logged for this long inside the session ...
 DROUGHT_CHECK_FROM = dtime(11, 30)   # ... or none at all today by this time
-BAD_FORM_EV_EXTRA = 0.0         # was 0.10: demanding MORE after losses froze the engine (no trades -> no data -> no recovery).
+BAD_FORM_EV_EXTRA = 0.08         # was 0.10: demanding MORE after losses froze the engine (no trades -> no data -> no recovery).
                                 # Recovery now comes from shadow trades + the mistake memory instead of a higher wall.
 REVIEW_DEADLINE_S = 150.0       # the review runs in a BACKGROUND thread (page never waits), so it may take as long as a real
                                 # grounded review needs (40 s search call + 25 s plain retry per key). 45 s / 25 s / 15 s was too
                                 # tight: slow-but-working Gemini calls timed out and were wrongly reported as 'unavailable'.
-MAX_SL_PTS = 28.0               # widest stop the structure-aware SL may use (same ceiling as the base ATR stop)
+# v62 WIDER STOP.  The real log showed nearly every trade stopped out within 5-30 minutes: a 20-28 pt stop (0.9 x ATR) sits INSIDE one normal 5-min
+# candle of noise, and the tracker scores a wick through the stop as a loss.  Stop = SL_ATR_MULT x ATR, clamped to [MIN_SL_PTS, MAX_SL_PTS].
+# The target is never closer than 1.5R (MIN_RR_RATIO), so a wider stop automatically gets a farther target.
+SL_ATR_MULT = 1.5
+MIN_SL_PTS = 30.0
+MAX_SL_PTS = 45.0               # widest stop the structure-aware SL may use too
 OI_WALL_SIGNIFICANCE = 0.60     # a wall counts when its OI >= this fraction of the strongest wall in range
 OI_FRONT_RUN_MIN_PTS = 4.0      # target sits this many pts BEFORE the wall (or OI_FRONT_RUN_ATR x ATR, whichever is larger)
 OI_FRONT_RUN_ATR = 0.25
@@ -1656,7 +1661,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     # SL: base 20 pts (user's fixed stop). In faster candles a flat 20 pts got stopped by normal noise
     # (4 of 5 recent setups), so it widens slightly with ATR -- hard-capped at 28 pts so trades stay frequent.
     try:
-        sl_distance = min(28.0, max(20.0, round(0.9 * float(atr), 1))) if atr else 20.0
+        sl_distance = min(MAX_SL_PTS, max(MIN_SL_PTS, round(SL_ATR_MULT * float(atr), 1))) if atr else MIN_SL_PTS
     except Exception:
         sl_distance = 20.0
     # STRUCTURE-AWARE STOP (a parameter, not a gate): a stop that sits INSIDE the support/resistance zone it is
@@ -2088,6 +2093,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
         _entry_meta["lane"] = "live_dom"
     if _evidence_lane and "lane" not in _entry_meta:
         _entry_meta["lane"] = "evidence"
+    _entry_meta.setdefault("lane", "base")      # v62: every trade now carries its lane so the lane scorecard can judge it
     _seg_blocked, _seg_reason = trade_learning.segment_gate(_entry_meta)
     if _seg_blocked:
         return {"has_setup": False, "reason": _seg_reason, "context_audit": context_audit,
@@ -2108,7 +2114,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     if _momentum_lane:
         confidence_note = ("Momentum-capture lane: live price action and the named strategies agree strongly, so the engine's own (history-driven) "
                            f"win-rate bar was waived for this move. Honest estimate {100 * _wp:.0f}% at R:R {rr:.2f}; Gemini's review and the "
-                           "28-pt stop still apply. " + confidence_note)
+                           "wide ATR stop still apply. " + confidence_note)
     if _global_note:
         confidence_note += " " + _global_note
     factor_flags["_entry_meta"] = _entry_meta
@@ -3081,7 +3087,7 @@ TRADE_ANSWER_RULES = """
 When asked for a trade / entry / exit / "kahan buy ya sell":
 1. FIRST read 'AI TRADE DECISION (final)' and the live strategy / S/R / OI sections.  If the engine has a trade, quote ITS exact entry, SL, target and R:R.
 2. If the engine has NO trade, say so with the engine's gate reason, then give a CONDITIONAL plan from the real levels in the data:
-   'BUY agar <level> ke upar 5-min close aaye -> entry <price>, SL <price> (max 28 pts), target <price> (near OI wall), R:R <x>' and the mirror SELL plan.
+   'BUY agar <level> ke upar 5-min close aaye -> entry <price>, SL <price> (max 45 pts), target <price> (near OI wall), R:R <x>' and the mirror SELL plan.
 3. Use only prices that appear in the supplied data (S/R zones, VWAP, EMA, OI walls, day high/low).  Never invent a level.  Show the arithmetic (points to SL / target, R:R).
 4. Say clearly where NO trade should be taken (middle of range, against live price action, extended move) and what would make the setup invalid.
 5. Give a probability in words (strong / medium / weak) with the 3-4 factors that decide it, including the facts against it.  No guarantees.

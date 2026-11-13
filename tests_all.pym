@@ -32,6 +32,11 @@ import ai_trade_decision as atd
 
 KEYS = tl.ALL_FACTOR_KEYS
 
+# v62: the production stop is now wide (see ai_trade_decision.SL_ATR_MULT).  The tuned scenarios below were written for the old 20-28 pt geometry and
+# test OTHER logic (lanes, EV bar, walls), so they run with that geometry pinned; V62WideStopAndLaneGuardTests checks the real defaults.
+_SL_DEFAULTS = (atd.MIN_SL_PTS, atd.MAX_SL_PTS, atd.SL_ATR_MULT)
+atd.MIN_SL_PTS, atd.MAX_SL_PTS, atd.SL_ATR_MULT = 20.0, 28.0, 0.9
+
 
 def _flags(n_true, **extra):
     f = {k: (i < n_true) for i, k in enumerate(KEYS)}
@@ -369,12 +374,12 @@ class GeminiFinalBlockTests(DbCase):
 
 class StopAndDiagnosticsTests(DbCase):
     def test_structure_aware_stop_goes_beyond_the_zone_but_is_capped(self):
-        near = _decide(zone_edge=6.0)                       # zone edge 6 pts away -> normal 20 pt stop
+        near = _decide(zone_edge=6.0)                       # zone edge 6 pts away -> normal (minimum) stop
         self.assertTrue(near["has_setup"], near.get("reason"))
-        self.assertAlmostEqual(abs(near["underlying_entry"] - near["stop_loss"]), 20.0, places=1)
-        far = _decide(zone_edge=26.0)                       # edge 26 pts away -> 26 + 0.25*14 = 29.5
+        self.assertAlmostEqual(abs(near["underlying_entry"] - near["stop_loss"]), atd.MIN_SL_PTS, places=1)
+        far = _decide(zone_edge=60.0)                       # edge 60 pts away -> beyond the cap
         self.assertTrue(far["has_setup"], far.get("reason"))
-        self.assertAlmostEqual(abs(far["underlying_entry"] - far["stop_loss"]), atd.MAX_SL_PTS, places=1)   # 26+3.5=29.5 -> capped at 28
+        self.assertAlmostEqual(abs(far["underlying_entry"] - far["stop_loss"]), atd.MAX_SL_PTS, places=1)   # capped at MAX_SL_PTS
         self.assertGreaterEqual(far["risk_reward"], 1.5)
         huge = _decide(zone_edge=80.0)                      # absurd zone -> capped
         self.assertTrue(huge["has_setup"], huge.get("reason"))
@@ -1057,6 +1062,34 @@ class LearningLoopEndToEndTests(DbCase):
 
 if __name__ == "__main__":
     unittest.main()
+class V62WideStopAndLaneGuardTests(unittest.TestCase):
+    def test_production_stop_defaults_are_wide(self):
+        self.assertEqual(_SL_DEFAULTS, (30.0, 45.0, 1.5))
+        atr = 22.0
+        sl = min(_SL_DEFAULTS[1], max(_SL_DEFAULTS[0], round(_SL_DEFAULTS[2] * atr, 1)))
+        self.assertEqual(sl, 33.0)          # old formula gave 20 pts for the same ATR
+
+    def test_lane_guard_pauses_a_losing_relief_lane_but_never_the_base_lane(self):
+        d = tempfile.mkdtemp(); old = tl.DB_NAME
+        tl.DB_NAME = os.path.join(d, "t.db"); tl._supabase_url = tl._supabase_key = None
+        try:
+            tl.init_db()
+            import sqlite3
+            c = sqlite3.connect(tl.DB_NAME)
+            for lane in ("tape", "base"):
+                for i in range(10):                                   # 2 wins in 10 = 20 %
+                    fj = json.dumps(_flags(10, **{"_entry_meta": {"logic_version": tl.LOGIC_VERSION, "lane": lane}}))
+                    c.execute("INSERT INTO ai_trade_setups (timestamp,direction,strike,option_type,underlying_entry,stop_loss,target,"
+                              "confidence_pct,factors_json,status) VALUES ('2026-01-01 10:00:00','BUY',1,'CE',1,1,1,1,?,?)",
+                              (fj, "WIN" if i < 2 else "LOSS"))
+            c.commit(); c.close()
+            tl._SEG_CACHE["stats"] = None
+            blocked, why = tl.segment_gate({"lane": "tape"})
+            self.assertTrue(blocked, why); self.assertIn("lane=tape", why)
+            self.assertEqual(tl.segment_gate({"lane": "base"}), (False, ""))
+        finally:
+            tl.DB_NAME = old; tl._SEG_CACHE["stats"] = None
+
 # @@END tests_edge_v36
 # @@MODULE tests_level_verdict
 """
@@ -1842,12 +1875,12 @@ class MomentumLaneTests(DbCase):
 
 
 class StopCeilingTests(DbCase):
-    def test_stop_is_never_wider_than_28_points(self):
+    def test_stop_is_never_wider_than_the_cap(self):
         for atr in (14.0, 40.0, 80.0):
             for d in ("BUY", "SELL"):
                 out = _decide(d, atr=atr, zone_edge=60.0)
                 if out["has_setup"]:
-                    self.assertLessEqual(abs(out["underlying_entry"] - out["stop_loss"]), 28.0 + 1e-6, (atr, d))
+                    self.assertLessEqual(abs(out["underlying_entry"] - out["stop_loss"]), atd.MAX_SL_PTS + 1e-6, (atr, d))
 
 
 class OiPickerTests(DbCase):
