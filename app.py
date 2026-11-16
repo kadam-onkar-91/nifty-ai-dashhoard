@@ -2088,7 +2088,6 @@ def _live_dashboard_body():
                 st.session_state["_nifty50_news_ts"] = _t_ni.time()
                 st.session_state["_nifty50_news_cache"] = _n50_news
             else:
-                _n50_news_status = st.session_state.get("_nifty50_news_status")      # v69 fix: was unbound on this path (UnboundLocalError)
                 # v68: stale (>10 min) news is renewed in a BACKGROUND thread -- the page never waits for it; fresh rows appear on the next 30 s refresh
                 try:
                     import news_intel
