@@ -2097,6 +2097,11 @@ def _live_dashboard_body():
                         st.markdown(f"- **{_title}** — {_src} · {_pub} · [Open]({_link})")
                     else:
                         st.markdown(f"- **{_title}** — {_src} · {_pub}")
+            try:
+                import news_intel
+                news_intel.render_news(st, "NIFTY 50", _n50_news, key="nifty50")
+            except Exception:
+                pass
 
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("📊 NIFTY 50 Fundamentals (constituent aggregate)", expanded=False):
@@ -2134,13 +2139,12 @@ def _live_dashboard_body():
                             _text = f"{_val:.2f}"
                     _nf_cols[_i % 5].metric(_label, _text, help=(f"{_cov or 0} of {_n50_fund.get('constituents')} constituents reporting" if _cov is not None else None))
                 st.caption(_n50_fund.get("regime_note", ""))
+                try:
+                    import news_intel
+                    news_intel.render_fundamentals(st, _n50_fund, is_index=True)
+                except Exception:
+                    pass
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        try:
-            import news_intel
-            news_intel.render(st, "NIFTY 50", st.session_state.get("_nifty50_news_cache") or [], st.session_state.get("_nifty50_fund_cache") or {}, is_index=True, key="nifty50")
-        except Exception:
-            pass
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("🌐 Global Market Sentiment & Regional Live News", expanded=False):
             st.info(f"**⚡ World's Strongest News Highlight (Live Today):**\n\n*{top_headline}*")

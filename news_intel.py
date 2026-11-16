@@ -234,50 +234,45 @@ _BADGE = {"POSITIVE": "🟢 POSITIVE", "NEGATIVE": "🔴 NEGATIVE", "NEUTRAL": "
 _EFFECT = {"UP": "🟢 UP", "DOWN": "🔴 DOWN", "VOLATILE": "🟠 VOLATILE (tez jhatke)", "SIDEWAYS": "⚪ SIDEWAYS", "UNCLEAR": "⚪ unclear"}
 
 
-def render(st, subject, news_items, fundamentals, is_index=False, key="x"):
-    """Draws the verdict block.  Cheap: local rule-based maths only; the events table is behind a button."""
+def _sig(c):
+    return "🟢" if c > 0 else "🔴" if c < 0 else "⚪"
+
+
+def render_fundamentals(st, fundamentals, is_index=False):
+    """One compact line INSIDE the existing Fundamentals expander (no new boxes)."""
     try:
         fv = fundamentals_verdict(fundamentals, is_index=is_index)
+        st.markdown(f"**Verdict: {_BADGE[fv['verdict']]}**")
+        if fv["points"]:
+            st.caption(" · ".join(f"{a} {b} {_sig(c)}" for a, b, c in fv["points"]) + "  — rule-based andaza, advice nahi.")
+    except Exception:
+        pass
+
+
+def render_news(st, subject, news_items, key="x"):
+    """Verdict + upcoming events INSIDE the existing News expander (no new boxes)."""
+    try:
         nv = news_verdict(news_items)
-        st.markdown(f"#### 🧭 {subject}: Fundamentals + News verdict")
-        c1, c2 = st.columns(2)
-        c1.metric("Fundamentals", _BADGE[fv["verdict"]], help="Rule-based: ROE, margin, growth, valuation, debt ko +1/0/-1 score karke average.")
-        c2.metric("News (fresh headlines)", _BADGE[nv["verdict"]], help="Headline keyword score, 24h ko full weight, 7 din se purani news ginti me nahi.")
-        with st.expander("Fundamentals verdict kyun? (point-by-point)", expanded=False):
-            if fv["points"]:
-                st.table([{"Metric": a, "Value": b, "Signal": ("🟢 +1" if c > 0 else "🔴 -1" if c < 0 else "⚪ 0")} for a, b, c in fv["points"]])
-            else:
-                st.info("Fundamental data nahi mila, isliye verdict nahi bana.")
-            st.caption("Ye mota rule-based andaza hai, financial advice nahi. Banks me Debt/Equity score nahi hota.")
-        with st.expander("News verdict kyun? (har headline)", expanded=False):
-            if nv["note"]:
-                st.info(nv["note"])
-            if nv["rows"]:
-                st.table([{"Sentiment": a, "Umr": b, "Headline": c, "Source": d} for a, b, c, d, _l in nv["rows"]])
-            st.caption("Keyword-based padhai hai -- sarcasm/context galat ho sakta hai. Fursat me headline khud padho.")
-        with st.expander("🗓️ Agle events kab aur kitna asar? (planning ke liye)", expanded=False):
-            st.caption("Neeche ki fixed list local hai. 'Google se events nikalo' dabane par AI Google Search se agle 7 din ke events lata hai "
-                       "(30 min cache). Ye AI-estimate hai -- date/time khud verify karo; direction ek aam pattern hai, guarantee nahi.")
-            rows = fixed_calendar()
-            ck = f"_ni_events_{key}"
-            if st.button("🔎 Google se events nikalo", key=f"ni_btn_{key}"):
-                with st.spinner("Events dhoondh raha hoon..."):
-                    keys = st.session_state.get("_news_intel_keys") or []
-                    ev, err = fetch_events(keys, subject)
-                st.session_state[ck] = (time.time(), ev, err)
-            cached = st.session_state.get(ck)
-            if cached and time.time() - cached[0] < EVENTS_TTL_S:
-                if cached[2]:
-                    st.warning(cached[2])
-                rows = rows + list(cached[1])
-            rows = sorted(rows, key=lambda r: (str(r.get("date_ist")), str(r.get("time_ist"))))
-            st.table([{"Date": r.get("date_ist"), "Time (IST)": r.get("time_ist"), "Event": r.get("event"),
+        sc = [r[0] for r in nv["rows"]]
+        st.markdown(f"**News verdict: {_BADGE[nv['verdict']]}**  ·  🟢 {sum('Positive' in x for x in sc)}  🔴 {sum('Negative' in x for x in sc)}  ⚪ {sum('Neutral' in x for x in sc)}")
+        st.caption(nv["note"] or "Sirf 7 din ke andar ki news ginti me; headline ke neeche har ek ka sentiment: " +
+                   " | ".join(f"{r[0].split()[0]} {r[2][:38]}…" for r in nv["rows"][:4]))
+        ck = f"_ni_events_{key}"
+        if st.button("🗓️ Agle events (kab, kitna asar) — Google se", key=f"ni_btn_{key}"):
+            with st.spinner("Events dhoondh raha hoon..."):
+                ev, err = fetch_events(st.session_state.get("_news_intel_keys") or [], subject)
+            st.session_state[ck] = (time.time(), ev, err)
+        rows = fixed_calendar()
+        cached = st.session_state.get(ck)
+        if cached and time.time() - cached[0] < EVENTS_TTL_S:
+            if cached[2]:
+                st.warning(cached[2])
+            rows = rows + list(cached[1])
+        rows = sorted(rows, key=lambda r: (str(r.get("date_ist")), str(r.get("time_ist"))))
+        st.dataframe([{"Date": r.get("date_ist"), "Time IST": r.get("time_ist"), "Event": r.get("event"),
                        "Asar": _EFFECT.get(str(r.get("expected_effect")).upper(), r.get("expected_effect")),
-                       "Kab tak asar": r.get("reaction_window"), "Kyun": r.get("why")} for r in rows])
-            st.markdown("**Aam reaction pattern (kab asar dikhta hai):**")
-            st.table([{"Event": a, "Aam pattern": b} for a, b in TYPICAL_REACTION])
-    except Exception as exc:  # the page must never break because of this block
-        try:
-            st.caption(f"News/fundamentals verdict abhi nahi bana: {str(exc)[:100]}")
-        except Exception:
-            pass
+                       "Kab tak": r.get("reaction_window")} for r in rows], hide_index=True, width="stretch")
+        st.caption("Events AI/Google-estimate hain, date-time khud verify karo; asar ek aam pattern hai, guarantee nahi. "
+                   "Result aksar market ke baad -> agle din gap; RBI/Budget -> 5-15 min spike; US data -> agla open/GIFT Nifty.")
+    except Exception:
+        pass
