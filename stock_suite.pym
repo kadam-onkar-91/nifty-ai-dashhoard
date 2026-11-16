@@ -3299,6 +3299,11 @@ def _body(symbol, ai_engine, helpers):
     st.markdown("<br>", unsafe_allow_html=True)
     with st.expander(f"📊 {sym} Fundamentals", expanded=False):
         helpers["fundamentals"](ctx["fundamentals"])
+    try:
+        import news_intel
+        news_intel.render(st, sym, ctx.get("news") or [], ctx.get("fundamentals") or {}, is_index=False, key=f"stk_{sym}")
+    except Exception:
+        pass
     st.markdown("<br>", unsafe_allow_html=True)
     with st.expander("🌐 Global Market Sentiment & Regional Live News", expanded=False):
         st.info(f"**⚡ World's Strongest News Highlight (Live Today):**\n\n*{top_headline}*")

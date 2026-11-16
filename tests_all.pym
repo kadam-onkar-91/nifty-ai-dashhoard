@@ -1090,6 +1090,22 @@ class V62WideStopAndLaneGuardTests(unittest.TestCase):
         finally:
             tl.DB_NAME = old; tl._SEG_CACHE["stats"] = None
 
+class V64NewsIntelTests(unittest.TestCase):
+    def test_fundamentals_and_news_verdicts(self):
+        import news_intel as ni
+        good = {"trailingPE": 12, "returnOnEquity": 0.17, "profitMargins": 0.2, "revenueGrowth": 0.2, "earningsGrowth": 0.3, "sector": "Financial Services"}
+        bad = {"trailingPE": -5, "returnOnEquity": 0.02, "profitMargins": -0.1, "revenueGrowth": -0.2, "earningsGrowth": -0.4}
+        self.assertEqual(ni.fundamentals_verdict(good)["verdict"], "POSITIVE")
+        self.assertEqual(ni.fundamentals_verdict(bad)["verdict"], "NEGATIVE")
+        self.assertEqual(ni.fundamentals_verdict({})["verdict"], "UNCLEAR")
+        from datetime import datetime, timezone
+        now = datetime(2026, 11, 16, 8, tzinfo=timezone.utc)
+        old_bad = [{"title": "Bank shares crash 14% after court rejects plea", "published": "Thu, 15 Oct 2026 07:00:00 GMT"}]
+        self.assertEqual(ni.news_verdict(old_bad, now=now)["verdict"], "NEUTRAL")         # 1 month old -> not counted
+        fresh = [{"title": "Market rally on FII inflows", "published": "Mon, 16 Nov 2026 04:00:00 GMT"}]
+        self.assertEqual(ni.news_verdict(fresh, now=now)["verdict"], "POSITIVE")
+        self.assertEqual(ni._extract_json('```json\n[{"event":"RBI policy","date_ist":"2026-12-05"}]\n```')[0]["event"], "RBI policy")
+
 # @@END tests_edge_v36
 # @@MODULE tests_level_verdict
 """

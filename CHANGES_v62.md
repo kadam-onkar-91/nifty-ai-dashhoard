@@ -4,3 +4,6 @@
 3. Lane scorecard (trade_core): momentum/tape/evidence/live_dom/reaction lane ka apna real record (>=8 trades, win < 34%) -> lane pause. 'base' lane kabhi pause nahi hoti. Har stock ka apna record.
 4. BAD_FORM_EV_EXTRA 0.0 -> 0.08 (kharab form me bar thoda upar; 30h baad khud expire).
 Revert: constants ko purani value pe karo (SL_ATR_MULT=0.9, MIN 20, MAX 28; LANE_GUARD=False).
+
+# v64 — news_intel.py (naya)
+Nifty 50 aur har stock page par: Fundamentals verdict (POSITIVE/NEGATIVE/NEUTRAL, point-by-point), News verdict (har headline ka sentiment, 7 din se purani ginti me nahi), aur "Agle events kab aur kitna asar" (fixed expiry/US-open + button dabane par Google-grounded Gemini events). Verdict local maths hai (load/refresh slow nahi); events sirf button par chalte hain.

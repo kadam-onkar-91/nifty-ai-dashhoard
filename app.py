@@ -108,6 +108,7 @@ if not GEMINI_API_KEYS:
 
 GEMINI_API_KEY = GEMINI_API_KEYS[0]  # primary key -- kept for any module that still expects a single key
 ai_engine = HybridAIEngine(api_keys=GEMINI_API_KEYS)
+st.session_state["_news_intel_keys"] = GEMINI_API_KEYS   # v64: news_intel's on-demand events lookup uses the same key pool
 
 try:
     TELEGRAM_BOT_TOKEN = st.secrets["TELEGRAM_BOT_TOKEN"]
@@ -2134,6 +2135,12 @@ def _live_dashboard_body():
                     _nf_cols[_i % 5].metric(_label, _text, help=(f"{_cov or 0} of {_n50_fund.get('constituents')} constituents reporting" if _cov is not None else None))
                 st.caption(_n50_fund.get("regime_note", ""))
 
+        st.markdown("<br>", unsafe_allow_html=True)
+        try:
+            import news_intel
+            news_intel.render(st, "NIFTY 50", st.session_state.get("_nifty50_news_cache") or [], st.session_state.get("_nifty50_fund_cache") or {}, is_index=True, key="nifty50")
+        except Exception:
+            pass
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("🌐 Global Market Sentiment & Regional Live News", expanded=False):
             st.info(f"**⚡ World's Strongest News Highlight (Live Today):**\n\n*{top_headline}*")
