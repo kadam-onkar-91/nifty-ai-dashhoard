@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 IST = timezone(timedelta(hours=5, minutes=30))
-EVENTS_TTL_S = 1800
+EVENTS_TTL_S = 7200
 
 # ----------------------------------------------------------------------------------------------------------------- fundamentals
 def _f(v):
@@ -227,7 +227,7 @@ def _extract_json(txt):
         return []
     try:
         data = json.loads(txt[a:b + 1])
-        return [x for x in data if isinstance(x, dict) and x.get("event")][:10]
+        return [x for x in data if isinstance(x, dict) and x.get("event")][:16]
     except Exception:
         return []
 
@@ -255,13 +255,13 @@ def fetch_events(keys, subject, headlines=None, now_ist=None):
         pass
     heads = "\n".join(f"- {h}" for h in (headlines or [])[:10])
     prompt = (f"Aaj {now_ist.strftime('%Y-%m-%d %H:%M')} IST hai. Google Search se INDIAN market ({subject}) ke liye: (1) pichhle 48 ghante me jo market-moving "
-              "news/event HO CHUKA, aur (2) agle 7 din me jo SCHEDULED event AANE WALA hai -- dono batao. Har item me bata: kya hai, kab (IST), kis par asar "
+              "news/event HO CHUKA, aur (2) agle 7 din me jo SCHEDULED event AANE WALA hai -- dono batao. Cover karo: RBI/monetary policy, sarkari policy/budget/GST, India data (CPI/WPI/GDP/IIP), FII/DII flows, Fed/US data, crude/dollar, geopolitics, sector news, bade stocks/results. Har item me bata: kya hai, kab (IST), kis par asar "
               "(Nifty / Bank Nifty / IT / PSU banks / specific stock), direction, aur Indian market (09:15-15:30 IST) me asar kab aur kahan padta hai. "
               "Sirf verifiable cheezein; invent mat karo; time confirm nahi to 'unknown'. Ye headlines bhi context hain:\n" + heads +
-              "\nSirf JSON array do (max 10), koi aur text nahi. Format: "
-              '[{"event":"..","status":"happened|upcoming","date_ist":"YYYY-MM-DD","time_ist":"HH:MM ya unknown","affects":"kis par asar",'
+              "\nSirf JSON array do (max 14), koi aur text nahi. Format: "
+              '[{"event":"..","status":"happened|upcoming","date_ist":"YYYY-MM-DD","time_ist":"HH:MM ya unknown","type":"RBI|Policy|Data|Global|Sector|Stock|Results","affects":"kis par asar","duration":"asar kitni der (e.g. 30 min / pura din / 2-3 din)",'
               '"expected_effect":"UP|DOWN|VOLATILE|SIDEWAYS|UNCLEAR","why":"1 line","india_note":"India market me asar kab/kahan, 1 line"}]')
-    body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}], "generationConfig": {"maxOutputTokens": 1400}}
+    body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}], "generationConfig": {"maxOutputTokens": 2600}}
     models = sorted(list(atd.REVIEW_MODELS), key=lambda m: 0 if "lite" in m else 1)
 
     def _one(key, model):
@@ -360,6 +360,10 @@ def render_news(st, subject, news_items, key="x"):
         st.caption(nv["note"] or "Sirf 7 din ke andar ki news ginti me; headline ke neeche har ek ka sentiment: " +
                    " | ".join(f"{r[0].split()[0]} {r[2][:38]}…" for r in nv["rows"][:4]))
         heads = [r[2] for r in nv["rows"]]
+        _ks = st.session_state.get("_news_intel_keys") or []
+        _es = events_state(key)
+        if key == "nifty50" and _ks and (not _es or (_es.get("status") in ("done", "error") and time.time() - _es.get("ts", 0) > EVENTS_TTL_S)):
+            start_events(key, _ks, subject, heads)      # one automatic BACKGROUND lookup per 2 h (page never waits)
         if st.button("🗓️ Aaj/kal kya hua + agle events (Google se)", key=f"ni_btn_{key}"):
             start_events(key, st.session_state.get("_news_intel_keys") or [], subject, heads)
         stt = events_state(key)
@@ -374,11 +378,11 @@ def render_news(st, subject, news_items, key="x"):
         table = []
         for r in fixed_calendar() + rows:
             up = str(r.get("status", "upcoming")).lower().startswith("up")
-            table.append({"Status": "🕒 Aane wala" if up else "✅ Ho chuka", "Kab (IST)": f"{r.get('date_ist')} {r.get('time_ist')}",
+            table.append({"Status": "🕒 Aane wala" if up else "✅ Ho chuka", "Type": r.get("type") or "", "Kab (IST)": f"{r.get('date_ist')} {r.get('time_ist')}",
                           "Kya": r.get("event"), "Kis par asar": r.get("affects") or "Nifty / market",
                           "Direction": _EFFECT.get(str(r.get("expected_effect")).upper(), r.get("expected_effect")),
                           "India market me kab / kahan": (r.get("india_text") or (india_impact(r.get("date_ist"), r.get("time_ist")) if up else (r.get("india_note") or "ho chuka"))),
-                          "Kyun": r.get("why") or "", "_k": str(r.get("date_ist")) + str(r.get("time_ist"))})
+                          "Kitni der asar": r.get("duration") or r.get("reaction_window") or "", "Kyun": r.get("why") or "", "_k": str(r.get("date_ist")) + str(r.get("time_ist"))})
         table.sort(key=lambda x: x["_k"])
         for x in table:
             x.pop("_k")
