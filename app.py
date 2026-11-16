@@ -2082,9 +2082,22 @@ def _live_dashboard_body():
         st.markdown("<br>", unsafe_allow_html=True)
         with st.expander("🗞️ NIFTY 50 News", expanded=False):
             _refresh_nifty_news = st.button("🔄 Refresh NIFTY 50 News", key="refresh_nifty50_news")
+            import time as _t_ni
             if _refresh_nifty_news or "_nifty50_news_cache" not in st.session_state:
                 _n50_news, _n50_news_status = multi_stock_engine.get_nifty50_news(limit=10)
+                st.session_state["_nifty50_news_ts"] = _t_ni.time()
                 st.session_state["_nifty50_news_cache"] = _n50_news
+            else:
+                # v68: stale (>10 min) news is renewed in a BACKGROUND thread -- the page never waits for it; fresh rows appear on the next 30 s refresh
+                try:
+                    import news_intel
+                    _bg = news_intel.take_bg_news()
+                    if _bg:
+                        st.session_state["_nifty50_news_cache"], st.session_state["_nifty50_news_ts"] = _bg, _t_ni.time()
+                    elif _t_ni.time() - st.session_state.get("_nifty50_news_ts", 0) > 600:
+                        news_intel.start_bg_news(lambda: multi_stock_engine.get_nifty50_news(limit=10)[0])
+                except Exception:
+                    pass
                 st.session_state["_nifty50_news_status"] = _n50_news_status
             _n50_news = st.session_state.get("_nifty50_news_cache", [])
             if not _n50_news:

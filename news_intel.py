@@ -232,8 +232,15 @@ def _extract_json(txt):
         return []
 
 
-def fetch_events(keys, subject, now_ist=None):
-    """Google-Search grounded Gemini call.  Returns (events, error_text)."""
+import threading
+
+_EVENTS = {}            # key -> {"ts", "status": running|done|error, "rows", "err"}   (filled by a background thread, never touches st.*)
+_EV_LOCK = threading.Lock()
+
+
+def fetch_events(keys, subject, headlines=None, now_ist=None):
+    """Google-Search grounded Gemini call (blocking; run it in the background thread).  Returns (rows, error_text).
+    Covers what HAPPENED in the last ~48h and what is COMING in the next 7 days, with where/when it can hit the Indian market."""
     now_ist = now_ist or datetime.now(IST)
     try:
         import requests
@@ -241,18 +248,21 @@ def fetch_events(keys, subject, now_ist=None):
         import ai_trade_decision as atd
     except Exception as exc:
         return [], f"modules load nahi hue: {exc}"[:160]
-    prompt = (f"Aaj {now_ist.strftime('%Y-%m-%d %H:%M')} IST hai. Google Search se agle 7 din ke SCHEDULED, verifiable market-moving events batao jo {subject} ko "
-              "asar kar sakte hain (RBI/Fed/CPI/jobs data, results/board meeting/AGM, court hearings, index events, global cues). Sirf wahi jo sach me confirm hon; "
-              "invent mat karo. Agar exact time confirm nahi to time_ist 'unknown' likho. Sirf JSON array do (max 8), koi aur text nahi. Format: "
-              '[{"event":"..","date_ist":"YYYY-MM-DD","time_ist":"HH:MM ya unknown","type":"macro|company|global|regulatory",'
-              '"expected_effect":"UP|DOWN|VOLATILE|SIDEWAYS|UNCLEAR","why":"1 line","reaction_window":"e.g. release ke baad pehle 15 min"}]')
-    body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}], "generationConfig": {"maxOutputTokens": 900}}
-    try:                                            # share the trade-review quota cooldown: if Gemini search is rate-limited, do not add more calls
+    try:
         if time.time() < atd._SEARCH_COOL["until"]:
             return [], "Gemini search abhi quota cooldown me hai (trade review ko quota bachane ke liye) -- thodi der baad try karo."
     except Exception:
         pass
-    models = sorted(list(atd.REVIEW_MODELS), key=lambda m: 0 if "lite" in m else 1)     # cheapest models first
+    heads = "\n".join(f"- {h}" for h in (headlines or [])[:10])
+    prompt = (f"Aaj {now_ist.strftime('%Y-%m-%d %H:%M')} IST hai. Google Search se INDIAN market ({subject}) ke liye: (1) pichhle 48 ghante me jo market-moving "
+              "news/event HO CHUKA, aur (2) agle 7 din me jo SCHEDULED event AANE WALA hai -- dono batao. Har item me bata: kya hai, kab (IST), kis par asar "
+              "(Nifty / Bank Nifty / IT / PSU banks / specific stock), direction, aur Indian market (09:15-15:30 IST) me asar kab aur kahan padta hai. "
+              "Sirf verifiable cheezein; invent mat karo; time confirm nahi to 'unknown'. Ye headlines bhi context hain:\n" + heads +
+              "\nSirf JSON array do (max 10), koi aur text nahi. Format: "
+              '[{"event":"..","status":"happened|upcoming","date_ist":"YYYY-MM-DD","time_ist":"HH:MM ya unknown","affects":"kis par asar",'
+              '"expected_effect":"UP|DOWN|VOLATILE|SIDEWAYS|UNCLEAR","why":"1 line","india_note":"India market me asar kab/kahan, 1 line"}]')
+    body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}], "generationConfig": {"maxOutputTokens": 1400}}
+    models = sorted(list(atd.REVIEW_MODELS), key=lambda m: 0 if "lite" in m else 1)
 
     def _one(key, model):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -262,15 +272,63 @@ def fetch_events(keys, subject, now_ist=None):
         cand = (r.json().get("candidates") or [{}])[0]
         txt = "".join(p.get("text", "") for p in ((cand.get("content") or {}).get("parts") or []) if not p.get("thought"))
         ev = _extract_json(txt)
-        if not ev and "[]" not in txt:
+        if not ev:
             raise gemini_pool.PoolHTTPError(502, "no parsable events")
         return ev
 
     try:
-        ev, _i, _m = gemini_pool.run(keys, models, _one, max_attempts=4, deadline_s=40.0)
+        ev, _i, _m = gemini_pool.run(keys, models, _one, max_attempts=4, deadline_s=45.0)
         return ev, ""
     except Exception as exc:
         return [], f"Gemini events nahi de paya: {exc}"[:200]
+
+
+def start_events(key, keys, subject, headlines=None):
+    """Start the lookup in a background thread and return at once -- the page never waits, so the live-refresh fragment can not cancel it."""
+    with _EV_LOCK:
+        cur = _EVENTS.get(key)
+        if cur and cur["status"] == "running" and time.time() - cur["ts"] < 90:
+            return
+        _EVENTS[key] = {"ts": time.time(), "status": "running", "rows": [], "err": ""}
+
+    def _work():
+        rows, err = fetch_events(keys, subject, headlines)
+        with _EV_LOCK:
+            _EVENTS[key] = {"ts": time.time(), "status": "error" if (err and not rows) else "done", "rows": rows, "err": err}
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
+_BG_NEWS = {"rows": None, "running": False, "ts": 0.0}
+
+
+def start_bg_news(fn):
+    """Fetch headlines in a background thread (never blocks the page)."""
+    with _EV_LOCK:
+        if _BG_NEWS["running"] and time.time() - _BG_NEWS["ts"] < 90:
+            return
+        _BG_NEWS["running"], _BG_NEWS["ts"] = True, time.time()
+
+    def _w():
+        try:
+            rows = fn()
+        except Exception:
+            rows = None
+        with _EV_LOCK:
+            _BG_NEWS["rows"], _BG_NEWS["running"] = (rows or None), False
+
+    threading.Thread(target=_w, daemon=True).start()
+
+
+def take_bg_news():
+    with _EV_LOCK:
+        rows, _BG_NEWS["rows"] = _BG_NEWS["rows"], None
+    return rows
+
+
+def events_state(key):
+    with _EV_LOCK:
+        return dict(_EVENTS.get(key) or {})
 
 
 # ---------------------------------------------------------------------------------------------------------------------- render
@@ -301,21 +359,30 @@ def render_news(st, subject, news_items, key="x"):
         st.markdown(f"**News verdict: {_BADGE[nv['verdict']]}**  ·  🟢 {sum('Positive' in x for x in sc)}  🔴 {sum('Negative' in x for x in sc)}  ⚪ {sum('Neutral' in x for x in sc)}")
         st.caption(nv["note"] or "Sirf 7 din ke andar ki news ginti me; headline ke neeche har ek ka sentiment: " +
                    " | ".join(f"{r[0].split()[0]} {r[2][:38]}…" for r in nv["rows"][:4]))
-        ck = f"_ni_events_{key}"
-        if st.button("🗓️ Agle events (kab, kitna asar) — Google se", key=f"ni_btn_{key}"):
-            with st.spinner("Events dhoondh raha hoon..."):
-                ev, err = fetch_events(st.session_state.get("_news_intel_keys") or [], subject)
-            st.session_state[ck] = (time.time(), ev, err)
-        rows = fixed_calendar()
-        cached = st.session_state.get(ck)
-        if cached and time.time() - cached[0] < EVENTS_TTL_S:
-            if cached[2]:
-                st.warning(cached[2])
-            rows = rows + list(cached[1])
-        rows = sorted(rows, key=lambda r: (str(r.get("date_ist")), str(r.get("time_ist"))))
-        st.dataframe([{"Date": r.get("date_ist"), "Time IST": r.get("time_ist"), "Event": r.get("event"),
-                       "Asar": _EFFECT.get(str(r.get("expected_effect")).upper(), r.get("expected_effect")),
-                       "India market me asar kab": r.get("india_text") or india_impact(r.get("date_ist"), r.get("time_ist"))} for r in rows], hide_index=True, width="stretch")
+        heads = [r[2] for r in nv["rows"]]
+        if st.button("🗓️ Aaj/kal kya hua + agle events (Google se)", key=f"ni_btn_{key}"):
+            start_events(key, st.session_state.get("_news_intel_keys") or [], subject, heads)
+        stt = events_state(key)
+        rows = []
+        if stt.get("status") == "running":
+            st.info("⏳ Google se news/events aa rahe hain (15-40 sec). Page ko mat chhedo -- neeche apne aap dikh jayenge.")
+        elif stt and time.time() - stt.get("ts", 0) < EVENTS_TTL_S:
+            if stt.get("err"):
+                st.warning(stt["err"])
+            rows = list(stt.get("rows") or [])
+        today = datetime.now(IST).date()
+        table = []
+        for r in fixed_calendar() + rows:
+            up = str(r.get("status", "upcoming")).lower().startswith("up")
+            table.append({"Status": "🕒 Aane wala" if up else "✅ Ho chuka", "Kab (IST)": f"{r.get('date_ist')} {r.get('time_ist')}",
+                          "Kya": r.get("event"), "Kis par asar": r.get("affects") or "Nifty / market",
+                          "Direction": _EFFECT.get(str(r.get("expected_effect")).upper(), r.get("expected_effect")),
+                          "India market me kab / kahan": (r.get("india_text") or (india_impact(r.get("date_ist"), r.get("time_ist")) if up else (r.get("india_note") or "ho chuka"))),
+                          "Kyun": r.get("why") or "", "_k": str(r.get("date_ist")) + str(r.get("time_ist"))})
+        table.sort(key=lambda x: x["_k"])
+        for x in table:
+            x.pop("_k")
+        st.dataframe(table, hide_index=True, width="stretch")
         st.caption("Events AI/Google-estimate hain, date-time khud verify karo; asar ek aam pattern hai, guarantee nahi. "
                    "Indian market: 09:15 open - 15:30 close (IST). Exchange holiday offline pata nahi chalta.")
     except Exception:
