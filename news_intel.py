@@ -153,17 +153,61 @@ def _us_open_ist(now_ist):
         return "19:00-20:00"
 
 
+_DAYS = ["Somvar", "Mangalvar", "Budhvar", "Guruvar", "Shukravar", "Shanivar", "Ravivar"]
+
+
+def _next_trading_day(d):
+    d = d + timedelta(days=1)
+    while d.weekday() >= 5:                       # Sat/Sun (exchange holidays are not known offline)
+        d += timedelta(days=1)
+    return d
+
+
+def _label(d, today):
+    if d == today:
+        return "Aaj"
+    if d == today + timedelta(days=1):
+        return "Kal"
+    return f"{_DAYS[d.weekday()]} {d.strftime('%d-%b')}"
+
+
+def india_impact(date_str, time_str, now_ist=None):
+    """Event ka asar INDIAN market (09:15-15:30 IST) me kab dikhega, plain Hinglish text."""
+    now_ist = now_ist or datetime.now(IST)
+    today = now_ist.date()
+    try:
+        d = datetime.strptime(str(date_str)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return "date confirm nahi -- khud check karo"
+    try:
+        hh, mm = [int(x) for x in str(time_str).split(":")[:2]]
+        mins = hh * 60 + mm
+    except Exception:
+        mins = None
+    if d.weekday() >= 5:
+        nd = _next_trading_day(d - timedelta(days=1))
+        return f"Market band (weekend) -> {_label(nd, today)} 09:15 open par gap"
+    if mins is None:
+        return f"{_label(d, today)} -- time unknown, din bhar dhyan rakho"
+    if mins < 9 * 60 + 15:
+        return f"{_label(d, today)} 09:15 open par gap (event market khulne se pehle)"
+    if mins <= 15 * 60 + 30:
+        end = min(mins + 30, 15 * 60 + 30)
+        return f"{_label(d, today)} {hh:02d}:{mm:02d} se {end//60:02d}:{end%60:02d} tak (market chalu -- turant asar)"
+    nd = _next_trading_day(d)
+    return f"India band hone ke baad -> {_label(nd, today)} 09:15 open par gap"
+
+
 def fixed_calendar(now_ist=None):
     """Deterministic items (no network): weekly expiry, US open, data-release pattern."""
     now_ist = now_ist or datetime.now(IST)
     d = now_ist.date()
     days = (1 - d.weekday()) % 7                      # Tuesday = Nifty weekly expiry (as shown on the Upstox header)
     exp = d + timedelta(days=days)
-    out = [{"event": "Nifty weekly expiry", "date_ist": exp.isoformat(), "time_ist": "15:30", "type": "expiry", "expected_effect": "VOLATILE",
+    out = [{"event": "Nifty weekly expiry", "date_ist": exp.isoformat(), "time_ist": "15:30", "type": "expiry", "expected_effect": "VOLATILE", "india_text": f"{_label(exp, d)} 14:00 se 15:30 tak (market chalu, aakhri ghante me tez jhatke)",
             "why": "Expiry din option gamma badhta hai; 14:00-15:30 me tez, jhatke wali moves aati hain.", "reaction_window": "14:00-15:30 IST"},
-           {"event": "US cash market open (US data/Fed-linked moves yahin se Nifty tak aate hain)", "date_ist": d.isoformat(), "time_ist": _us_open_ist(now_ist),
-            "type": "global", "expected_effect": "VOLATILE", "why": "US open ke baad global risk-mood badalta hai, raat ko India futures/GIFT Nifty pe dikhta hai.",
-            "reaction_window": "open ke baad pehle 30 min"}]
+           {"event": "US market open (India me tab band hota hai)", "date_ist": d.isoformat(), "time_ist": _us_open_ist(now_ist),
+            "type": "global", "expected_effect": "VOLATILE", "why": "US ka mood raat ko GIFT Nifty me dikhta hai.", "reaction_window": ""}]
     return out
 
 
@@ -271,8 +315,8 @@ def render_news(st, subject, news_items, key="x"):
         rows = sorted(rows, key=lambda r: (str(r.get("date_ist")), str(r.get("time_ist"))))
         st.dataframe([{"Date": r.get("date_ist"), "Time IST": r.get("time_ist"), "Event": r.get("event"),
                        "Asar": _EFFECT.get(str(r.get("expected_effect")).upper(), r.get("expected_effect")),
-                       "Kab tak": r.get("reaction_window")} for r in rows], hide_index=True, width="stretch")
+                       "India market me asar kab": r.get("india_text") or india_impact(r.get("date_ist"), r.get("time_ist"))} for r in rows], hide_index=True, width="stretch")
         st.caption("Events AI/Google-estimate hain, date-time khud verify karo; asar ek aam pattern hai, guarantee nahi. "
-                   "Result aksar market ke baad -> agle din gap; RBI/Budget -> 5-15 min spike; US data -> agla open/GIFT Nifty.")
+                   "Indian market: 09:15 open - 15:30 close (IST). Exchange holiday offline pata nahi chalta.")
     except Exception:
         pass
