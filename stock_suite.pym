@@ -1636,10 +1636,9 @@ def _run(ctx, state, gemini_keys, extra=None):
     closed = step("closed_trades", lambda: database.fetch_all_closed_trades(symbol=sym), [])
 
     # ---- 2.1 strategy engine (41 strategies) ----------------------------------------------------------------------------------------
-    import safe_io as _sio70
-    strategy_result = step("strategy_engine", lambda: _sio70.memo(("stk_strat", sym, str(df.index[-1]), len(df)), 55, lambda: fam.strategy_engine.analyze(
+    strategy_result = step("strategy_engine", lambda: fam.strategy_engine.analyze(
         df, sr_context=ctx.get("sr_context"), level_prediction=ctx.get("level_prediction"), order_flow=ctx.get("order_flow"),
-        mtf=ctx.get("mtf"), ai_analysis=ai, trade_history=closed, option_chain=df_oc, option_chain_live=bool(ctx.get("has_option_chain")))),
+        mtf=ctx.get("mtf"), ai_analysis=ai, trade_history=closed, option_chain=df_oc, option_chain_live=bool(ctx.get("has_option_chain"))),
         {"status": "ERROR", "has_setup": False, "direction": "WAIT", "score": 0.0, "strategies": {}})
     p2["strategy_result"] = strategy_result
 
@@ -3299,7 +3298,7 @@ def _body(symbol, ai_engine, helpers):
         helpers["news"](ctx["news"])
         try:
             import news_intel
-            news_intel.render_news(st, sym, ctx.get("news") or [], key=f"stk_{sym}")
+            news_intel.render_news(st, sym, ctx.get("news") or [], key=f"stk_{sym}", stock={"symbol": sym, "company": ctx.get("company"), "sector": ctx.get("sector")})
         except Exception:
             pass
     st.markdown("<br>", unsafe_allow_html=True)
@@ -3373,6 +3372,8 @@ def render(symbol, ai_engine, helpers):
         _ok = False
         try:
             stock_watchlist.page_busy(True)
+            safe_io.page_run("stock", "start")
+            safe_io.run_started(False)           # v65: tell the keep-open "robot tab" a person is working -> it shows a light standby page instead of running the whole Nifty pipeline beside this stock
         except Exception:
             pass
         try:
@@ -3393,6 +3394,8 @@ def render(symbol, ai_engine, helpers):
                 if _ok:
                     safe_io.run_completed(False)
                 safe_io.note_run_result(_ok)
+                safe_io.page_run("stock", "abort")
+                safe_io.run_aborted(False)       # v65: a finished/interrupted run is no longer "in progress"
                 stock_watchlist.page_busy(False)
             except Exception:
                 pass

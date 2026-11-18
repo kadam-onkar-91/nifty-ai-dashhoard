@@ -79,6 +79,8 @@ def main() -> int:
         log("APP_URL is the Streamlit DASHBOARD link (share.streamlit.io), not your app's own link. Open your app, copy the address "
             "that ends with .streamlit.app and put THAT in the APP_URL variable.")
         return 1
+    if "robot=1" not in url:                      # v65: tells the app this is the robot tab (it then steps aside while a person's tab is working)
+        url = url + ("&" if "?" in url else "?") + "robot=1"
     log(f"App host: {host}")
     now = ist_now()
     if is_skip_day(now, os.environ.get("SKIP_DATES")):

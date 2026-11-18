@@ -7,9 +7,3 @@ Revert: constants ko purani value pe karo (SL_ATR_MULT=0.9, MIN 20, MAX 28; LANE
 
 # v64 — news_intel.py (naya)
 Nifty 50 aur har stock page par: Fundamentals verdict (POSITIVE/NEGATIVE/NEUTRAL, point-by-point), News verdict (har headline ka sentiment, 7 din se purani ginti me nahi), aur "Agle events kab aur kitna asar" (fixed expiry/US-open + button dabane par Google-grounded Gemini events). Verdict local maths hai (load/refresh slow nahi); events sirf button par chalte hain.
-
-# v70 — speed + events
-- strategies._session_range: tail-only fast path (strategy engine ~3x faster, identical output; it was 70% of its time).
-- safe_io.guarded: a call that is still running from the previous refresh is not waited for again (no repeated 20 s waits when Yahoo/data is slow).
-- safe_io.memo: strategy engine result shared for 55 s between all sessions (your tab + robot tab) for Nifty and each stock.
-- news_intel events: NVIDIA model builds the table from real headlines (Gemini only as fallback); fixed the REVIEW_MODELS crash that left only 2 rows.

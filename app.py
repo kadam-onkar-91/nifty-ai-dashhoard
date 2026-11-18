@@ -108,12 +108,12 @@ if not GEMINI_API_KEYS:
 
 GEMINI_API_KEY = GEMINI_API_KEYS[0]  # primary key -- kept for any module that still expects a single key
 ai_engine = HybridAIEngine(api_keys=GEMINI_API_KEYS)
-st.session_state["_news_intel_keys"] = GEMINI_API_KEYS   # v64: news_intel's on-demand events lookup uses the same key pool
-try:
-    import nvidia_llm as _nv_ni
-    st.session_state["_news_intel_nv_keys"] = _nv_ni.keys_from_secrets(st.secrets)      # v70: events are made by the NVIDIA model first (Gemini only as fallback)
+try:                                                    # v65: per-stock events use NVIDIA NIM (not Gemini); keys come from the same secrets as the chat box
+    import nvidia_llm as _nv65
+    st.session_state["_nvidia_keys"] = _nv65.keys_from_secrets(st.secrets)
 except Exception:
-    st.session_state["_news_intel_nv_keys"] = []
+    st.session_state["_nvidia_keys"] = []
+st.session_state["_news_intel_keys"] = GEMINI_API_KEYS   # v64: news_intel's on-demand events lookup uses the same key pool
 
 try:
     TELEGRAM_BOT_TOKEN = st.secrets["TELEGRAM_BOT_TOKEN"]
@@ -241,9 +241,29 @@ def _live_dashboard():
     except Exception as _e_rr:
         if type(_e_rr).__name__ in ("RerunException", "StopException"):
             raise
+    # v65: the keep-open "robot tab" (URL has ?robot=1) must not run the whole heavy pipeline beside a person's tab on the same small server.
+    try:
+        _robot_tab = str(st.query_params.get("robot", "")) == "1"
+    except Exception:
+        _robot_tab = False
+    if _robot_tab:
+        try:
+            _w0 = time.time()
+            while safe_io.stock_run_in_progress() and time.time() - _w0 < 75:      # a person is loading a stock page: it goes first
+                time.sleep(1.0)
+            if safe_io.nifty_human_active():
+                _now_s = market_status.get_market_status()["now_ist"].strftime("%d-%b-%Y %H:%M:%S")
+                st.info(f"🤖 Robot tab standby -- IST Time: {_now_s} | aapka tab Nifty engine chala raha hai; aap jaate hi ye tab engine wapas chalayega.")
+                safe_io.run_completed(True)
+                return
+        except Exception as _e_rb:
+            if type(_e_rb).__name__ in ("RerunException", "StopException"):
+                raise
     _run_ok = False
     try:
-        safe_io.run_started(False)
+        if not _robot_tab:
+            safe_io.run_started(False)
+            safe_io.page_run("nifty", "start")
         stock_watchlist.page_busy(True)
     except Exception:
         pass
@@ -256,7 +276,9 @@ def _live_dashboard():
     finally:
         try:
             safe_io.note_run_result(_run_ok)
-            safe_io.run_aborted(False)
+            if not _robot_tab:
+                safe_io.run_aborted(False)
+                safe_io.page_run("nifty", "done" if _run_ok else "abort")
             stock_watchlist.page_busy(False)
         except Exception:
             pass
@@ -1333,12 +1355,12 @@ def _live_dashboard_body():
         # additional vote, never an all-factors hard gate.
         # -------------------------------------------------------------
         _sp.step("Strategy engine (40 strategies)")
-        strategy_result = safe_io.memo(("nifty_strat", str(df.index[-1]), len(df)), 55, lambda: strategy_engine.analyze(
+        strategy_result = strategy_engine.analyze(
             df, sr_context=sr_context, level_prediction=level_prediction,
             order_flow=order_flow_snapshot, mtf=mtf_structure,
             ai_analysis=ai_analysis, trade_history=closed_trades, option_chain=df_option_chain,
             option_chain_live=(oc_source == "LIVE")
-        ))      # v70: two sessions (your tab + the robot tab) no longer compute the same thing twice within 55 s
+        )
         st.session_state['dashboard_context']['Strategy Ensemble'] = str(strategy_result)
         st.session_state['dashboard_context']['STRATEGY ENTRY POLICY'] = (
             "ENTRY requires: at least one named strategy currently formed + AI Self-Learning\n"

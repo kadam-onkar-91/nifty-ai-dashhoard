@@ -96,7 +96,6 @@ def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
         if ttl and st["has"] and now - st["ts"] < ttl:
             return st["value"]
         fut = st["fut"]
-        reused = fut is not None and not fut.done()      # v70: a call for this key is ALREADY running from an earlier refresh
         if fut is None or fut.done():
             t0 = time.time()
 
@@ -121,10 +120,6 @@ def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
                         s["last_status"] = f"error: {type(exc).__name__}"
                         logger.warning("safe_io %s failed: %s", _key, exc)
             fut.add_done_callback(_done)
-    if reused:
-        with _LOCK:
-            if _STATE[key]["has"]:                        # v70: do NOT wait the full timeout again for the same slow call -- last good value now
-                return _STATE[key]["value"]
     try:
         fut.result(timeout=timeout)
     except _FutTimeout:
@@ -137,26 +132,6 @@ def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
     with _LOCK:
         st = _STATE[key]
         return st["value"] if st["has"] else default
-
-
-_MEMO = {}
-
-
-def memo(key, ttl, fn):
-    """v70: server-wide short memo (shared by every browser session / the robot tab): the same heavy computation is not repeated within `ttl` seconds."""
-    import copy
-    now = time.time()
-    with _LOCK:
-        hit = _MEMO.get(key)
-        if hit and now - hit[0] < ttl:
-            return copy.deepcopy(hit[1])
-    val = fn()
-    with _LOCK:
-        _MEMO[key] = (time.time(), val)
-        if len(_MEMO) > 60:
-            for k in sorted(_MEMO, key=lambda z: _MEMO[z][0])[:20]:
-                _MEMO.pop(k, None)
-    return copy.deepcopy(val)
 
 
 def status(key):
@@ -224,6 +199,37 @@ def run_completed(robot):
         _SESS["robot_done"] = time.time()
     else:
         _SESS["human_done"] = time.time()
+
+
+_SESS.update({"nifty_start": 0.0, "nifty_done": 0.0, "stock_start": 0.0})
+
+
+def page_run(kind, state):
+    """v65: which PAGE a person is running.  kind 'nifty'|'stock'; state 'start'|'done'|'abort'.  The keep-open robot tab goes to a light standby page only
+    while a person is on the NIFTY page (that page runs the same Nifty engine); while a person loads a STOCK page the robot tab merely waits for it."""
+    now = time.time()
+    if kind == "stock":
+        _SESS["stock_start"] = now if state == "start" else 0.0
+    elif state == "start":
+        _SESS["nifty_start"] = now
+    elif state == "done":
+        _SESS["nifty_done"], _SESS["nifty_start"] = now, 0.0
+    else:
+        _SESS["nifty_start"] = 0.0
+
+
+def nifty_human_active():
+    now = time.time()
+    st_ = _SESS.get("nifty_start") or 0.0
+    if st_ and now - st_ < 600:
+        return True
+    ema = _RUN_STATS.get("ema") or 60.0
+    return (now - (_SESS.get("nifty_done") or 0.0)) < max(90.0, 1.4 * ema + 40.0)
+
+
+def stock_run_in_progress():
+    s_ = _SESS.get("stock_start") or 0.0
+    return bool(s_) and time.time() - s_ < 600
 
 
 def human_active(window=None):
