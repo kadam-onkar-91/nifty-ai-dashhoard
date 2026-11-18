@@ -1636,9 +1636,10 @@ def _run(ctx, state, gemini_keys, extra=None):
     closed = step("closed_trades", lambda: database.fetch_all_closed_trades(symbol=sym), [])
 
     # ---- 2.1 strategy engine (41 strategies) ----------------------------------------------------------------------------------------
-    strategy_result = step("strategy_engine", lambda: fam.strategy_engine.analyze(
+    import safe_io as _sio70
+    strategy_result = step("strategy_engine", lambda: _sio70.memo(("stk_strat", sym, str(df.index[-1]), len(df)), 55, lambda: fam.strategy_engine.analyze(
         df, sr_context=ctx.get("sr_context"), level_prediction=ctx.get("level_prediction"), order_flow=ctx.get("order_flow"),
-        mtf=ctx.get("mtf"), ai_analysis=ai, trade_history=closed, option_chain=df_oc, option_chain_live=bool(ctx.get("has_option_chain"))),
+        mtf=ctx.get("mtf"), ai_analysis=ai, trade_history=closed, option_chain=df_oc, option_chain_live=bool(ctx.get("has_option_chain")))),
         {"status": "ERROR", "has_setup": False, "direction": "WAIT", "score": 0.0, "strategies": {}})
     p2["strategy_result"] = strategy_result
 

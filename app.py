@@ -109,6 +109,11 @@ if not GEMINI_API_KEYS:
 GEMINI_API_KEY = GEMINI_API_KEYS[0]  # primary key -- kept for any module that still expects a single key
 ai_engine = HybridAIEngine(api_keys=GEMINI_API_KEYS)
 st.session_state["_news_intel_keys"] = GEMINI_API_KEYS   # v64: news_intel's on-demand events lookup uses the same key pool
+try:
+    import nvidia_llm as _nv_ni
+    st.session_state["_news_intel_nv_keys"] = _nv_ni.keys_from_secrets(st.secrets)      # v70: events are made by the NVIDIA model first (Gemini only as fallback)
+except Exception:
+    st.session_state["_news_intel_nv_keys"] = []
 
 try:
     TELEGRAM_BOT_TOKEN = st.secrets["TELEGRAM_BOT_TOKEN"]
@@ -1328,12 +1333,12 @@ def _live_dashboard_body():
         # additional vote, never an all-factors hard gate.
         # -------------------------------------------------------------
         _sp.step("Strategy engine (40 strategies)")
-        strategy_result = strategy_engine.analyze(
+        strategy_result = safe_io.memo(("nifty_strat", str(df.index[-1]), len(df)), 55, lambda: strategy_engine.analyze(
             df, sr_context=sr_context, level_prediction=level_prediction,
             order_flow=order_flow_snapshot, mtf=mtf_structure,
             ai_analysis=ai_analysis, trade_history=closed_trades, option_chain=df_option_chain,
             option_chain_live=(oc_source == "LIVE")
-        )
+        ))      # v70: two sessions (your tab + the robot tab) no longer compute the same thing twice within 55 s
         st.session_state['dashboard_context']['Strategy Ensemble'] = str(strategy_result)
         st.session_state['dashboard_context']['STRATEGY ENTRY POLICY'] = (
             "ENTRY requires: at least one named strategy currently formed + AI Self-Learning\n"

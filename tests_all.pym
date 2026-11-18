@@ -1106,6 +1106,39 @@ class V64NewsIntelTests(unittest.TestCase):
         self.assertEqual(ni.news_verdict(fresh, now=now)["verdict"], "POSITIVE")
         self.assertEqual(ni._extract_json('```json\n[{"event":"RBI policy","date_ist":"2026-12-05"}]\n```')[0]["event"], "RBI policy")
 
+class V70SpeedTests(unittest.TestCase):
+    def test_session_range_fast_path_equals_old_code(self):
+        import numpy as np, pandas as pd, strategy_engine as se
+        idx = pd.date_range("2026-11-10 09:15", periods=900, freq="5min")
+        idx = idx[(idx.time >= pd.Timestamp("09:15").time()) & (idx.time <= pd.Timestamp("15:25").time())]
+        rng = np.random.RandomState(3); c = np.cumsum(rng.randn(len(idx))) + 100
+        df = pd.DataFrame({"Open": c, "High": c + rng.rand(len(idx)), "Low": c - rng.rand(len(idx)), "Close": c, "Volume": 1}, index=idx)
+
+        def old(x, a, b):
+            ts = pd.to_datetime(x.index); cd = ts[-1].date(); st = pd.Timestamp(a).time(); en = pd.Timestamp(b).time()
+            if ts[-1].time() <= en:
+                return None
+            m = pd.Series((ts.date == cd) & (ts.time >= st) & (ts.time <= en), index=x.index); y = x.loc[m.values]
+            return None if y.empty else (float(y["High"].max()), float(y["Low"].min()))
+        for k in range(100, len(df), 11):
+            for a, b in (("09:15:00", "09:20:00"), ("09:15:00", "10:15:00")):
+                self.assertEqual(old(df.iloc[:k], a, b), se._session_range(df.iloc[:k], a, b, completed_only=True))
+
+    def test_guarded_does_not_wait_again_for_a_running_call_and_memo_shares(self):
+        import time as _t, safe_io
+        def slow():
+            _t.sleep(1.5); return "v"
+        safe_io.guarded("v70_slow", lambda: "first", timeout=2)                      # has a good value now
+        safe_io._STATE["v70_slow"]["fut"] = None
+        safe_io.guarded("v70_slow", slow, timeout=0.2)                                # starts the slow call, times out quickly
+        t0 = _t.time(); out = safe_io.guarded("v70_slow", slow, timeout=5)           # same call still running -> instant last-good
+        self.assertLess(_t.time() - t0, 0.5); self.assertEqual(out, "first")
+        n = {"c": 0}
+        def f():
+            n["c"] += 1; return {"a": n["c"]}
+        a = safe_io.memo(("t70", 1), 30, f); b = safe_io.memo(("t70", 1), 30, f)
+        self.assertEqual(n["c"], 1); self.assertEqual(a, b)
+
 # @@END tests_edge_v36
 # @@MODULE tests_level_verdict
 """

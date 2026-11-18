@@ -262,7 +262,7 @@ def fetch_events(keys, subject, headlines=None, now_ist=None):
               '[{"event":"..","status":"happened|upcoming","date_ist":"YYYY-MM-DD","time_ist":"HH:MM ya unknown","type":"RBI|Policy|Data|Global|Sector|Stock|Results","affects":"kis par asar","duration":"asar kitni der (e.g. 30 min / pura din / 2-3 din)",'
               '"expected_effect":"UP|DOWN|VOLATILE|SIDEWAYS|UNCLEAR","why":"1 line","india_note":"India market me asar kab/kahan, 1 line"}]')
     body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}], "generationConfig": {"maxOutputTokens": 2600}}
-    models = sorted(list(atd.REVIEW_MODELS), key=lambda m: 0 if "lite" in m else 1)
+    models = sorted(list(gemini_pool.REVIEW_MODELS), key=lambda m: 0 if "lite" in m else 1)     # v70 fix: REVIEW_MODELS lives in gemini_pool
 
     def _one(key, model):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -283,7 +283,36 @@ def fetch_events(keys, subject, headlines=None, now_ist=None):
         return [], f"Gemini events nahi de paya: {exc}"[:200]
 
 
-def start_events(key, keys, subject, headlines=None):
+def fetch_events_nvidia(nv_keys, subject, news_items, now_ist=None):
+    """Events/impact table made by the NVIDIA model from REAL headlines (no Google quota used).  Returns (rows, err)."""
+    now_ist = now_ist or datetime.now(IST)
+    try:
+        import nvidia_llm
+    except Exception as exc:
+        return [], f"nvidia module nahi mila: {exc}"[:120]
+    lines = []
+    for n in (news_items or [])[:16]:
+        t = str(n.get("title") or "").strip()
+        if t:
+            lines.append(f"- {t} [{n.get('published') or 'time?'}]")
+    if not lines:
+        return [], "Is waqt koi headline nahi mili."
+    prompt = (f"Aaj {now_ist.strftime('%Y-%m-%d %H:%M')} IST hai. Subject: {subject} (Indian market, 09:15-15:30 IST). Neeche REAL headlines hain. "
+              "Har important headline ko trader ke liye event me badlo: kya hua/aane wala hai, kab (headline ki date se; pata na ho to 'unknown'), kis par asar "
+              "(Nifty/Bank Nifty/IT/PSU banks/specific stock), direction, asar kitni der, aur Indian market me kab-kahan asar padega. Sirf headlines aur apni PAKKI "
+              "jaankari se; naya event invent mat karo. Scheduled cheez (RBI, results, data, court) headline me ho to status 'upcoming', warna 'happened'. "
+              "Sirf JSON array do (max 12), koi aur text nahi. Format: "
+              '[{"event":"..","status":"happened|upcoming","type":"RBI|Policy|Data|Global|Sector|Stock|Results","date_ist":"YYYY-MM-DD","time_ist":"HH:MM ya unknown",'
+              '"affects":"..","expected_effect":"UP|DOWN|VOLATILE|SIDEWAYS|UNCLEAR","duration":"..","why":"1 line","india_note":"1 line"}]\nHeadlines:\n' + "\n".join(lines))
+    try:
+        txt, _model = nvidia_llm.chat(nv_keys, [{"role": "user", "content": prompt}], max_tokens=2200, temperature=0.1, deadline_s=75.0)
+        rows = _extract_json(txt)
+        return (rows, "") if rows else ([], "NVIDIA ne parse hone layak jawab nahi diya.")
+    except Exception as exc:
+        return [], f"NVIDIA events nahi de paya: {exc}"[:160]
+
+
+def start_events(key, keys, subject, headlines=None, nv_keys=None, news_items=None):
     """Start the lookup in a background thread and return at once -- the page never waits, so the live-refresh fragment can not cancel it."""
     with _EV_LOCK:
         cur = _EVENTS.get(key)
@@ -292,7 +321,12 @@ def start_events(key, keys, subject, headlines=None):
         _EVENTS[key] = {"ts": time.time(), "status": "running", "rows": [], "err": ""}
 
     def _work():
-        rows, err = fetch_events(keys, subject, headlines)
+        rows, err = ([], "")
+        if nv_keys:
+            rows, err = fetch_events_nvidia(nv_keys, subject, news_items)
+        if not rows and keys:                       # fallback only: Gemini + Google Search
+            rows, err2 = fetch_events(keys, subject, headlines)
+            err = err2 if not rows else ""
         with _EV_LOCK:
             _EVENTS[key] = {"ts": time.time(), "status": "error" if (err and not rows) else "done", "rows": rows, "err": err}
 
@@ -360,12 +394,18 @@ def render_news(st, subject, news_items, key="x"):
         st.caption(nv["note"] or "Sirf 7 din ke andar ki news ginti me; headline ke neeche har ek ka sentiment: " +
                    " | ".join(f"{r[0].split()[0]} {r[2][:38]}…" for r in nv["rows"][:4]))
         heads = [r[2] for r in nv["rows"]]
+        if key != "nifty50":                                     # a stock's events also see today's market-wide headlines (RBI, FII, crude ...)
+            try:
+                news_items = list(news_items or []) + list((st.session_state.get("_nifty50_news_cache") or [])[:6])
+            except Exception:
+                pass
         _ks = st.session_state.get("_news_intel_keys") or []
+        _nv = st.session_state.get("_news_intel_nv_keys") or []
         _es = events_state(key)
-        if key == "nifty50" and _ks and (not _es or (_es.get("status") in ("done", "error") and time.time() - _es.get("ts", 0) > EVENTS_TTL_S)):
-            start_events(key, _ks, subject, heads)      # one automatic BACKGROUND lookup per 2 h (page never waits)
+        if key == "nifty50" and (_ks or _nv) and (not _es or (_es.get("status") in ("done", "error") and time.time() - _es.get("ts", 0) > EVENTS_TTL_S)):
+            start_events(key, _ks, subject, heads, _nv, news_items)      # one automatic BACKGROUND lookup per 2 h (page never waits)
         if st.button("🗓️ Aaj/kal kya hua + agle events (Google se)", key=f"ni_btn_{key}"):
-            start_events(key, st.session_state.get("_news_intel_keys") or [], subject, heads)
+            start_events(key, _ks, subject, heads, _nv, news_items)
         stt = events_state(key)
         rows = []
         if stt.get("status") == "running":

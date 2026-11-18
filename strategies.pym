@@ -186,6 +186,22 @@ def _session_range(x: pd.DataFrame, start_hm: str, end_hm: str, *, completed_onl
         end = pd.Timestamp(end_hm).time()
         if completed_only and ts[-1].time() <= end:
             return None
+        # v70 FAST PATH: the index is time-sorted, so today's rows are a short tail -> filter only that tail (was: masks over the whole history,
+        # called ~550 times per run = 70 % of the strategy engine's time).  Falls back to the exact old code if the index is not sorted.
+        try:
+            if ts.is_monotonic_increasing:
+                pos = int(ts.searchsorted(pd.Timestamp(current_day)))
+                tail = ts[pos:]
+                tt = tail.time
+                sel = [(start <= t <= end) for t in tt]
+                if not any(sel):
+                    return None
+                y = x.iloc[pos:]
+                import numpy as _np
+                sel = _np.asarray(sel, dtype=bool)
+                return float(y["High"].values[sel].max()), float(y["Low"].values[sel].min())
+        except Exception:
+            pass
         m = pd.Series((ts.date == current_day) & (ts.time >= start) & (ts.time <= end), index=x.index)
         y = x.loc[m.values]
         if y.empty:

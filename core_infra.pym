@@ -96,6 +96,7 @@ def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
         if ttl and st["has"] and now - st["ts"] < ttl:
             return st["value"]
         fut = st["fut"]
+        reused = fut is not None and not fut.done()      # v70: a call for this key is ALREADY running from an earlier refresh
         if fut is None or fut.done():
             t0 = time.time()
 
@@ -120,6 +121,10 @@ def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
                         s["last_status"] = f"error: {type(exc).__name__}"
                         logger.warning("safe_io %s failed: %s", _key, exc)
             fut.add_done_callback(_done)
+    if reused:
+        with _LOCK:
+            if _STATE[key]["has"]:                        # v70: do NOT wait the full timeout again for the same slow call -- last good value now
+                return _STATE[key]["value"]
     try:
         fut.result(timeout=timeout)
     except _FutTimeout:
@@ -132,6 +137,26 @@ def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
     with _LOCK:
         st = _STATE[key]
         return st["value"] if st["has"] else default
+
+
+_MEMO = {}
+
+
+def memo(key, ttl, fn):
+    """v70: server-wide short memo (shared by every browser session / the robot tab): the same heavy computation is not repeated within `ttl` seconds."""
+    import copy
+    now = time.time()
+    with _LOCK:
+        hit = _MEMO.get(key)
+        if hit and now - hit[0] < ttl:
+            return copy.deepcopy(hit[1])
+    val = fn()
+    with _LOCK:
+        _MEMO[key] = (time.time(), val)
+        if len(_MEMO) > 60:
+            for k in sorted(_MEMO, key=lambda z: _MEMO[z][0])[:20]:
+                _MEMO.pop(k, None)
+    return copy.deepcopy(val)
 
 
 def status(key):
