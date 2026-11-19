@@ -3669,6 +3669,24 @@ class TestV65StockEvents(unittest.TestCase):
         self.assertIn("NIFTY 50", seen["p"])
         self.assertEqual(rows[0]["importance"], 5)
 
+    def test_v67_events_never_pile_up_or_run_in_grace(self):
+        started = []
+        orig = (news_intel.fetch_stock_events, news_intel._BOOT_T)
+        try:
+            news_intel.fetch_stock_events = lambda *a, **k: (started.append(1), __import__("time").sleep(0.4), ([], ""))[2]
+            news_intel._BOOT_T = 0.0
+            self.assertTrue(news_intel._auto_ok())
+            news_intel.start_stock_events("a", [], "A", [], stock={"symbol": "A"})
+            news_intel.start_stock_events("b", [], "B", [], stock={"symbol": "B"})       # slot busy -> no second thread
+            news_intel.start_nifty_events("n", [], "NIFTY 50", [])
+            __import__("time").sleep(0.8)
+            self.assertEqual(len(started), 1)
+            news_intel._BOOT_T = __import__("time").time()
+            self.assertFalse(news_intel._auto_ok())                                       # grace period after a start
+            self.assertEqual(news_intel.stock_calendar_rows("ZZZ"), [])                  # no Yahoo call inside the grace period
+        finally:
+            news_intel.fetch_stock_events, news_intel._BOOT_T = orig
+
     def test_v66_ranking_calendar_and_macro(self):
         import nvidia_llm
         heads = [{"n": 1, "label": "Company", "title": "A", "src": "ET", "age_h": 1, "date": "2026-11-19 09:00"}]

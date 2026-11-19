@@ -13,6 +13,8 @@ from email.utils import parsedate_to_datetime
 
 IST = timezone(timedelta(hours=5, minutes=30))
 EVENTS_TTL_S = 7200
+AUTO_START_GRACE_S = 240    # no AUTOMATIC research in the first 4 minutes after a server start (the page's cold start goes first); buttons work at once
+_BOOT_T = time.time()
 STOCK_EVENTS_TTL_S = 2400   # stock events are re-researched every 40 min (background thread, the page never waits)
 
 # ----------------------------------------------------------------------------------------------------------------- fundamentals
@@ -398,7 +400,27 @@ def gather_macro_headlines(per_query=6):
         return list(_MACRO["rows"])
 
 
+_CAL_CACHE = {}              # symbol -> (time, rows, ok)
+_CAL_LOCK = threading.Lock()
+
+
 def stock_calendar_rows(symbol, now_ist=None):
+    """Cached wrapper: Yahoo is asked at most once per 12 h per stock (1 h after a failure) and only one call at a time, so this can never
+    hold the shared yfinance session that the page's own market-data steps also use."""
+    sym = str(symbol)
+    now = time.time()
+    with _CAL_LOCK:
+        c = _CAL_CACHE.get(sym)
+        if c and now - c[0] < (43200 if c[2] else 3600):
+            return list(c[1])
+        if not _auto_ok():
+            return []
+        rows = _stock_calendar_rows_uncached(symbol, now_ist)
+        _CAL_CACHE[sym] = (time.time(), rows, bool(rows))
+        return list(rows)
+
+
+def _stock_calendar_rows_uncached(symbol, now_ist=None):
     """REAL scheduled events from Yahoo's calendar (results date, ex-dividend date) -> event rows.  8 s limit, never raises, [] if unavailable."""
     now_ist = now_ist or datetime.now(IST)
     box = {}
@@ -411,7 +433,7 @@ def stock_calendar_rows(symbol, now_ist=None):
             box["cal"] = None
     t = threading.Thread(target=_w, daemon=True)
     t.start()
-    t.join(8.0)
+    t.join(5.0)
     cal = box.get("cal")
     rows = []
     try:
@@ -613,9 +635,12 @@ def fetch_nifty_events(keys, subject, headlines=None, now_ist=None, nvidia_keys=
 
 
 def start_nifty_events(key, keys, subject, headlines=None, nvidia_keys=None):
+    if not _slot_acquire():      # another research thread is running -> try again on a later refresh, cost nothing now
+        return
     with _EV_LOCK:
         cur = _EVENTS.get(key)
         if cur and cur["status"] == "running" and time.time() - cur["ts"] < 120:
+            _EV_SLOT.release()
             return
         _EVENTS[key] = {"ts": time.time(), "status": "running", "rows": [], "err": ""}
 
@@ -624,6 +649,7 @@ def start_nifty_events(key, keys, subject, headlines=None, nvidia_keys=None):
             rows, err = fetch_nifty_events(keys, subject, headlines, nvidia_keys=nvidia_keys)
         except Exception as exc:
             rows, err = [], f"{type(exc).__name__}: {exc}"[:200]
+        _EV_SLOT.release()
         with _EV_LOCK:
             _EVENTS[key] = {"ts": time.time(), "status": "error" if (err and not rows) else "done", "rows": rows, "err": err}
 
@@ -632,9 +658,12 @@ def start_nifty_events(key, keys, subject, headlines=None, nvidia_keys=None):
 
 def start_stock_events(key, keys, subject, headlines=None, stock=None, nvidia_keys=None):
     """Background thread, same state machine as start_events()."""
+    if not _slot_acquire():      # another research thread is running -> try again on a later refresh, cost nothing now
+        return
     with _EV_LOCK:
         cur = _EVENTS.get(key)
         if cur and cur["status"] == "running" and time.time() - cur["ts"] < 120:
+            _EV_SLOT.release()
             return
         _EVENTS[key] = {"ts": time.time(), "status": "running", "rows": [], "err": ""}
 
@@ -643,10 +672,35 @@ def start_stock_events(key, keys, subject, headlines=None, stock=None, nvidia_ke
             rows, err = fetch_stock_events(keys, subject, headlines, stock=stock, nvidia_keys=nvidia_keys)
         except Exception as exc:
             rows, err = [], f"{type(exc).__name__}: {exc}"[:200]
+        _EV_SLOT.release()
         with _EV_LOCK:
             _EVENTS[key] = {"ts": time.time(), "status": "error" if (err and not rows and "nahi mili" not in err) else "done", "rows": rows, "err": err}
 
     threading.Thread(target=_work, daemon=True).start()
+
+
+_EV_SLOT = threading.Semaphore(1)     # ONE events-research thread in the whole app at a time (Nifty or a stock): nothing can pile up behind the page
+
+
+_EV_SLOT_T = {"t": 0.0}
+
+
+def _slot_acquire():
+    """Non-blocking.  A research thread that somehow hangs for more than 4 minutes is abandoned (its slot is handed on), never blocks the feature for ever."""
+    global _EV_SLOT
+    if _EV_SLOT.acquire(blocking=False):
+        _EV_SLOT_T["t"] = time.time()
+        return True
+    if time.time() - _EV_SLOT_T["t"] > 240:
+        _EV_SLOT = threading.Semaphore(1)
+        _EV_SLOT.acquire()
+        _EV_SLOT_T["t"] = time.time()
+        return True
+    return False
+
+
+def _auto_ok():
+    return time.time() - _BOOT_T > AUTO_START_GRACE_S
 
 
 _BG_NEWS = {"rows": None, "running": False, "ts": 0.0}
@@ -717,12 +771,12 @@ def render_news(st, subject, news_items, key="x", stock=None):
         rich = bool(stock) or key == "nifty50"
         _stale = (not _es) or (_es.get("status") in ("done", "error") and time.time() - _es.get("ts", 0) > _ttl)
         if stock:
-            if _stale:
+            if _stale and _auto_ok():
                 start_stock_events(key, _ks, subject, heads, stock=stock, nvidia_keys=_nk)       # this stock's OWN research, automatic, once per 2 h, in the background
             if st.button(f"🔄 {stock.get('symbol') or subject} ke events dobara nikalo (NVIDIA research)", key=f"ni_btn_{key}"):
                 start_stock_events(key, _ks, subject, heads, stock=stock, nvidia_keys=_nk)
         else:
-            if key == "nifty50" and (_ks or _nk) and _stale:
+            if key == "nifty50" and (_ks or _nk) and _stale and _auto_ok():
                 start_nifty_events(key, _ks, subject, heads, nvidia_keys=_nk)      # automatic BACKGROUND lookup every 40 min (page never waits)
             if st.button("🗓️ Aaj/kal kya hua + agle events (NVIDIA + Google news)", key=f"ni_btn_{key}"):
                 start_nifty_events(key, st.session_state.get("_news_intel_keys") or [], subject, heads, nvidia_keys=_nk)
