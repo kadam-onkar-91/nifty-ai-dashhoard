@@ -3652,41 +3652,6 @@ class TestV65StockEvents(unittest.TestCase):
             nvidia_llm.chat_robust, news_intel.gather_stock_headlines = orig_chat, orig_g
             news_intel.gather_macro_headlines, news_intel.stock_calendar_rows = orig_m, orig_c
 
-    def test_v66_nifty_uses_ranked_nvidia_path(self):
-        import nvidia_llm
-        o = (news_intel.gather_nifty_headlines, nvidia_llm.chat_robust)
-        seen = {}
-        try:
-            news_intel.gather_nifty_headlines = lambda *a, **k: [{"n": 1, "label": "Nifty", "title": "Sensex falls 500 pts", "src": "ET", "age_h": 1, "date": "2026-11-19 10:00"},
-                                                                {"n": 2, "label": "Upcoming", "title": "RBI policy on 5 Dec", "src": "Mint", "age_h": 5, "date": "2026-11-19 06:00"}]
-            _json = ('[{"event":"RBI policy","status":"upcoming","date_ist":"2026-12-05","time_ist":"10:00","type":"RBI","importance":5,"evidence":2},'
-                     '{"event":"Sensex fall","status":"happened","date_ist":"2026-11-19","importance":3,"evidence":1}]')
-            nvidia_llm.chat_robust = lambda keys, msgs, **k: (seen.setdefault("p", msgs[1]["content"]) and _json, "m")
-            rows, err = news_intel.fetch_nifty_events([], "NIFTY 50", [], nvidia_keys=["k" * 12])
-        finally:
-            news_intel.gather_nifty_headlines, nvidia_llm.chat_robust = o
-        self.assertEqual([r["event"] for r in rows], ["RBI policy", "Sensex fall"])
-        self.assertIn("NIFTY 50", seen["p"])
-        self.assertEqual(rows[0]["importance"], 5)
-
-    def test_v67_events_never_pile_up_or_run_in_grace(self):
-        started = []
-        orig = (news_intel.fetch_stock_events, news_intel._BOOT_T)
-        try:
-            news_intel.fetch_stock_events = lambda *a, **k: (started.append(1), __import__("time").sleep(0.4), ([], ""))[2]
-            news_intel._BOOT_T = 0.0
-            self.assertTrue(news_intel._auto_ok())
-            news_intel.start_stock_events("a", [], "A", [], stock={"symbol": "A"})
-            news_intel.start_stock_events("b", [], "B", [], stock={"symbol": "B"})       # slot busy -> no second thread
-            news_intel.start_nifty_events("n", [], "NIFTY 50", [])
-            __import__("time").sleep(0.8)
-            self.assertEqual(len(started), 1)
-            news_intel._BOOT_T = __import__("time").time()
-            self.assertFalse(news_intel._auto_ok())                                       # grace period after a start
-            self.assertEqual(news_intel.stock_calendar_rows("ZZZ"), [])                  # no Yahoo call inside the grace period
-        finally:
-            news_intel.fetch_stock_events, news_intel._BOOT_T = orig
-
     def test_v66_ranking_calendar_and_macro(self):
         import nvidia_llm
         heads = [{"n": 1, "label": "Company", "title": "A", "src": "ET", "age_h": 1, "date": "2026-11-19 09:00"}]

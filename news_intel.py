@@ -13,8 +13,6 @@ from email.utils import parsedate_to_datetime
 
 IST = timezone(timedelta(hours=5, minutes=30))
 EVENTS_TTL_S = 7200
-AUTO_START_GRACE_S = 240    # no AUTOMATIC research in the first 4 minutes after a server start (the page's cold start goes first); buttons work at once
-_BOOT_T = time.time()
 STOCK_EVENTS_TTL_S = 2400   # stock events are re-researched every 40 min (background thread, the page never waits)
 
 # ----------------------------------------------------------------------------------------------------------------- fundamentals
@@ -400,27 +398,7 @@ def gather_macro_headlines(per_query=6):
         return list(_MACRO["rows"])
 
 
-_CAL_CACHE = {}              # symbol -> (time, rows, ok)
-_CAL_LOCK = threading.Lock()
-
-
 def stock_calendar_rows(symbol, now_ist=None):
-    """Cached wrapper: Yahoo is asked at most once per 12 h per stock (1 h after a failure) and only one call at a time, so this can never
-    hold the shared yfinance session that the page's own market-data steps also use."""
-    sym = str(symbol)
-    now = time.time()
-    with _CAL_LOCK:
-        c = _CAL_CACHE.get(sym)
-        if c and now - c[0] < (43200 if c[2] else 3600):
-            return list(c[1])
-        if not _auto_ok():
-            return []
-        rows = _stock_calendar_rows_uncached(symbol, now_ist)
-        _CAL_CACHE[sym] = (time.time(), rows, bool(rows))
-        return list(rows)
-
-
-def _stock_calendar_rows_uncached(symbol, now_ist=None):
     """REAL scheduled events from Yahoo's calendar (results date, ex-dividend date) -> event rows.  8 s limit, never raises, [] if unavailable."""
     now_ist = now_ist or datetime.now(IST)
     box = {}
@@ -433,7 +411,7 @@ def _stock_calendar_rows_uncached(symbol, now_ist=None):
             box["cal"] = None
     t = threading.Thread(target=_w, daemon=True)
     t.start()
-    t.join(5.0)
+    t.join(8.0)
     cal = box.get("cal")
     rows = []
     try:
@@ -569,101 +547,11 @@ def fetch_stock_events(keys, subject, headlines=None, now_ist=None, stock=None, 
     return rows, (err if rows else (err + " | " + gerr)).strip(" |")[:260]
 
 
-_NIFTY_QUERIES = [("Nifty", 'Nifty 50 OR Sensex market today when:1d'),
-                  ("Heavyweights", 'Reliance OR "HDFC Bank" OR Infosys OR "ICICI Bank" OR TCS OR "Bharti Airtel" results OR order OR rating when:2d'),
-                  ("Upcoming", 'RBI policy OR "Fed meeting" OR "GDP data" OR "CPI inflation" OR "F&O expiry" OR "Union Budget" OR "FII" India market when:7d')]
-
-
-def gather_nifty_headlines(per_query=7, max_age_days=7):
-    """Real, dated headlines that move the Nifty 50 (index news + heavyweights + scheduled macro) + the shared India/global macro list."""
-    out, seen = [], set()
-    try:
-        import news_rss
-        from concurrent.futures import ThreadPoolExecutor
-
-        def _one(lq):
-            try:
-                return lq[0], news_rss.parse_items(news_rss._fetch(lq[1], timeout=7), max_age_h=max_age_days * 24, limit=per_query)
-            except Exception:
-                return lq[0], []
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            res = list(ex.map(_one, _NIFTY_QUERIES))
-        now = datetime.now(IST)
-        rows = [(lab, a, t, sr) for lab, items in res for a, t, sr in items]
-        for lab, age_min, title, src in rows:
-            k = re.sub(r"\W+", "", title.lower())[:60]
-            if k in seen:
-                continue
-            seen.add(k)
-            out.append({"label": lab, "title": title, "src": src or "news", "age_h": round(age_min / 60.0, 1), "date": (now - timedelta(minutes=age_min)).strftime("%Y-%m-%d %H:%M")})
-    except Exception:
-        pass
-    for h in gather_macro_headlines():
-        k = re.sub(r"\W+", "", h["title"].lower())[:60]
-        if k not in seen:
-            seen.add(k)
-            out.append(dict(h))
-    out.sort(key=lambda r: r["age_h"])
-    out = out[:26]
-    for i, r in enumerate(out, 1):
-        r["n"] = i
-    return out
-
-
-def fetch_nifty_events(keys, subject, headlines=None, now_ist=None, nvidia_keys=None):
-    """Blocking (background thread).  NVIDIA on real headlines first (same ranked, timed table as the stocks), old Gemini+Google path as fallback."""
-    now_ist = now_ist or datetime.now(IST)
-    heads = gather_nifty_headlines()
-    err = ""
-    nk = [k for k in (nvidia_keys or []) if k]
-    if nk and heads:
-        try:
-            import nvidia_llm
-            msgs = [{"role": "system", "content": "You are a careful Indian equity market analyst. Reply with ONLY a JSON array. Never invent facts or dates."},
-                    {"role": "user", "content": _stock_prompt("NIFTY 50", "Nifty 50 index (poora India market)", "Index", heads, headlines, now_ist)}]
-            txt, model = nvidia_llm.chat_robust(nk, msgs, max_tokens=2400, temperature=0.1, deadline_s=80.0, thinking=False)
-            rows = _clean_stock_events(_extract_json(txt), heads)
-            if rows:
-                for r in rows:
-                    r["_model"] = model
-                return rows, ""
-            err = "NVIDIA ne koi badi event nahi chuni"
-        except Exception as exc:
-            err = f"NVIDIA: {type(exc).__name__}: {exc}"[:200]
-    rows, gerr = fetch_events(keys, subject, headlines, now_ist)
-    return rows, ("" if rows else (err + " | " + gerr).strip(" |")[:260])
-
-
-def start_nifty_events(key, keys, subject, headlines=None, nvidia_keys=None):
-    if not _slot_acquire():      # another research thread is running -> try again on a later refresh, cost nothing now
-        return
-    with _EV_LOCK:
-        cur = _EVENTS.get(key)
-        if cur and cur["status"] == "running" and time.time() - cur["ts"] < 120:
-            _EV_SLOT.release()
-            return
-        _EVENTS[key] = {"ts": time.time(), "status": "running", "rows": [], "err": ""}
-
-    def _work():
-        try:
-            rows, err = fetch_nifty_events(keys, subject, headlines, nvidia_keys=nvidia_keys)
-        except Exception as exc:
-            rows, err = [], f"{type(exc).__name__}: {exc}"[:200]
-        _EV_SLOT.release()
-        with _EV_LOCK:
-            _EVENTS[key] = {"ts": time.time(), "status": "error" if (err and not rows) else "done", "rows": rows, "err": err}
-
-    threading.Thread(target=_work, daemon=True).start()
-
-
 def start_stock_events(key, keys, subject, headlines=None, stock=None, nvidia_keys=None):
     """Background thread, same state machine as start_events()."""
-    if not _slot_acquire():      # another research thread is running -> try again on a later refresh, cost nothing now
-        return
     with _EV_LOCK:
         cur = _EVENTS.get(key)
         if cur and cur["status"] == "running" and time.time() - cur["ts"] < 120:
-            _EV_SLOT.release()
             return
         _EVENTS[key] = {"ts": time.time(), "status": "running", "rows": [], "err": ""}
 
@@ -672,35 +560,10 @@ def start_stock_events(key, keys, subject, headlines=None, stock=None, nvidia_ke
             rows, err = fetch_stock_events(keys, subject, headlines, stock=stock, nvidia_keys=nvidia_keys)
         except Exception as exc:
             rows, err = [], f"{type(exc).__name__}: {exc}"[:200]
-        _EV_SLOT.release()
         with _EV_LOCK:
             _EVENTS[key] = {"ts": time.time(), "status": "error" if (err and not rows and "nahi mili" not in err) else "done", "rows": rows, "err": err}
 
     threading.Thread(target=_work, daemon=True).start()
-
-
-_EV_SLOT = threading.Semaphore(1)     # ONE events-research thread in the whole app at a time (Nifty or a stock): nothing can pile up behind the page
-
-
-_EV_SLOT_T = {"t": 0.0}
-
-
-def _slot_acquire():
-    """Non-blocking.  A research thread that somehow hangs for more than 4 minutes is abandoned (its slot is handed on), never blocks the feature for ever."""
-    global _EV_SLOT
-    if _EV_SLOT.acquire(blocking=False):
-        _EV_SLOT_T["t"] = time.time()
-        return True
-    if time.time() - _EV_SLOT_T["t"] > 240:
-        _EV_SLOT = threading.Semaphore(1)
-        _EV_SLOT.acquire()
-        _EV_SLOT_T["t"] = time.time()
-        return True
-    return False
-
-
-def _auto_ok():
-    return time.time() - _BOOT_T > AUTO_START_GRACE_S
 
 
 _BG_NEWS = {"rows": None, "running": False, "ts": 0.0}
@@ -767,19 +630,18 @@ def render_news(st, subject, news_items, key="x", stock=None):
         _ks = st.session_state.get("_news_intel_keys") or []
         _es = events_state(key)
         _nk = st.session_state.get("_nvidia_keys") or []
-        _ttl = STOCK_EVENTS_TTL_S if (stock or key == "nifty50") else EVENTS_TTL_S
-        rich = bool(stock) or key == "nifty50"
+        _ttl = STOCK_EVENTS_TTL_S if stock else EVENTS_TTL_S
         _stale = (not _es) or (_es.get("status") in ("done", "error") and time.time() - _es.get("ts", 0) > _ttl)
         if stock:
-            if _stale and _auto_ok():
+            if _stale:
                 start_stock_events(key, _ks, subject, heads, stock=stock, nvidia_keys=_nk)       # this stock's OWN research, automatic, once per 2 h, in the background
             if st.button(f"🔄 {stock.get('symbol') or subject} ke events dobara nikalo (NVIDIA research)", key=f"ni_btn_{key}"):
                 start_stock_events(key, _ks, subject, heads, stock=stock, nvidia_keys=_nk)
         else:
-            if key == "nifty50" and (_ks or _nk) and _stale and _auto_ok():
-                start_nifty_events(key, _ks, subject, heads, nvidia_keys=_nk)      # automatic BACKGROUND lookup every 40 min (page never waits)
-            if st.button("🗓️ Aaj/kal kya hua + agle events (NVIDIA + Google news)", key=f"ni_btn_{key}"):
-                start_nifty_events(key, st.session_state.get("_news_intel_keys") or [], subject, heads, nvidia_keys=_nk)
+            if key == "nifty50" and _ks and _stale:
+                start_events(key, _ks, subject, heads)      # one automatic BACKGROUND lookup per 2 h (page never waits)
+            if st.button("🗓️ Aaj/kal kya hua + agle events (Google se)", key=f"ni_btn_{key}"):
+                start_events(key, st.session_state.get("_news_intel_keys") or [], subject, heads)
         stt = events_state(key)
         rows = []
         if stt.get("status") == "running":
@@ -795,15 +657,10 @@ def render_news(st, subject, news_items, key="x", stock=None):
             table.append({"Status": "🕒 Aane wala" if up else "✅ Ho chuka", "Type": r.get("type") or "", "Kab (IST)": f"{r.get('date_ist')} {r.get('time_ist')}",
                           "Kya": r.get("event"), "Kis par asar": r.get("affects") or "Nifty / market",
                           "Direction": _EFFECT.get(str(r.get("expected_effect")).upper(), r.get("expected_effect")),
-                          "India market me kab / kahan": ((("⏱ " + str(r.get("impact_time_ist")) + " · ") if str(r.get("impact_time_ist") or "unknown") != "unknown" else "") if rich else "") + (r.get("india_text") or (india_impact(r.get("date_ist"), r.get("time_ist")) if (up and str(r.get("date_ist")) != "unknown") else (r.get("impact_start") or r.get("india_note") or ("date pata nahi" if up else "ho chuka")))),
-                          "Kitni der asar": r.get("duration") or r.get("reaction_window") or "", "Kyun": r.get("why") or "", **({"Mahatva": "⭐" * int(r.get("importance") or 3), "Asar kab se": r.get("impact_start") or "", "Sabut (headline)": r.get("evidence_text") or ""} if rich else {}), "_k": str(r.get("date_ist")) + str(r.get("time_ist"))})
-        if key == "nifty50":                            # upcoming first (nearest first), then what already happened (newest first)
-            _up = sorted([x for x in table if x["Status"].startswith("🕒")], key=lambda x: x["_k"])
-            _dn = sorted([x for x in table if not x["Status"].startswith("🕒")], key=lambda x: x["_k"], reverse=True)
-            table = _up + _dn
-        elif not stock:
-            table.sort(key=lambda x: x["_k"])
-        # (stock rows are already ranked: upcoming first, then by importance)
+                          "India market me kab / kahan": ((("⏱ " + str(r.get("impact_time_ist")) + " · ") if str(r.get("impact_time_ist") or "unknown") != "unknown" else "") if stock else "") + (r.get("india_text") or (india_impact(r.get("date_ist"), r.get("time_ist")) if (up and str(r.get("date_ist")) != "unknown") else (r.get("impact_start") or r.get("india_note") or ("date pata nahi" if up else "ho chuka")))),
+                          "Kitni der asar": r.get("duration") or r.get("reaction_window") or "", "Kyun": r.get("why") or "", **({"Mahatva": "⭐" * int(r.get("importance") or 3), "Asar kab se": r.get("impact_start") or "", "Sabut (headline)": r.get("evidence_text") or ""} if stock else {}), "_k": str(r.get("date_ist")) + str(r.get("time_ist"))})
+        if not stock:
+            table.sort(key=lambda x: x["_k"])          # stock rows are already ranked (upcoming first, then by importance)
         for x in table:
             x.pop("_k")
         if stock and not table and stt.get("status") != "running":
