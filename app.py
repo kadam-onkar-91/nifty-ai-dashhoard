@@ -2227,6 +2227,10 @@ except Exception:
 _LIVE_CHART_ON = False
 if not ACTIVE_SYMBOL:
     _LIVE_CHART_ON = live_chart.render()   # own fast refresh; False -> old chart is used
+    try:
+        st.sidebar.empty()                 # v66: claim a stable sidebar slot in the full run, so the fragment may write to the sidebar (StreamlitInvalidLayoutContextError)
+    except Exception:
+        pass
     _live_dashboard()
 else:
     try:

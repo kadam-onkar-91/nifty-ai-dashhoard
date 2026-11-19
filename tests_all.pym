@@ -1064,10 +1064,10 @@ if __name__ == "__main__":
     unittest.main()
 class V62WideStopAndLaneGuardTests(unittest.TestCase):
     def test_production_stop_defaults_are_wide(self):
-        self.assertEqual(_SL_DEFAULTS, (30.0, 45.0, 1.5))
+        self.assertEqual(_SL_DEFAULTS, (24.0, 28.0, 1.5))       # v66: stop capped at 28 pts (was 30-45)
         atr = 22.0
         sl = min(_SL_DEFAULTS[1], max(_SL_DEFAULTS[0], round(_SL_DEFAULTS[2] * atr, 1)))
-        self.assertEqual(sl, 33.0)          # old formula gave 20 pts for the same ATR
+        self.assertEqual(sl, 28.0)          # v66: 1.5 x 22 = 33 is clamped to the 28 pt cap (v62 had 33; the original formula gave 20)
 
     def test_lane_guard_pauses_a_losing_relief_lane_but_never_the_base_lane(self):
         d = tempfile.mkdtemp(); old = tl.DB_NAME
@@ -3733,4 +3733,71 @@ class TestV66BestEvents(unittest.TestCase):
     def test_fixed_calendar_rows_have_impact(self):
         for r in news_intel.fixed_calendar():
             self.assertGreaterEqual(int(r["impact"]), 3)
+
+class TestV66SidebarFragment(unittest.TestCase):
+    def test_login_runs_even_if_streamlit_refuses_the_sidebar_write(self):
+        import upstox_auth
+
+        class StreamlitInvalidLayoutContextError(Exception):
+            pass
+
+        class _Boom:
+            def __getattr__(self, _n):
+                def f(*a, **k):
+                    raise StreamlitInvalidLayoutContextError("fragment sidebar")
+                return f
+        calls = []
+        orig = upstox_auth._get_upstox_access_token_impl
+        try:
+            def fake(sb):
+                calls.append(type(sb).__name__)
+                sb.subheader("x")                      # first UI call decides
+                return "TOKEN"
+            upstox_auth._get_upstox_access_token_impl = fake
+            _had = hasattr(upstox_auth.st, "sidebar")
+            orig_sidebar = getattr(upstox_auth.st, "sidebar", None)
+            upstox_auth.st.sidebar = _Boom()
+            try:
+                self.assertEqual(upstox_auth.get_upstox_access_token(), "TOKEN")
+            finally:
+                if _had:
+                    upstox_auth.st.sidebar = orig_sidebar
+                else:
+                    delattr(upstox_auth.st, "sidebar")
+            self.assertEqual(calls, ["_Boom", "_NullSidebar"])
+        finally:
+            upstox_auth._get_upstox_access_token_impl = orig
+
+class TestV66StopCap(unittest.TestCase):
+    def test_production_stop_is_never_wider_than_28_points(self):
+        import tests_edge_v36 as _t36
+        d = _t36._SL_DEFAULTS                                       # production values captured before that module overrides them for the older tuned scenarios
+        self.assertLessEqual(d[1], 28.0)
+        self.assertGreaterEqual(d[0], 20.0)
+        self.assertLessEqual(d[0], d[1])
+
+class TestV66StockStopScale(unittest.TestCase):
+    def _fam(self):
+        import stock_family
+        return stock_family.get_family("V66TEST")
+
+    def test_stock_stop_follows_atr_like_nifty_not_a_fat_price_floor(self):
+        fam = self._fam()
+        fam.scale(1000.0, 2.0)                       # quiet Rs 1000 stock, ATR 0.2 %: old floor made the stop 2.5, now ATR based
+        self.assertAlmostEqual(fam.sl_min, 2.4, places=2)
+        self.assertAlmostEqual(fam.sl_max, 3.0, places=2)
+        self.assertLess(fam.sl_max / 1000.0, 0.0035)       # nowhere near the old 0.25 %-floor world for a calm stock
+
+    def test_stop_floor_and_ceiling(self):
+        fam = self._fam()
+        fam.scale(1000.0, 0.3)                       # almost no movement -> floor 0.15 % of price = 1.5
+        self.assertAlmostEqual(fam.sl_min, 1.5, places=2)
+        self.assertGreaterEqual(fam.sl_max, fam.sl_min)
+        fam.scale(1000.0, 9.0)                       # wild spike (ATR 0.9 %) -> never above 0.6 % of price = 6
+        self.assertLessEqual(fam.sl_max, 6.0 + 1e-6)
+        self.assertGreaterEqual(fam.sl_max, fam.sl_min)
+
+    def test_stock_stop_never_wider_than_ceiling_in_a_real_decision_patch(self):
+        fam = self._fam()
+        self.assertEqual([m for m in fam.misses if "sl_distance" in m], [])        # the text patch still finds the ATR stop line
 # @@END tests_v66_best_events

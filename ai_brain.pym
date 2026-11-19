@@ -50,9 +50,10 @@ REVIEW_DEADLINE_S = 150.0       # the review runs in a BACKGROUND thread (page n
 # v62 WIDER STOP.  The real log showed nearly every trade stopped out within 5-30 minutes: a 20-28 pt stop (0.9 x ATR) sits INSIDE one normal 5-min
 # candle of noise, and the tracker scores a wick through the stop as a loss.  Stop = SL_ATR_MULT x ATR, clamped to [MIN_SL_PTS, MAX_SL_PTS].
 # The target is never closer than 1.5R (MIN_RR_RATIO), so a wider stop automatically gets a farther target.
+# v66: the user wants the stop NEVER wider than 28 pts (45 pts was too big).  Stop = 1.5 x ATR clamped to [24, 28]; the structure-aware widening below is capped by the same 28.
 SL_ATR_MULT = 1.5
-MIN_SL_PTS = 30.0
-MAX_SL_PTS = 45.0               # widest stop the structure-aware SL may use too
+MIN_SL_PTS = 24.0
+MAX_SL_PTS = 28.0               # widest stop the structure-aware SL may use too (HARD cap, v66: was 45)
 OI_WALL_SIGNIFICANCE = 0.60     # a wall counts when its OI >= this fraction of the strongest wall in range
 OI_FRONT_RUN_MIN_PTS = 4.0      # target sits this many pts BEFORE the wall (or OI_FRONT_RUN_ATR x ATR, whichever is larger)
 OI_FRONT_RUN_ATR = 0.25

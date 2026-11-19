@@ -586,8 +586,8 @@ def _analytics_token():
     return tok or None
 
 
-def get_upstox_access_token():
-    st.sidebar.subheader("🔐 Upstox Live Authentication")
+def _get_upstox_access_token_impl(sb):
+    sb.subheader("🔐 Upstox Live Authentication")
     if "access_token" not in st.session_state:
         st.session_state.access_token = None
 
@@ -596,9 +596,9 @@ def get_upstox_access_token():
     if creds is None:
         if _an_token:                      # data-only setup: the analytics token alone is enough
             st.session_state.access_token = _an_token
-            st.sidebar.success("🟢 Live Feed Active (Upstox Analytics token, 1 saal valid)")
+            sb.success("🟢 Live Feed Active (Upstox Analytics token, 1 saal valid)")
             return _an_token
-        st.sidebar.error("Secrets me UPSTOX_API_KEY / UPSTOX_API_SECRET / REDIRECT_URI me se kuch missing hai.")
+        sb.error("Secrets me UPSTOX_API_KEY / UPSTOX_API_SECRET / REDIRECT_URI me se kuch missing hai.")
         return None
     API_KEY, API_SECRET, REDIRECT_URI = creds
 
@@ -632,8 +632,8 @@ def get_upstox_access_token():
             pass
 
     if st.session_state.access_token:
-        st.sidebar.success("🟢 Live Feed Active (Upstox connected)")
-        if st.sidebar.button("Disconnect", key="upstox_disconnect_btn"):
+        sb.success("🟢 Live Feed Active (Upstox connected)")
+        if sb.button("Disconnect", key="upstox_disconnect_btn"):
             _clear_token()
             st.session_state.access_token = None
             st.rerun()
@@ -642,23 +642,41 @@ def get_upstox_access_token():
     if _an_token:
         # no (valid) OAuth login today -> the 1-year analytics token keeps the live feed on, automatically
         st.session_state.access_token = _an_token
-        st.sidebar.success("🟢 Live Feed Active (Upstox Analytics token - roz login ki zarurat nahi)")
-        st.sidebar.caption("Normal Upstox login bhi chalega (optional). Analytics token sirf data padhta hai, order nahi laga sakta.")
+        sb.success("🟢 Live Feed Active (Upstox Analytics token - roz login ki zarurat nahi)")
+        sb.caption("Normal Upstox login bhi chalega (optional). Analytics token sirf data padhta hai, order nahi laga sakta.")
         return _an_token
 
     err = st.session_state.get("upstox_login_error")
     if err:
-        st.sidebar.error(f"Login fail: {err}\n\nCheck karo: Upstox portal me Redirect URI bilkul wahi ho jo secrets me "
+        sb.error(f"Login fail: {err}\n\nCheck karo: Upstox portal me Redirect URI bilkul wahi ho jo secrets me "
                          f"REDIRECT_URI hai (`{REDIRECT_URI}`), aur API key/secret sahi ho.")
 
     encoded_redirect = urllib.parse.quote(REDIRECT_URI, safe="")
     login_url = (f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code"
                  f"&client_id={API_KEY}&redirect_uri={encoded_redirect}")
-    st.sidebar.link_button("🚀 Login with Upstox", login_url)
-    st.sidebar.caption("Login naye tab me khulta hai. PIN daalne ke baad ye dashboard apne aap connect ho jayega "
+    sb.link_button("🚀 Login with Upstox", login_url)
+    sb.caption("Login naye tab me khulta hai. PIN daalne ke baad ye dashboard apne aap connect ho jayega "
                        "(agle refresh me, max 30 sec). Purana tab band kar sakte ho.")
-    st.sidebar.button("🔄 Login ho gaya? Status check karo", key="upstox_check_btn")
+    sb.button("🔄 Login ho gaya? Status check karo", key="upstox_check_btn")
     return None
+
+
+class _NullSidebar:
+    """v66: stand-in used for ONE run when Streamlit refuses a sidebar write from inside a fragment (StreamlitInvalidLayoutContextError, seen 3x in the log).
+    The token logic below still runs; only the sidebar widgets are skipped until the next full page run puts them back."""
+    def __getattr__(self, _name):
+        return lambda *a, **k: False
+
+
+def get_upstox_access_token():
+    try:
+        return _get_upstox_access_token_impl(st.sidebar)
+    except Exception as exc:
+        if type(exc).__name__ != "StreamlitInvalidLayoutContextError":
+            raise
+        return _get_upstox_access_token_impl(_NullSidebar())       # the error is raised by the very first sidebar write, before any login logic ran -> safe to run again
+
+
 # @@END upstox_auth
 # @@MODULE tick_guard
 """tick_guard.py -- stop-loss / target are checked on the LIVE PRICE every ~2 seconds.
