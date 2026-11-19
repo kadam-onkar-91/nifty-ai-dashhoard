@@ -3658,3 +3658,79 @@ class TestV65StockEvents(unittest.TestCase):
         safe_io._SESS["nifty_done"] = 0.0
         self.assertFalse(safe_io.nifty_human_active())
 # @@END tests_v65_stock_events
+# @@MODULE tests_v66_best_events
+import unittest
+from datetime import datetime, timedelta, timezone
+import news_intel
+
+IST_ = timezone(timedelta(hours=5, minutes=30))
+
+
+class TestV66BestEvents(unittest.TestCase):
+    def test_gemini_fallback_no_longer_crashes_without_review_models(self):
+        import ai_trade_decision as atd
+        self.assertFalse(hasattr(atd, "REVIEW_MODELS") and False)
+        rows, err = news_intel.fetch_events([], "X", [])      # no keys -> must return an error text, never raise AttributeError
+        self.assertEqual(rows, [])
+
+    def test_finished_events_are_dropped_upcoming_kept(self):
+        now = datetime(2026, 11, 19, 13, 20, tzinfo=IST_)            # Thursday, market open
+        rows = [{"event": "old", "status": "happened", "date_ist": "2026-11-17", "time_ist": "16:06", "impact": 4},
+                {"event": "morning", "status": "happened", "date_ist": "2026-11-19", "time_ist": "10:00", "impact": 4},
+                {"event": "post-close news", "status": "happened", "date_ist": "2026-11-18", "time_ist": "18:00", "impact": 4},
+                {"event": "tonight", "status": "upcoming", "date_ist": "2026-11-19", "time_ist": "20:00", "impact": 4},
+                {"event": "next week", "status": "upcoming", "date_ist": "2026-11-26", "time_ist": "unknown", "impact": 5},
+                {"event": "low", "status": "upcoming", "date_ist": "2026-11-20", "time_ist": "10:00", "impact": 2},
+                {"event": "no date", "status": "upcoming", "date_ist": "unknown", "time_ist": "unknown", "impact": 3}]
+        names = [r["event"] for ph, r in news_intel.best_rows(rows, now)]
+        self.assertEqual(names, ["tonight", "next week"])            # post-close news (18-Nov 18:00) reacted by 10:15 today -> gone; old/low/undated(impact<4) gone
+
+    def test_post_close_news_is_live_until_next_open_plus_hour(self):
+        r = {"event": "after close", "status": "happened", "date_ist": "2026-11-18", "time_ist": "18:00", "impact": 4}
+        self.assertEqual(news_intel.event_phase(r, datetime(2026, 11, 19, 9, 40, tzinfo=IST_)), "live")
+        self.assertIsNone(news_intel.event_phase(r, datetime(2026, 11, 19, 10, 30, tzinfo=IST_)))
+
+    def test_friday_evening_news_reacts_on_monday(self):
+        r = {"event": "fri", "status": "happened", "date_ist": "2026-11-20", "time_ist": "19:00", "impact": 4}
+        self.assertEqual(news_intel.event_phase(r, datetime(2026, 11, 23, 9, 30, tzinfo=IST_)), "live")
+
+    def test_nifty_and_stock_queries_differ(self):
+        nq = " ".join(q for _l, q in news_intel.nifty_queries())
+        self.assertIn("RBI", nq)
+        sq = " ".join(q for _l, q in news_intel.stock_queries("RELIANCE", "Reliance Industries Ltd", ""))
+        self.assertIn("Reliance Industries", sq)
+        self.assertNotIn("FOMC", sq)
+
+    def test_heuristic_reader_finds_future_dates_only(self):
+        now = datetime(2026, 11, 19, 13, 0, tzinfo=IST_)
+        heads = [{"n": 1, "title": "HCC board meeting on 25 Nov to consider Q2 results", "src": "ET", "date": "2026-11-19 09:00"},
+                 {"n": 2, "title": "XYZ results on 10 Nov beat estimates", "src": "ET", "date": "2026-11-10 09:00"},
+                 {"n": 3, "title": "Market rallies", "src": "ET", "date": "2026-11-19 09:00"}]
+        rows = news_intel.heuristic_events(heads, now)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["date_ist"], "2026-11-25")
+
+    def test_llm_called_only_when_headlines_change(self):
+        import time as _t
+        calls = []
+        heads = [{"n": 1, "label": "x", "title": "A wins order", "src": "s", "age_h": 1, "date": "2026-11-19 09:00"}]
+        key = "t66"
+        news_intel._EVENTS.pop(key, None)
+        w = {"gather": lambda: heads, "fetch": lambda h: (calls.append(1) or ([{"event": "e", "status": "upcoming", "date_ist": "2026-11-25", "time_ist": "unknown", "impact": 4}], ""))}
+        news_intel._start(key, w)
+        for _ in range(50):
+            if news_intel.events_state(key).get("status") == "done":
+                break
+            _t.sleep(0.05)
+        news_intel._start(key, w)
+        for _ in range(50):
+            if news_intel.events_state(key).get("status") == "done" and news_intel.events_state(key).get("took") is not None:
+                _t.sleep(0.1)
+                break
+            _t.sleep(0.05)
+        self.assertEqual(len(calls), 1)                              # identical headlines -> no second LLM call
+
+    def test_fixed_calendar_rows_have_impact(self):
+        for r in news_intel.fixed_calendar():
+            self.assertGreaterEqual(int(r["impact"]), 3)
+# @@END tests_v66_best_events

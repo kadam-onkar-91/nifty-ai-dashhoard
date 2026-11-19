@@ -1,0 +1,10 @@
+# v66 — sirf kaam ki news/events (aane wale + abhi asar chalu), har stock / Nifty ke apne, crash fix
+Sirf 2 file badli hain: `news_intel.py` aur `tests_all.pym`. Engine, gates, SL/target, loading, refresh -- kuch nahi chheda.
+
+1. CRASH FIX (asli wajah): `news_intel.fetch_events` `ai_trade_decision.REVIEW_MODELS` maangta tha jo ab hai hi nahi -> Gemini wala events thread har baar mar jata tha, isliye Nifty page par sirf expiry/US-open (fixed) dikhte the. Ab safe default models.
+2. "HO CHUKA" band: har render par har row check hoti hai -- jo event nikal chuka aur jiska market reaction poora ho gaya, wo gayab. Dikhta sirf: (a) AANE WALA, (b) "abhi asar chalu" (jaise market band hone ke baad aayi news, jiska reaction agle 09:15 + 1 ghante tak baaki). Impact 1-2 wali rows nahi dikhti.
+3. IMPACT + KAB: har row me Impact (MEDIUM/BADA/BAHUT BADA), countdown ("2 ghante 10 min baad"), "Market me asar kab/kahan" (09:15 gap / market chalu me turant / expiry ka aakhri ghanta), kitni der asar, kyun, headline ka sabut. Time ke hisaab se sort (live pehle, phir jo sabse pehle aane wala).
+4. HAR PAGE KI APNI NEWS: stock = us stock ke 6 targeted Google-News searches (company / aane wali date: results-board-record date-AGM / orders-deals / SEBI-court-rating / sector). Nifty 50 = 8 index-level searches (RBI-policy, Fed/US data, FII-DII, crude-dollar, India CPI-GDP, heavyweights results, expiry-NSE, geopolitics). Pehle NVIDIA (Gemini nahi); NVIDIA fail ho to Gemini+Google; wo bhi fail ho to rule-based headline reader -- table khaali nahi rehta.
+5. FRESH + FAST: sab kuch background thread me (page sirf dict padhta hai -> loading/refresh ka time bilkul same). Headlines har 10 min fir se padhi jaati hain (RSS, free); model sirf tab dubara bulaya jata hai jab headlines badli hon (ya 3 ghante baad) -> quota bachta hai. Naya check chalte waqt purani rows dikhti rehti hain (spinner se khaali nahi).
+6. Tests: tests_v66_best_events (8 naye). Poora suite: 314 OK.
+Revert: purani news_intel.py wapas daal do (v65).
