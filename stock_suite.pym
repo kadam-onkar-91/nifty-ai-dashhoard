@@ -313,7 +313,7 @@ def _cfg():
 
 
 def _local_rows(fam):
-    conn = sqlite3.connect(fam.mods["trade_learning"].DB_NAME)
+    conn = sqlite3.connect(fam.mods["trade_learning"].DB_NAME, timeout=30)
     try:
         cur = conn.execute("SELECT timestamp, direction, underlying_entry, stop_loss, target, confidence_pct, factors_json, status, exit_price, "
                            "exit_timestamp FROM ai_trade_setups ORDER BY id ASC")
@@ -332,7 +332,7 @@ def restore(fam):
     r = requests.get(f"{url}?symbol=eq.{fam.symbol}&order=id.asc&limit=2000", headers=hdr, timeout=8)
     r.raise_for_status()
     rows = r.json() or []
-    conn = sqlite3.connect(fam.mods["trade_learning"].DB_NAME)
+    conn = sqlite3.connect(fam.mods["trade_learning"].DB_NAME, timeout=30)
     try:
         for x in rows:
             conn.execute("INSERT INTO ai_trade_setups (timestamp, direction, strike, option_type, underlying_entry, stop_loss, target, "
@@ -3317,7 +3317,10 @@ def _body(symbol, ai_engine, helpers):
     with st.expander("🌐 Global Market Sentiment & Regional Live News", expanded=False):
         st.info(f"**⚡ World's Strongest News Highlight (Live Today):**\n\n*{top_headline}*")
         try:
-            st.dataframe(df_sent.style.background_gradient(subset=["Positive News", "Negative News"], cmap="Blues"), width="stretch")
+            _sdf = df_sent.copy()
+            for _c in ("Positive News", "Negative News"):
+                _sdf[_c] = pd.to_numeric(_sdf[_c], errors="coerce")   # "N/A" -> NaN so gradient styling does not crash
+            st.dataframe(_sdf.style.background_gradient(subset=["Positive News", "Negative News"], cmap="Blues").format(na_rep="N/A"), width="stretch")
         except Exception:
             st.dataframe(df_sent, width="stretch")
     st.markdown("<br>", unsafe_allow_html=True)

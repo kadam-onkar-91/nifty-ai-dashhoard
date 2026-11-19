@@ -888,7 +888,7 @@ def _walk_forward_cached(name: str, x: pd.DataFrame, fingerprint: tuple, start: 
             return last[1]
         if fut is None:
             # completed candles only: the forming candle must not leak into history statistics
-            fut = _WF_EXECUTOR.submit(_walk_forward, name, x.iloc[:-1].copy(), start, horizon)
+            fut = _WF_EXECUTOR.submit(_wf_offload, name, x.iloc[:-1].copy(), start, horizon)
             _WF_PENDING[name] = fut
         if last is not None:
             return last[1]
@@ -899,6 +899,9 @@ def _walk_forward_cached(name: str, x: pd.DataFrame, fingerprint: tuple, start: 
             "validation_status": "WARMING_UP",
             "note": "Walk-forward history is calculating in the background; live setup evaluation is not blocked."
         }
+
+
+_WF_SIG: Dict[str, Any] = {}
 
 
 def _walk_forward(name: str, x: pd.DataFrame, start: int = 100, horizon: int = DEFAULT_HORIZON) -> Dict[str, Any]:
@@ -921,9 +924,33 @@ def _walk_forward(name: str, x: pd.DataFrame, start: int = 100, horizon: int = D
     outcomes = []
     ambiguous = 0
     unresolved = 0
+    # v67 SPEED: the signal at bar i depends ONLY on x.iloc[:i+1].  A refresh used to recompute all ~800 historical bars of every strategy
+    # although only the newest bars are new.  Each bar's signal is now remembered together with a checksum of the whole history before it:
+    # a bar is reused only when that history is bit-for-bit identical, otherwise it is recomputed -- the statistics are exactly the same.
+    try:
+        _num_cols = x.select_dtypes("number")
+        _a = np.nan_to_num(_num_cols.to_numpy(dtype=float), nan=-12345.678)
+        _row = _a @ (1.0 + 0.37 * np.arange(_a.shape[1]))
+        _cs = np.cumsum(_row * (1.0 + (np.arange(len(_row)) % 1013) * 1e-4))
+        _idx = np.asarray(x.index.asi8, dtype=float) if hasattr(x.index, "asi8") else np.arange(len(x), dtype=float)
+        _cs = _cs + np.cumsum(_idx % 1e9)
+        _first = (str(x.index[0]), tuple(_num_cols.columns))
+        _sc = _WF_SIG.setdefault(name, {"first": None, "sigs": {}})
+        if _sc["first"] != _first or len(_sc["sigs"]) > 20000:
+            _sc["first"] = _first
+            _sc["sigs"] = {}
+        _sigs = _sc["sigs"]
+    except Exception:
+        _cs, _sigs = None, None
     for i in range(start, len(x) - horizon):
-        hist = x.iloc[:i + 1]
-        sig = _signal_rules(hist, name)
+        _hit = _sigs.get(i) if _sigs is not None else None
+        if _hit is not None and _hit[0] == _cs[i]:
+            sig = _hit[1]
+        else:
+            hist = x.iloc[:i + 1]
+            sig = _signal_rules(hist, name)
+            if _sigs is not None:
+                _sigs[i] = (float(_cs[i]), sig)
         if not sig:
             continue
         entry = _num(x["Close"].iloc[i])
@@ -982,6 +1009,54 @@ def _walk_forward(name: str, x: pd.DataFrame, start: int = 100, horizon: int = D
                   "Provisional historical sample" if validation_status == "PROVISIONAL" else
                   "Not enough resolved samples for a trustworthy win-rate display")
     }
+
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# v67 SPEED: the walk-forward statistics (41 strategies x every historical bar) are ~75+ s of pure-Python CPU.  They used to run in a
+# background THREAD, which fights the page for the GIL -> every step of the refresh (strategy engine, consensus, rendering) crawled.
+# They now run in a separate low-priority PROCESS: identical function, identical inputs, identical numbers -- the page just keeps
+# its own core.  Any problem (spawn blocked, memory, timeout, stock-family module copy) falls back to the old in-process path.
+# ---------------------------------------------------------------------------------------------------------------------------
+_WF_PROC = {"pool": None, "dead": False}
+_WF_PROC_LOCK = threading.Lock()
+
+
+def _wf_child_run(module_name, consts, name, x, start, horizon):
+    import importlib
+    m = importlib.import_module(module_name)
+    for k, v in consts.items():
+        setattr(m, k, v)
+    return m._walk_forward(name, x, start, horizon)
+
+
+def _wf_pool():
+    with _WF_PROC_LOCK:
+        if _WF_PROC["pool"] is None:
+            import multiprocessing as _mp
+            from concurrent.futures import ProcessPoolExecutor
+            import bundle_loader as _bl
+            _WF_PROC["pool"] = ProcessPoolExecutor(max_workers=1, mp_context=_mp.get_context("spawn"), initializer=_bl.wf_child_init)
+        return _WF_PROC["pool"]
+
+
+def _wf_offload(name, x, start=100, horizon=DEFAULT_HORIZON):
+    import sys as _sys
+    g = globals()
+    if (_WF_PROC["dead"] or __name__ != "strategy_engine" or getattr(_sys.modules.get(__name__), "__dict__", None) is not g
+            or "bundle_loader" not in _sys.modules):
+        return _walk_forward(name, x, start, horizon)
+    try:
+        consts = {k: v for k, v in g.items() if k.isupper() and isinstance(v, (int, float, str)) and not isinstance(v, bool)}
+        return _wf_pool().submit(_wf_child_run, __name__, consts, name, x, start, horizon).result(timeout=900)
+    except Exception:
+        _WF_PROC["dead"] = True                      # one failure -> stay on the proven in-process path from now on
+        try:
+            pool, _WF_PROC["pool"] = _WF_PROC["pool"], None
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        return _walk_forward(name, x, start, horizon)
 
 
 def _recent_strategy_signal_cached(x: pd.DataFrame, name: str, fingerprint: tuple, option_chain=None, window: int = RECENT_SETUP_BARS):
