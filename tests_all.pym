@@ -3638,9 +3638,6 @@ class TestV65StockEvents(unittest.TestCase):
     def test_nvidia_path_is_used_before_gemini(self):
         import nvidia_llm
         orig_chat, orig_g = nvidia_llm.chat_robust, news_intel.gather_stock_headlines
-        orig_m, orig_c = news_intel.gather_macro_headlines, news_intel.stock_calendar_rows
-        news_intel.gather_macro_headlines = lambda *a, **k: []
-        news_intel.stock_calendar_rows = lambda *a, **k: []
         try:
             news_intel.gather_stock_headlines = lambda *a, **k: [{"n": 1, "label": "Company", "title": "X wins order", "src": "ET", "age_h": 2, "date": "2026-11-18 08:00"}]
             nvidia_llm.chat_robust = lambda *a, **k: ('[{"event":"Order win","status":"happened","date_ist":"2026-11-18","time_ist":"unknown","evidence":1}]', "fake-model")
@@ -3650,33 +3647,6 @@ class TestV65StockEvents(unittest.TestCase):
             self.assertEqual(err, "")
         finally:
             nvidia_llm.chat_robust, news_intel.gather_stock_headlines = orig_chat, orig_g
-            news_intel.gather_macro_headlines, news_intel.stock_calendar_rows = orig_m, orig_c
-
-    def test_v66_ranking_calendar_and_macro(self):
-        import nvidia_llm
-        heads = [{"n": 1, "label": "Company", "title": "A", "src": "ET", "age_h": 1, "date": "2026-11-19 09:00"}]
-        rows = news_intel._clean_stock_events([
-            {"event": "old minor", "status": "happened", "date_ist": "2026-11-17", "evidence": 1, "importance": 1},
-            {"event": "big happened", "status": "happened", "date_ist": "2026-11-19", "evidence": 1, "importance": 5},
-            {"event": "later", "status": "upcoming", "date_ist": "2026-11-25", "evidence": 1, "importance": 3},
-            {"event": "soon", "status": "upcoming", "date_ist": "2026-11-20", "evidence": 1, "importance": 2}], heads)
-        self.assertEqual([r["event"] for r in rows], ["soon", "later", "big happened", "old minor"])     # upcoming nearest first, then by importance
-        cal = [{"event": "Quarterly results", "status": "upcoming", "date_ist": "2026-11-20", "type": "Results", "importance": 5}]
-        merged = news_intel._merge_calendar([{"event": "dup", "type": "Results", "date_ist": "2026-11-20"}, {"event": "keep", "type": "Order", "date_ist": "unknown"}], cal)
-        self.assertEqual([r["event"] for r in merged], ["Quarterly results", "keep"])
-        orig_m, orig_c, orig_g, orig_chat = news_intel.gather_macro_headlines, news_intel.stock_calendar_rows, news_intel.gather_stock_headlines, nvidia_llm.chat_robust
-        seen = {}
-        try:
-            news_intel.gather_stock_headlines = lambda *a, **k: [{"n": 1, "label": "Company", "title": "X order", "src": "ET", "age_h": 2, "date": "2026-11-19 08:00"}]
-            news_intel.gather_macro_headlines = lambda *a, **k: [{"label": "Macro-Global", "title": "Fed holds rates", "src": "Reuters", "age_h": 3, "date": "2026-11-19 06:00"}]
-            news_intel.stock_calendar_rows = lambda *a, **k: cal
-            nvidia_llm.chat_robust = lambda keys, msgs, **k: (seen.setdefault("p", msgs[1]["content"]), '[{"event":"Fed","status":"happened","date_ist":"2026-11-19","type":"Macro-Global","evidence":2,"importance":4}]')[1:] + ("m",)
-            out, err = news_intel.fetch_stock_events([], "XYZ", [], stock={"symbol": "XYZ", "company": "XYZ Ltd", "sector": "Infra"}, nvidia_keys=["k" * 12])
-        finally:
-            news_intel.gather_macro_headlines, news_intel.stock_calendar_rows, news_intel.gather_stock_headlines, nvidia_llm.chat_robust = orig_m, orig_c, orig_g, orig_chat
-        self.assertIn("Fed holds rates", seen["p"])                              # market-wide headline reached the model
-        self.assertEqual(out[0]["type"], "Results")                              # the real calendar date comes first
-        self.assertEqual(out[1]["evidence_text"].startswith("[2] Fed holds rates"), True)
 
     def test_robot_tab_waits_only_for_stock_runs(self):
         safe_io.page_run("stock", "start")
