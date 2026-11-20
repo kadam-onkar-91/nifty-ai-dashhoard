@@ -669,7 +669,7 @@ def _sb_ok(table):
 
 
 def _local():
-    conn = sqlite3.connect(tl.DB_NAME)
+    conn = sqlite3.connect(tl.DB_NAME, timeout=30)
     conn.execute("CREATE TABLE IF NOT EXISTS market_snapshots (ts TEXT PRIMARY KEY, features TEXT, labels TEXT, src TEXT, forecast TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS market_autopsy (day TEXT PRIMARY KEY, summary TEXT)")
     conn.commit()
@@ -1963,12 +1963,12 @@ def score_bank_fundamentals(info):
 
 def fetch_bank_fundamentals():
     """{symbol: {label, score, notes}}.  Raises when nothing could be read (so safe_io keeps the previous good value and retries later)."""
-    if time.time() - _BANK_FUND_FAIL["ts"] < 600:
+    if time.time() - _BANK_FUND_FAIL["ts"] < 600:      # (a failed fetch is retried after 10 min; successes are cached 12 h by fundamentals_hub)
         raise RuntimeError("bank fundamentals: backing off after a failed fetch")
-    import yfinance as yf
+    import fundamentals_hub                       # v68: cache + breaker + screener.in fallback
 
     def _one(sym):
-        info = yf.Ticker(sym + ".NS").info or {}
+        info = fundamentals_hub.get_info(sym) or {}
         sc, label, notes = score_bank_fundamentals(info)
         return {"label": label, "score": sc, "notes": notes}
 

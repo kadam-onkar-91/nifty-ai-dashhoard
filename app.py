@@ -148,6 +148,11 @@ try:        # NSE stock list: instant (memory / disk / bundled list); the full l
 except Exception:
     logger.exception("stock universe prewarm failed (ignored)")
 
+try:        # v68: slow data (50-stock fundamentals, Nifty news) starts loading in the background the moment the server starts
+    multi_stock_engine.prewarm_background()
+except Exception:
+    logger.exception("fundamentals prewarm failed (ignored)")
+
 ui_theme.inject_theme()   # premium dark-glass look + animations
 ui_theme.render_hero()    # animated hero banner (presentation only)
 
@@ -204,6 +209,7 @@ with st.sidebar:
     except Exception:
         logger.exception("watchlist panel failed (ignored)")
 
+st.sidebar.empty()      # v68: claim a sidebar slot in the FULL run so the fragment may write to the sidebar later (StreamlitInvalidLayoutContextError)
 ACTIVE_SYMBOL = st.session_state.get("active_symbol") or None
 
 # -------------------------------------------------------------
@@ -401,12 +407,15 @@ def _live_dashboard_body():
         _sp.step("Market breadth (heavyweights + Nifty 50)")
         # Each source is wrapped: a slow one is skipped after `timeout` s (last good value / "unavailable") and keeps
         # loading in the background, instead of freezing the whole page.
-        df_heavyweights, advances, declines, breadth_ratio, breadth_status, heavyweights_debug = safe_io.guarded(
-            "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=20,
-            default=market_breadth.unavailable_heavyweights())
-        df_full50, adv50, dec50, ratio50, breadth50_status, full50_debug = safe_io.guarded(
-            "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=20,
-            default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
+        # v68: both breadth sources run AT THE SAME TIME (before: one after the other = up to 2 x 20 s), 14 s cap each.
+        from concurrent.futures import ThreadPoolExecutor as _BreadthPool
+        with _BreadthPool(max_workers=2) as _bx:
+            _bf_heavy = _bx.submit(safe_io.guarded, "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=14,
+                                   default=market_breadth.unavailable_heavyweights())
+            _bf_full = _bx.submit(safe_io.guarded, "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=14,
+                                  default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
+            df_heavyweights, advances, declines, breadth_ratio, breadth_status, heavyweights_debug = _bf_heavy.result()
+            df_full50, adv50, dec50, ratio50, breadth50_status, full50_debug = _bf_full.result()
         max_pain = option_chain.calculate_max_pain(df_option_chain)
         fii_footprint, current_pcr = option_chain.get_fii_dii_fo_footprint(df_option_chain)
         try:
@@ -2149,11 +2158,16 @@ def _live_dashboard_body():
             st.caption("Real NIFTY 50 nahi ek single company hai, isliye ek official PE/EPS nahi hota — ye "
                        "asli 50 constituents ke fundamentals ka equal-weight average hai, honestly labelled "
                        "as an aggregate (Nifty ke official index-weighted number se alag).")
-            _refresh_nifty_fund = st.button("🔄 Refresh NIFTY 50 Fundamentals (slow — ~50 stocks)", key="refresh_nifty50_fund")
-            if _refresh_nifty_fund or "_nifty50_fund_cache" not in st.session_state:
-                with st.spinner("Fetching all 50 constituent fundamentals..."):
-                    st.session_state["_nifty50_fund_cache"] = multi_stock_engine.get_nifty50_fundamentals(limit=50)
-            _n50_fund = st.session_state.get("_nifty50_fund_cache") or {"status": "UNAVAILABLE", "reason": "Not fetched yet — click refresh."}
+            _refresh_nifty_fund = st.button("🔄 Refresh NIFTY 50 Fundamentals (background)", key="refresh_nifty50_fund")
+            # v68: NEVER blocks the page.  Newest real snapshot (memory/disk) is shown at once with its age; a refresh runs in a background thread.
+            _fv, _fage, _floading = multi_stock_engine.get_nifty50_fundamentals_cached(force_refresh=bool(_refresh_nifty_fund))
+            if _fv is not None:
+                st.session_state["_nifty50_fund_cache"] = _fv
+            _n50_fund = st.session_state.get("_nifty50_fund_cache") or {"status": "UNAVAILABLE", "reason": (
+                "⏳ 50 stocks ke fundamentals background me aa rahe hain (pehli baar ~1 min) — agle auto-refresh par yahin dikh jayenge." if _floading
+                else "Abhi data nahi mila — thodi der me khud dobara try hoga, ya upar Refresh dabao.")}
+            if _fv is not None and _fage is not None:
+                st.caption(f"🕒 Snapshot age: {_fage/60:.0f} min" + (" · naya background me load ho raha hai" if _floading else ""))
             if _n50_fund.get("status") != "AVAILABLE":
                 st.warning(_n50_fund.get("reason") or "NIFTY 50 fundamentals unavailable right now.")
             else:

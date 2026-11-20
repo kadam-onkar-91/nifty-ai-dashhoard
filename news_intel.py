@@ -2,7 +2,8 @@
 
 Design rules (kept on purpose):
   * Verdicts are computed locally from data the page already has -> adds ~0 ms, never a network call, never slows load/refresh.
-  * The upcoming-events table needs Google Search through Gemini, so it only runs when the person taps the button (cached 30 min).
+  * v66: the events table is built in BACKGROUND threads only (RSS headlines -> NVIDIA model; Gemini+Google only as fallback).  The page just reads a dict.
+    Rows that are already over (and whose market reaction is finished) are dropped on every render, so only UPCOMING / still-reacting events are shown.
   * Everything is labelled as rule-based / AI-estimated.  It is a planning aid, not a prediction and not an order trigger.
 """
 import json
@@ -204,10 +205,12 @@ def fixed_calendar(now_ist=None):
     d = now_ist.date()
     days = (1 - d.weekday()) % 7                      # Tuesday = Nifty weekly expiry (as shown on the Upstox header)
     exp = d + timedelta(days=days)
-    out = [{"event": "Nifty weekly expiry", "date_ist": exp.isoformat(), "time_ist": "15:30", "type": "expiry", "expected_effect": "VOLATILE", "india_text": f"{_label(exp, d)} 14:00 se 15:30 tak (market chalu, aakhri ghante me tez jhatke)",
+    out = [{"event": "Nifty weekly expiry", "date_ist": exp.isoformat(), "time_ist": "15:30", "type": "expiry", "expected_effect": "VOLATILE", "impact": 4 if exp == d else 3, "india_text": f"{_label(exp, d)} 14:00 se 15:30 tak (market chalu, aakhri ghante me tez jhatke)",
             "why": "Expiry din option gamma badhta hai; 14:00-15:30 me tez, jhatke wali moves aati hain.", "reaction_window": "14:00-15:30 IST"},
            {"event": "US market open (India me tab band hota hai)", "date_ist": d.isoformat(), "time_ist": _us_open_ist(now_ist),
-            "type": "global", "expected_effect": "VOLATILE", "why": "US ka mood raat ko GIFT Nifty me dikhta hai.", "reaction_window": ""}]
+            "type": "global", "expected_effect": "VOLATILE", "impact": 3, "why": "US ka mood raat ko GIFT Nifty me dikhta hai.", "reaction_window": ""}]
+    if d.weekday() >= 5:                                                   # US is closed at the weekend -> do not list its 'open'
+        out = out[:1]
     return out
 
 
@@ -249,7 +252,7 @@ def fetch_events(keys, subject, headlines=None, now_ist=None):
     except Exception as exc:
         return [], f"modules load nahi hue: {exc}"[:160]
     try:
-        if time.time() < atd._SEARCH_COOL["until"]:
+        if time.time() < getattr(atd, "_SEARCH_COOL", {"until": 0})["until"]:
             return [], "Gemini search abhi quota cooldown me hai (trade review ko quota bachane ke liye) -- thodi der baad try karo."
     except Exception:
         pass
@@ -262,7 +265,10 @@ def fetch_events(keys, subject, headlines=None, now_ist=None):
               '[{"event":"..","status":"happened|upcoming","date_ist":"YYYY-MM-DD","time_ist":"HH:MM ya unknown","type":"RBI|Policy|Data|Global|Sector|Stock|Results","affects":"kis par asar","duration":"asar kitni der (e.g. 30 min / pura din / 2-3 din)",'
               '"expected_effect":"UP|DOWN|VOLATILE|SIDEWAYS|UNCLEAR","why":"1 line","india_note":"India market me asar kab/kahan, 1 line"}]')
     body = {"contents": [{"parts": [{"text": prompt}]}], "tools": [{"google_search": {}}], "generationConfig": {"maxOutputTokens": 2600}}
-    models = sorted(list(atd.REVIEW_MODELS), key=lambda m: 0 if "lite" in m else 1)
+    try:                                                      # v66: ai_trade_decision.REVIEW_MODELS was removed -> this line crashed the whole events thread
+        models = sorted(list(getattr(atd, "REVIEW_MODELS", None) or ("gemini-2.5-flash-lite", "gemini-2.5-flash")), key=lambda m: 0 if "lite" in m else 1)
+    except Exception:
+        models = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
 
     def _one(key, model):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -299,49 +305,66 @@ def start_events(key, keys, subject, headlines=None):
     threading.Thread(target=_work, daemon=True).start()
 
 
-# ---------------------------------------------------------------------------------------------------------------------- v65: PER-STOCK events
-# Each stock gets ITS OWN research: several targeted Google-News RSS searches (company results / orders / regulator / promoter / sector policy),
-# then NVIDIA NIM (NOT Gemini -- Gemini is already used heavily by the trade review) turns those REAL headlines into a dated happened/upcoming
-# table with "when will it hit the price".  Every row must cite one of the supplied headlines; rows that cannot are flagged "AI andaza".
-# If NVIDIA gives no answer, the old Gemini+Google-Search path is the fallback (with a stock-specific prompt).
+# ---------------------------------------------------------------------------------------------------------------------- v66: BEST-ONLY events
+# Every page (Nifty 50 and every single stock) gets ITS OWN list.  Pipeline (all in a BACKGROUND thread -- the page only reads a dict, so load/refresh speed is unchanged):
+#   1. real dated Google-News RSS headlines (parallel, 6 s timeout, ~1-3 s total)      2. NVIDIA NIM model (NOT Gemini) turns them into upcoming / still-reacting events + impact 1-5
+#   3. only if NVIDIA fails: Gemini+Google fallback, then a pure rule-based headline reader (so the table is never empty because an API is down)
+# The LLM is called only when the headline set CHANGED (fingerprint) -> fresh news is noticed within ~10 min, quota is not burnt.
+# On every render rows that are already over (and whose market reaction is finished) are dropped -> "ho chuka" never clutters the table.
+
+RECHECK_S = 600            # headlines re-read every 10 min (cheap RSS); the LLM only runs again if they changed
+RETRY_FAIL_S = 180         # after a failure retry sooner
+LLM_MAX_AGE_S = 3 * 3600   # even with identical headlines, re-ask the model every 3 h (dates move closer)
+_MON = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
 
 _STOCK_STOP = re.compile(r"\b(ltd|limited|co|corp|corporation|company|ven|ventures?|industries|inds?)\b\.?", re.I)
 
 
 def stock_queries(symbol, company="", sector=""):
-    """-> [(label, google-news query)] -- all about THIS stock (+ its sector)."""
+    """-> [(label, google-news query)] -- all about THIS stock (+ its sector).  Forward-looking query first: it is what finds 'results on 21 Nov', 'record date', 'AGM'."""
     sym = re.sub(r"[^A-Za-z0-9&\-]", "", str(symbol or ""))
     comp = re.sub(r"\s+", " ", str(company or "").strip())
     short = re.sub(r"\s+", " ", _STOCK_STOP.sub(" ", comp)).strip() or sym
     who = f'"{comp}"' if comp else sym
     sec = re.sub(r"\s+", " ", str(sector or "").strip())
-    q = [("Company", f'{who} OR "{short}" share when:7d'),
-         ("Results/Board", f'"{short}" results OR earnings OR "board meeting" OR dividend OR "record date" when:14d'),
-         ("Orders/Deals", f'"{short}" order OR contract OR acquisition OR "block deal" OR stake when:14d'),
-         ("Regulator/Court", f'"{short}" SEBI OR NSE OR court OR NCLT OR promoter OR pledge OR rating when:14d')]
+    q = [("Company", f'{who} OR "{short}" share when:3d'),
+         ("Aane wala", f'"{short}" "board meeting" OR "to announce" OR "results on" OR "record date" OR "ex-dividend" OR AGM OR "to consider" when:21d'),
+         ("Results/Board", f'"{short}" results OR earnings OR dividend OR guidance when:10d'),
+         ("Orders/Deals", f'"{short}" order OR contract OR acquisition OR "block deal" OR stake OR fundraise OR QIP when:10d'),
+         ("Regulator/Court", f'"{short}" SEBI OR NSE OR court OR NCLT OR promoter OR pledge OR rating OR upgrade OR downgrade when:10d')]
     if sec and sec.lower() not in ("unknown", "n/a", "none", "nan"):
-        q.append(("Sector", f"{sec} sector India stocks policy OR demand OR prices when:7d"))
+        q.append(("Sector", f"{sec} sector India stocks policy OR demand OR prices when:5d"))
     return q
 
 
-def gather_stock_headlines(symbol, company="", sector="", per_query=6, max_age_days=14):
-    """Real, dated headlines for ONE stock (parallel, short timeouts, never raises).  -> [{'n','label','title','src','age_h','date'}]"""
+def nifty_queries():
+    """Index-level queries: policy, global cues, flows, data, heavyweights, expiry -- nothing about one single stock."""
+    return [("RBI/Policy", "RBI OR MPC OR \"repo rate\" OR SEBI India markets when:7d"),
+            ("US Fed/Data", "Fed OR FOMC OR Powell OR \"US CPI\" OR \"US jobs\" OR \"Wall Street\" when:4d"),
+            ("FII/DII", "FII OR DII flows Nifty Sensex when:3d"),
+            ("Crude/Dollar", "crude oil OR \"dollar index\" OR rupee OR \"bond yield\" India market when:3d"),
+            ("India data", "India CPI OR WPI OR GDP OR IIP OR GST OR budget OR \"trade deficit\" when:14d"),
+            ("Heavyweights", "Reliance OR \"HDFC Bank\" OR Infosys OR TCS OR ICICI OR Bharti OR ITC results OR earnings OR \"board meeting\" when:10d"),
+            ("Expiry/NSE", "Nifty expiry OR \"F&O\" OR \"index rebalancing\" OR \"NSE holiday\" OR \"market holiday\" when:14d"),
+            ("Geopolitics", "war OR tariff OR sanctions OR geopolitical markets Asia India when:3d")]
+
+
+def _gather(queries, per_query=6, max_age_days=14, cap=26):
     out, seen = [], set()
     try:
         import news_rss
     except Exception:
         return out
     from concurrent.futures import ThreadPoolExecutor
-    qs = stock_queries(symbol, company, sector)
 
     def _one(lq):
         try:
-            return lq[0], news_rss.parse_items(news_rss._fetch(lq[1], timeout=7), max_age_h=max_age_days * 24, limit=per_query)
+            return lq[0], news_rss.parse_items(news_rss._fetch(lq[1], timeout=6), max_age_h=max_age_days * 24, limit=per_query)
         except Exception:
             return lq[0], []
     try:
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            res = list(ex.map(_one, qs))
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(queries)))) as ex:
+            res = list(ex.map(_one, queries))
     except Exception:
         return out
     now = datetime.now(IST)
@@ -354,26 +377,56 @@ def gather_stock_headlines(symbol, company="", sector="", per_query=6, max_age_d
             when = now - timedelta(minutes=age_min)
             out.append({"label": label, "title": title, "src": src or "news", "age_h": round(age_min / 60.0, 1), "date": when.strftime("%Y-%m-%d %H:%M")})
     out.sort(key=lambda r: r["age_h"])
-    out = out[:24]
+    out = out[:cap]
     for i, r in enumerate(out, 1):
         r["n"] = i
     return out
 
 
+def gather_stock_headlines(symbol, company="", sector="", per_query=6, max_age_days=21):
+    """Real, dated headlines for ONE stock (parallel, short timeouts, never raises).  -> [{'n','label','title','src','age_h','date'}]"""
+    return _gather(stock_queries(symbol, company, sector), per_query=per_query, max_age_days=max_age_days, cap=26)
+
+
+def gather_nifty_headlines(per_query=5, max_age_days=14):
+    return _gather(nifty_queries(), per_query=per_query, max_age_days=max_age_days, cap=30)
+
+
+def _fingerprint(heads):
+    import hashlib
+    t = "|".join(sorted(re.sub(r"\W+", "", h["title"].lower())[:50] for h in (heads or [])[:20]))
+    return hashlib.md5(t.encode("utf-8", "ignore")).hexdigest()
+
+
+_RULES = ("Rules: SIRF headlines me jo likha hai wahi (ya uska seedha asar). Har row me 'evidence' = headline ka number. Date/time headline me na ho to 'unknown' likho -- date invent mat karo. "
+          "SIRF kaam ki cheezein do: (a) AANE WALI event (results / board meeting / dividend record date / ex-date / AGM / order / policy / data release / court-regulator decision) jiska price par asar padega, "
+          "(b) pichhle 24 ghante ki badi news JISKA ASAR MARKET ME ABHI TAK POORA NAHI AAYA (jaise market band hone ke baad aayi). Jo news/event ho chuka aur uska asar nikal chuka -- MAT do. "
+          "Sirf best/high-impact rows do (max 8); kam important ya generic cheez mat do; khaali list bhi theek hai. 'impact' 1-5 (5 = bahut bada move, 3 = dhyan dene layak, 1-2 = mat do).\n")
+_FMT = ('Sirf JSON array do, koi aur text nahi. Format:\n'
+        '[{"event":"..","status":"upcoming|happened","date_ist":"YYYY-MM-DD ya unknown","time_ist":"HH:MM ya unknown","type":"Results|Order|Deal|Regulatory|Corporate|Sector|Rating|Policy|Data|Global|News",'
+        '"affects":"kis par asar","expected_effect":"UP|DOWN|VOLATILE|SIDEWAYS|UNCLEAR","impact":1-5,"impact_start":"asar kab se shuru (e.g. results ke baad agle din 09:15 open par, turant, 1-2 din me)",'
+        '"duration":"asar kitni der/din","why":"1 line, kyun asar padega","evidence":<headline number ya null>}]')
+
+
+def _head_lines(heads):
+    return "\n".join(f"[{h['n']}] ({h['date']} IST, {h['label']}, {h['src']}) {h['title']}" for h in heads) or "(koi headline nahi mili)"
+
+
 def _stock_prompt(symbol, company, sector, heads, extra_titles, now_ist):
-    lines = "\n".join(f"[{h['n']}] ({h['date']} IST, {h['label']}, {h['src']}) {h['title']}" for h in heads) or "(koi headline nahi mili)"
     old = "\n".join(f"- {t}" for t in (extra_titles or [])[:8])
-    return (f"Aaj {now_ist.strftime('%Y-%m-%d %H:%M')} IST hai. Tum Indian equity research analyst ho. Stock: {symbol} ({company or symbol}), sector: {sector or 'unknown'}.\n"
-            "Neeche is stock ki REAL headlines hain (number, time, source ke saath). Inhi ko padhkar batao:\n"
-            "(1) pichhle ~72 ghante me is stock ke liye kaun si badi news/event HO CHUKI, aur\n"
-            "(2) agle ~14 din me kaun sa event AANE WALA hai (results/board meeting/dividend record date/order/AGM/regulatory/court/sector policy), jiska SEEDHA ya sector ke raste is stock par asar pade.\n"
-            "Rules: SIRF headlines me jo likha hai wahi (ya sector ka seedha asar). Har row me 'evidence' = headline ka number. Date/time headline me na ho to 'unknown' likho -- date invent mat karo. "
-            "Agar headlines me koi badi cheez nahi hai to kam rows do (khaali list bhi theek hai); Nifty ke generic events (expiry, US open) MAT do.\n\n"
-            f"HEADLINES:\n{lines}\n\nDashboard ki purani headlines (context):\n{old}\n\n"
-            "Sirf JSON array do (max 12), koi aur text nahi. Format:\n"
-            '[{"event":"..","status":"happened|upcoming","date_ist":"YYYY-MM-DD ya unknown","time_ist":"HH:MM ya unknown","type":"Results|Order|Deal|Regulatory|Corporate|Sector|Rating|News",'
-            '"affects":"is stock / sector / peers","expected_effect":"UP|DOWN|VOLATILE|SIDEWAYS|UNCLEAR","impact_start":"asar kab se shuru (e.g. results ke baad agle din open, turant, 1-2 din me)",'
-            '"duration":"asar kitni der/din","why":"1 line, is stock ke liye kyun","evidence":<headline number ya null>}]')
+    return (f"Aaj {now_ist.strftime('%Y-%m-%d %A %H:%M')} IST hai (Indian market 09:15-15:30 IST). Tum Indian equity research analyst ho. Stock: {symbol} ({company or symbol}), sector: {sector or 'unknown'}.\n"
+            "Neeche is stock ki REAL headlines hain (number, time, source ke saath). Inhe padhkar sirf wahi events batao jo IS STOCK ke price ko aage hilayengi, aur batao asar KAB padega.\n"
+            + _RULES + "Nifty ke generic events (expiry, US open) MAT do.\n\n"
+            f"HEADLINES:\n{_head_lines(heads)}\n\nDashboard ki purani headlines (context):\n{old}\n\n" + _FMT)
+
+
+def _nifty_prompt(heads, extra_titles, now_ist):
+    old = "\n".join(f"- {t}" for t in (extra_titles or [])[:8])
+    return (f"Aaj {now_ist.strftime('%Y-%m-%d %A %H:%M')} IST hai (Indian market 09:15-15:30 IST). Tum Indian index (NIFTY 50) ke analyst ho.\n"
+            "Neeche index-level REAL headlines hain. Sirf wahi events batao jo poore NIFTY 50 / Bank Nifty / bade sectors ko hilayengi: RBI/policy, Fed/US data, India data (CPI/GDP/IIP), FII/DII, crude/dollar, geopolitics, "
+            "heavyweights (Reliance, HDFC Bank, Infosys, TCS, ICICI...) ke results/board meeting. Kisi ek chhote stock ki news MAT do.\n"
+            + _RULES + "Har row ke 'affects' me batao: Nifty / Bank Nifty / IT / PSU banks / Reliance jaisa kaun sa hissa.\n\n"
+            f"HEADLINES:\n{_head_lines(heads)}\n\nDashboard ki purani headlines (context):\n{old}\n\n" + _FMT)
 
 
 def _clean_stock_events(rows, heads):
@@ -395,57 +448,153 @@ def _clean_stock_events(rows, heads):
         d = str(r.get("date_ist") or "unknown")
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
             r["date_ist"] = "unknown"
+        try:
+            r["impact"] = max(1, min(5, int(float(r.get("impact")))))
+        except Exception:
+            r["impact"] = 3
         out.append(r)
     out.sort(key=lambda x: (str(x.get("status", "")).lower().startswith("up"), str(x.get("date_ist"))))
     return out[:14]
 
 
-def fetch_stock_events(keys, subject, headlines=None, now_ist=None, stock=None, nvidia_keys=None):
-    """Blocking (run in a background thread).  -> (rows, error_text).  NVIDIA first, Gemini-with-search only as the fallback."""
+# ---- rule-based reader: the last safety net (no LLM) -- picks headlines that name a FUTURE date together with an event word
+_KW = ((r"results|earnings|q[1-4]\s?fy", "Results"), (r"board meeting|to consider|fund ?rais|qip|buyback", "Corporate"), (r"record date|ex-?dividend|ex-?date|dividend", "Corporate"),
+       (r"\bagm\b|\begm\b", "Corporate"), (r"\brbi\b|\bmpc\b|policy|repo", "Policy"), (r"\bfed\b|fomc|powell", "Global"), (r"\bcpi\b|\bwpi\b|\bgdp\b|\biip\b", "Data"))
+_DATE_RE = (re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", re.I),
+            re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b", re.I))
+
+
+def heuristic_events(heads, now_ist=None):
+    now_ist = now_ist or datetime.now(IST)
+    today = now_ist.date()
+    out, seen = [], set()
+    for h in heads or []:
+        t = h["title"]
+        kind = next((k for pat, k in _KW if re.search(pat, t, re.I)), None)
+        if not kind:
+            continue
+        d = None
+        for rx in _DATE_RE:
+            m = rx.search(t)
+            if not m:
+                continue
+            a, b = m.group(1), m.group(2)
+            day, mon = (int(a), _MON[b[:3].lower()]) if a.isdigit() else (int(b), _MON[a[:3].lower()])
+            try:
+                d = datetime(today.year, mon, day).date()
+                if d < today - timedelta(days=30):
+                    d = datetime(today.year + 1, mon, day).date()
+            except Exception:
+                d = None
+            break
+        if not d or d < today or d > today + timedelta(days=21) or t[:40] in seen:
+            continue
+        seen.add(t[:40])
+        out.append({"event": t[:140] + " (headline se, AI nahi)", "status": "upcoming", "date_ist": d.isoformat(), "time_ist": "unknown", "type": kind, "affects": "headline ke hisaab se",
+                    "expected_effect": "UNCLEAR", "impact": 3, "impact_start": "event ke din / agle open par", "duration": "", "why": "Headline me aane wali date likhi hai",
+                    "evidence_text": f"[{h['n']}] {t[:90]} ({h['src']}, {h['date'][:10]})"})
+    return out[:6]
+
+
+def _llm_rows(prompt, heads, nvidia_keys):
+    """-> (rows, err, model).  NVIDIA only."""
+    nk = [k for k in (nvidia_keys or []) if k]
+    if not nk:
+        return [], "NVIDIA_API_KEY secrets me nahi mili -- Gemini fallback chala", ""
+    try:
+        import nvidia_llm
+        msgs = [{"role": "system", "content": "You are a careful Indian equity research analyst. Reply with ONLY a JSON array. Never invent facts or dates."},
+                {"role": "user", "content": prompt}]
+        txt, model = nvidia_llm.chat_robust(nk, msgs, max_tokens=2000, temperature=0.1, deadline_s=70.0, thinking=False)
+        return _clean_stock_events(_extract_json(txt), heads), "", model
+    except Exception as exc:
+        return [], f"NVIDIA: {type(exc).__name__}: {exc}"[:200], ""
+
+
+def _finish(rows, err, heads, gem_subject, keys, headlines, now_ist):
+    """NVIDIA failed / no key -> Gemini+Google, then the rule-based headline reader (so the table is not empty just because an API is down)."""
+    gerr = ""
+    if keys:
+        g_rows, gerr = fetch_events(keys, gem_subject, [h["title"] for h in heads[:10]] or headlines, now_ist)
+        if g_rows:
+            return _clean_stock_events(g_rows, heads), ""
+    hr = heuristic_events(heads, now_ist)
+    if hr:
+        return hr, ""
+    return [], " | ".join(x for x in (err, gerr) if x)[:260]
+
+
+def fetch_stock_events(keys, subject, headlines=None, now_ist=None, stock=None, nvidia_keys=None, heads=None):
+    """Blocking (background thread).  -> (rows, error_text).  NVIDIA first; Gemini-with-search, then rule-based reader only as fallbacks."""
     now_ist = now_ist or datetime.now(IST)
     stock = stock or {}
     sym, comp, sec = stock.get("symbol") or subject, stock.get("company") or "", stock.get("sector") or ""
-    heads = gather_stock_headlines(sym, comp, sec)
-    err = ""
-    nk = [k for k in (nvidia_keys or []) if k]
-    if nk:
-        try:
-            import nvidia_llm
-            msgs = [{"role": "system", "content": "You are a careful Indian equity research analyst. Reply with ONLY a JSON array. Never invent facts or dates."},
-                    {"role": "user", "content": _stock_prompt(sym, comp, sec, heads, headlines, now_ist)}]
-            txt, model = nvidia_llm.chat_robust(nk, msgs, max_tokens=2400, temperature=0.1, deadline_s=80.0, thinking=False)
-            rows = _clean_stock_events(_extract_json(txt), heads)
-            if rows or heads:
-                for r in rows:
-                    r["_model"] = model
-                return rows, ("" if rows else "Is stock ki last 14 din ki headlines me koi badi/aane wali event nahi mili.")
-            err = "NVIDIA ne khaali jawab diya"
-        except Exception as exc:
-            err = f"NVIDIA: {type(exc).__name__}: {exc}"[:200]
-    else:
-        err = "NVIDIA_API_KEY secrets me nahi mili -- Gemini fallback chala"
-    # fallback: the old Google-grounded Gemini call, but with THIS stock as the subject (not 'Nifty')
-    rows, gerr = fetch_events(keys, f"{sym} ({comp or sym}, sector {sec or 'unknown'}) -- sirf isi stock aur uske sector ke events", [h["title"] for h in heads[:10]] or headlines, now_ist)
-    return rows, (err if rows else (err + " | " + gerr)).strip(" |")[:260]
+    heads = heads if heads is not None else gather_stock_headlines(sym, comp, sec)
+    rows, err, model = _llm_rows(_stock_prompt(sym, comp, sec, heads, headlines, now_ist), heads, nvidia_keys)
+    for r in rows:
+        r["_model"] = model
+    if rows:
+        return rows, ""
+    if not err:                                                    # the model answered with an empty list: nothing important -> say so, do not spend Gemini quota
+        return [], ""
+    out, e2 = _finish(rows, err, heads, f"{sym} ({comp or sym}, sector {sec or 'unknown'}) -- sirf isi stock aur uske sector ke events", keys, headlines, now_ist)
+    return out, e2
 
 
-def start_stock_events(key, keys, subject, headlines=None, stock=None, nvidia_keys=None):
-    """Background thread, same state machine as start_events()."""
+def fetch_nifty_events(keys, headlines=None, now_ist=None, nvidia_keys=None, heads=None):
+    now_ist = now_ist or datetime.now(IST)
+    heads = heads if heads is not None else gather_nifty_headlines()
+    rows, err, model = _llm_rows(_nifty_prompt(heads, headlines, now_ist), heads, nvidia_keys)
+    for r in rows:
+        r["_model"] = model
+    if rows:
+        return rows, ""
+    if not err:
+        return [], ""
+    return _finish(rows, err, heads, "NIFTY 50 / poora Indian market", keys, headlines, now_ist)
+
+
+# ---- state machine (never touches st.*)
+def _start(key, worker, force=False):
     with _EV_LOCK:
-        cur = _EVENTS.get(key)
-        if cur and cur["status"] == "running" and time.time() - cur["ts"] < 120:
+        cur = dict(_EVENTS.get(key) or {})
+        if cur.get("status") == "running" and time.time() - cur.get("started", 0) < 150:
             return
-        _EVENTS[key] = {"ts": time.time(), "status": "running", "rows": [], "err": ""}
+        _EVENTS[key] = {**cur, "status": "running", "started": time.time(), "ts": cur.get("ts", 0.0), "rows": cur.get("rows") or [], "err": cur.get("err", "")}
+        if len(_EVENTS) > 60:                                                   # keep memory small when many stocks were opened
+            for k in sorted(_EVENTS, key=lambda x: _EVENTS[x].get("ts", 0))[:20]:
+                if k != key and _EVENTS[k].get("status") != "running":
+                    _EVENTS.pop(k, None)
 
-    def _work():
+    def _w():
+        t0 = time.time()
         try:
-            rows, err = fetch_stock_events(keys, subject, headlines, stock=stock, nvidia_keys=nvidia_keys)
+            heads = worker["gather"]()
+            fp = _fingerprint(heads)
+            same = cur.get("fp") == fp and cur.get("rows_ok") and (time.time() - cur.get("llm_ts", 0) < LLM_MAX_AGE_S) and not force
+            if same:
+                rows, err, llm_ts, ok = cur.get("rows") or [], "", cur.get("llm_ts", 0), True
+            else:
+                rows, err = worker["fetch"](heads)
+                llm_ts, ok = time.time(), bool(rows) or not err
+                if not rows and cur.get("rows") and err:                         # keep the last good rows if this run failed
+                    rows = cur.get("rows")
         except Exception as exc:
-            rows, err = [], f"{type(exc).__name__}: {exc}"[:200]
+            rows, err, fp, llm_ts, ok = cur.get("rows") or [], f"{type(exc).__name__}: {exc}"[:200], cur.get("fp"), cur.get("llm_ts", 0), False
         with _EV_LOCK:
-            _EVENTS[key] = {"ts": time.time(), "status": "error" if (err and not rows and "nahi mili" not in err) else "done", "rows": rows, "err": err}
+            _EVENTS[key] = {"ts": time.time(), "status": "error" if (err and not rows) else "done", "rows": rows, "err": err, "fp": fp, "llm_ts": llm_ts, "rows_ok": ok, "took": round(time.time() - t0, 1)}
 
-    threading.Thread(target=_work, daemon=True).start()
+    threading.Thread(target=_w, daemon=True).start()
+
+
+def start_stock_events(key, keys, subject, headlines=None, stock=None, nvidia_keys=None, force=False):
+    stock = stock or {}
+    _start(key, {"gather": lambda: gather_stock_headlines(stock.get("symbol") or subject, stock.get("company") or "", stock.get("sector") or ""),
+                 "fetch": lambda heads: fetch_stock_events(keys, subject, headlines, stock=stock, nvidia_keys=nvidia_keys, heads=heads)}, force=force)
+
+
+def start_nifty_events(key, keys, headlines=None, nvidia_keys=None, force=False):
+    _start(key, {"gather": gather_nifty_headlines, "fetch": lambda heads: fetch_nifty_events(keys, headlines, nvidia_keys=nvidia_keys, heads=heads)}, force=force)
 
 
 _BG_NEWS = {"rows": None, "running": False, "ts": 0.0}
@@ -480,9 +629,127 @@ def events_state(key):
         return dict(_EVENTS.get(key) or {})
 
 
-# ---------------------------------------------------------------------------------------------------------------------- render
+# ---------------------------------------------------------------------------------------------------------- relevance filter (runs on every render, pure python, ~0 ms)
+def _parse_dt(date_s, time_s):
+    try:
+        d = datetime.strptime(str(date_s)[:10], "%Y-%m-%d")
+    except Exception:
+        return None, False
+    try:
+        hh, mm = [int(x) for x in str(time_s).split(":")[:2]]
+        return d.replace(hour=hh, minute=mm, tzinfo=IST), True
+    except Exception:
+        return d.replace(hour=15, minute=30, tzinfo=IST), False
+
+
+def _in_session(dt):
+    m = dt.hour * 60 + dt.minute
+    return dt.weekday() < 5 and 9 * 60 + 15 <= m <= 15 * 60 + 30
+
+
+def _next_open_after(dt):
+    d = dt.date()
+    if dt.weekday() < 5 and dt.hour * 60 + dt.minute < 9 * 60 + 15:
+        pass
+    else:
+        d = _next_trading_day(d)
+    return datetime(d.year, d.month, d.day, 9, 15, tzinfo=IST)
+
+
+def event_phase(row, now=None):
+    """-> 'upcoming' | 'live' | 'undated' | None (drop).  'live' = already happened but the market has not finished reacting (e.g. news after 15:30, reaction at next 09:15)."""
+    now = now or datetime.now(IST)
+    dt, _known_time = _parse_dt(row.get("date_ist"), row.get("time_ist"))
+    if dt is None:
+        return "undated" if str(row.get("status", "")).lower().startswith("up") else None
+    if dt >= now - timedelta(minutes=5):
+        return "upcoming" if dt <= now + timedelta(days=30) else None
+    end = (dt + timedelta(minutes=60)) if _in_session(dt) else (_next_open_after(dt) + timedelta(minutes=60))
+    return "live" if now <= end else None
+
+
+def _eta(dt, now):
+    secs = (dt - now).total_seconds()
+    if secs < 0:
+        return "abhi"
+    if secs < 3600:
+        return f"{max(1, int(secs // 60))} min baad"
+    if secs < 86400:
+        h, m = int(secs // 3600), int(secs % 3600 // 60)
+        return f"{h} ghante {m} min baad"
+    return f"{int(secs // 86400)} din baad"
+
+
+def best_rows(rows, now=None, limit=8):
+    """Only what still matters: upcoming + still-reacting, impact >= 3, live first, then by time.  -> [(phase, row)]"""
+    now = now or datetime.now(IST)
+    out = []
+    for r in rows or []:
+        ph = event_phase(r, now)
+        if not ph:
+            continue
+        try:
+            imp = int(float(r.get("impact", 3)))
+        except Exception:
+            imp = 3
+        if imp < 3 or (ph == "undated" and imp < 4):
+            continue
+        dt, _ = _parse_dt(r.get("date_ist"), r.get("time_ist"))
+        out.append((0 if ph == "live" else 1 if ph == "upcoming" else 2, -imp, dt or (now + timedelta(days=99)), ph, r))
+    out.sort(key=lambda x: (x[0], x[2], x[1]))                  # live first, then soonest first (impact is shown in its own column)
+    return [(x[3], x[4]) for x in out[:limit]]
+
+
+
+# ------------------------------------------------------------------------------------------------------------ v68: headline -> market impact (always shown)
+# Pure rules, no network, no API: the table below the news box is NEVER empty just because an LLM key / quota is missing.
+# (category regex, label, impact 3-5, "kab asar", "kitni der")
+_IMPACT_RULES = (
+    (r"\b(rbi|repo rate|monetary policy|mpc|budget)\b", "RBI / Budget", 5, "Announcement ke turant baad 5-15 min me spike; phir 1-2 ghante me direction settle", "1-2 ghante (policy din poora din volatile)"),
+    (r"\b(fed|fomc|powell|us cpi|nonfarm|jobs report|treasury yield|us inflation)\b", "US Fed / US data", 5, "Raat ko aata hai -> asar GIFT Nifty se agle din ke 09:15 gap me", "agle din ka pehla 1 ghanta"),
+    (r"\b(crude|brent|opec|oil price)\b", "Crude oil", 4, "Market chalu me turant (OMC, paint, aviation, tyre sector pe zyada)", "kuch ghante - poora din, agar crude 2%+ hila"),
+    (r"\b(fii|fpi|dii|foreign investor|institutional)\b", "FII / DII flow", 4, "Aaj ka flow aaj ki direction banata hai; data shaam ko aata hai -> asar agle din", "1-3 din ka trend"),
+    (r"\b(war|missile|attack|ceasefire|sanction|tariff|geopolit|border|iran|israel|russia|china)\b", "Geopolitics / Tariff", 4, "Global market ke saath turant; Asia open par gap", "kuch ghante se kuch din (khabar badalne tak)"),
+    (r"\b(q[1-4]\s?fy|results?|earnings|profit|net loss|revenue|ebitda|guidance)\b", "Company results", 4, "Results aksar market ke baad aate hain -> agle din 09:15 gap; pehle 15-30 min whipsaw", "pehle 30 min whipsaw, phir 1-2 din trend"),
+    (r"\b(sebi|court|supreme court|nclt|tribunal|probe|raid|fraud|penalty|ban)\b", "SEBI / Court / Regulatory", 4, "Aate hi tez move; aksar 1-3 candles (5-15 min) me reaction poora", "15-60 min (bada order ho to 1-2 din)"),
+    (r"\b(order win|bags order|wins order|contract|deal|acquisition|merger|stake|buyback|dividend|bonus|split)\b", "Order / Deal / Corporate action", 3, "Khabar aate hi us stock me; sector peers me halka asar", "1 din (record date tak halka support)"),
+    (r"\b(upgrade|downgrade|target price|brokerage|rating)\b", "Brokerage rating", 3, "Agle open / khabar aate hi us stock me", "1-2 din"),
+    (r"\b(gdp|cpi|wpi|inflation|iip|pmi|trade deficit|gst collection)\b", "India macro data", 4, "Data ~17:30 IST aata hai (market band) -> asar agle din 09:15 gap me", "agle din ka pehla 1 ghanta"),
+    (r"\b(expiry|f&o|derivative|margin)\b", "Expiry / F&O rules", 3, "Expiry din 14:00-15:30 me tez jhatke", "aakhri 1.5 ghanta"),
+)
+
+
+def headline_impacts(news_items, limit=6, now=None):
+    """Top fresh headlines -> [{"Khabar", "Sentiment", "Impact", "Category", "Market me asar kab", "Kitni der", "Umar"}] (rule-based, <1 ms)."""
+    out = []
+    for n in (news_items or [])[:25]:
+        title = (n.get("title") or "").strip()
+        if not title:
+            continue
+        age = _age_hours(n.get("published"), now)
+        if age is not None and age > 72:
+            continue
+        low = title.lower()
+        cat = next(((lab, imp, kab, dur) for rx, lab, imp, kab, dur in _IMPACT_RULES if re.search(rx, low)), None)
+        sc = _headline_score(title)
+        if cat is None and sc == 0:
+            continue                                                       # neither a known market driver nor a clear positive/negative -> noise
+        lab, imp, kab, dur = cat or ("General market news", 3, "Khabar ke hisaab se din me; confirm karne ke liye price reaction dekho", "kuch ghante")
+        if sc != 0 and abs(sc) >= 2:
+            imp = min(5, imp + 1)
+        old = age is not None and age > 24
+        out.append((-(imp if not old else imp - 1), age if age is not None else 99.0, {
+            "Khabar": title[:140], "Sentiment": "🟢 Positive" if sc > 0 else "🔴 Negative" if sc < 0 else "⚪ Neutral",
+            "Impact": _IMP.get(imp, "🟡 MEDIUM") if "_IMP" in globals() else str(imp), "Category": lab,
+            "Market me asar kab": kab if not old else "Khabar purani (>24h) -- asar zyadatar price me aa chuka hoga",
+            "Kitni der": dur, "Umar": "time unknown" if age is None else (f"{age:.0f}h" if age < 48 else f"{age/24:.0f} din")}))
+    out.sort(key=lambda x: (x[0], x[1]))
+    return [x[2] for x in out[:limit]]
+
+# ---------------------------------------------------------------------------------------------------------------------------------- render
 _BADGE = {"POSITIVE": "🟢 POSITIVE", "NEGATIVE": "🔴 NEGATIVE", "NEUTRAL": "⚪ NEUTRAL", "UNCLEAR": "⚪ UNCLEAR (data kam)"}
 _EFFECT = {"UP": "🟢 UP", "DOWN": "🔴 DOWN", "VOLATILE": "🟠 VOLATILE (tez jhatke)", "SIDEWAYS": "⚪ SIDEWAYS", "UNCLEAR": "⚪ unclear"}
+_IMP = {5: "🔥 BAHUT BADA", 4: "🔥 BADA", 3: "🟡 MEDIUM"}
 
 
 def _sig(c):
@@ -500,8 +767,30 @@ def render_fundamentals(st, fundamentals, is_index=False):
         pass
 
 
+def _row_to_table(phase, r, now):
+    dt, known = _parse_dt(r.get("date_ist"), r.get("time_ist"))
+    if dt is None:
+        kab, eta = "date pata nahi", ""
+    else:
+        kab = f"{dt.strftime('%d-%b')} {dt.strftime('%H:%M') if known else '(time pata nahi)'}"
+        eta = "🔴 ABHI ASAR CHAL RAHA" if phase == "live" else _eta(dt, now)
+    if phase == "live":
+        mk = r.get("impact_start") or "Event aa chuki hai, market ka reaction abhi poora nahi hua -- live chart dekho"
+    elif dt is not None and known:
+        mk = r.get("india_text") or india_impact(r.get("date_ist"), r.get("time_ist"), now)
+    else:
+        mk = r.get("india_text") or r.get("impact_start") or r.get("india_note") or "time confirm nahi -- us din dhyan rakho"
+    try:
+        imp = int(float(r.get("impact", 3)))
+    except Exception:
+        imp = 3
+    return {"Kab (IST)": f"{kab}  ·  {eta}".strip(" ·"), "Kya": r.get("event"), "Impact": _IMP.get(imp, "🟡 MEDIUM"), "Direction": _EFFECT.get(str(r.get("expected_effect")).upper(), r.get("expected_effect")),
+            "Kis par asar": r.get("affects") or "Nifty / market", "Market me asar kab / kahan": mk, "Kitni der": r.get("duration") or r.get("reaction_window") or "", "Kyun": r.get("why") or "",
+            "Sabut (headline)": r.get("evidence_text") or ("rule-based calendar" if r.get("type") == "expiry" else "")}
+
+
 def render_news(st, subject, news_items, key="x", stock=None):
-    """Verdict + upcoming events INSIDE the existing News expander (no new boxes)."""
+    """Verdict + BEST upcoming events INSIDE the existing News expander (no new boxes).  Everything slow runs in a background thread."""
     try:
         nv = news_verdict(news_items)
         sc = [r[0] for r in nv["rows"]]
@@ -510,44 +799,43 @@ def render_news(st, subject, news_items, key="x", stock=None):
                    " | ".join(f"{r[0].split()[0]} {r[2][:38]}…" for r in nv["rows"][:4]))
         heads = [r[2] for r in nv["rows"]]
         _ks = st.session_state.get("_news_intel_keys") or []
-        _es = events_state(key)
         _nk = st.session_state.get("_nvidia_keys") or []
-        _stale = (not _es) or (_es.get("status") in ("done", "error") and time.time() - _es.get("ts", 0) > EVENTS_TTL_S)
-        if stock:
-            if _stale:
-                start_stock_events(key, _ks, subject, heads, stock=stock, nvidia_keys=_nk)       # this stock's OWN research, automatic, once per 2 h, in the background
-            if st.button(f"🔄 {stock.get('symbol') or subject} ke events dobara nikalo (NVIDIA research)", key=f"ni_btn_{key}"):
-                start_stock_events(key, _ks, subject, heads, stock=stock, nvidia_keys=_nk)
-        else:
-            if key == "nifty50" and _ks and _stale:
-                start_events(key, _ks, subject, heads)      # one automatic BACKGROUND lookup per 2 h (page never waits)
-            if st.button("🗓️ Aaj/kal kya hua + agle events (Google se)", key=f"ni_btn_{key}"):
-                start_events(key, st.session_state.get("_news_intel_keys") or [], subject, heads)
+        _es = events_state(key)
+        _age = time.time() - _es.get("ts", 0) if _es else 1e9
+        _failed = bool(_es) and _es.get("status") == "error"
+        _stale = (not _es) or (_es.get("status") in ("done", "error") and _age > (RETRY_FAIL_S if _failed else RECHECK_S))
+        _label = (stock.get("symbol") or subject) if stock else "NIFTY 50"
+        _go = lambda force: (start_stock_events(key, _ks, subject, heads, stock=stock, nvidia_keys=_nk, force=force) if stock
+                             else start_nifty_events(key, _ks, heads, nvidia_keys=_nk, force=force))
+        if _stale:
+            _go(False)                                                       # automatic, background, LLM only if the headlines changed
+        if st.button(f"🔄 {_label} ke best events abhi dobara nikalo", key=f"ni_btn_{key}"):
+            _go(True)
         stt = events_state(key)
-        rows = []
-        if stt.get("status") == "running":
-            st.info("⏳ Google se news/events aa rahe hain (15-40 sec). Page ko mat chhedo -- neeche apne aap dikh jayenge.")
-        elif stt and time.time() - stt.get("ts", 0) < EVENTS_TTL_S:
-            if stt.get("err"):
-                st.warning(stt["err"])
-            rows = list(stt.get("rows") or [])
-        today = datetime.now(IST).date()
-        table = []
-        for r in (rows if stock else fixed_calendar() + rows):
-            up = str(r.get("status", "upcoming")).lower().startswith("up")
-            table.append({"Status": "🕒 Aane wala" if up else "✅ Ho chuka", "Type": r.get("type") or "", "Kab (IST)": f"{r.get('date_ist')} {r.get('time_ist')}",
-                          "Kya": r.get("event"), "Kis par asar": r.get("affects") or "Nifty / market",
-                          "Direction": _EFFECT.get(str(r.get("expected_effect")).upper(), r.get("expected_effect")),
-                          "India market me kab / kahan": (r.get("india_text") or (india_impact(r.get("date_ist"), r.get("time_ist")) if (up and str(r.get("date_ist")) != "unknown") else (r.get("impact_start") or r.get("india_note") or ("date pata nahi" if up else "ho chuka")))),
-                          "Kitni der asar": r.get("duration") or r.get("reaction_window") or "", "Kyun": r.get("why") or "", **({"Asar kab se": r.get("impact_start") or "", "Sabut (headline)": r.get("evidence_text") or ""} if stock else {}), "_k": str(r.get("date_ist")) + str(r.get("time_ist"))})
-        table.sort(key=lambda x: x["_k"])
-        for x in table:
-            x.pop("_k")
-        if stock and not table and stt.get("status") != "running":
-            st.caption("Is stock ke liye abhi koi badi/aane wali event nahi mili (ya research abhi chal raha hai).")
-        elif table:
+        now = datetime.now(IST)
+        shown = best_rows(stt.get("rows") or [], now, limit=8 if stock else 10)
+        pre = [("upcoming", r) for r in fixed_calendar(now)] if not stock else []
+        pre = [(ph, r) for ph, r in pre if event_phase(r, now) == "upcoming" and int(r.get("impact", 3)) >= 3]
+        table = [_row_to_table(ph, r, now) for ph, r in (pre + shown)]
+        table.sort(key=lambda x: (0 if "ABHI" in x["Kab (IST)"] else 1))
+        try:                                                                # v68: always-on, rule-based "badi khabar -> market asar" table
+            _hi = headline_impacts(news_items, limit=6 if stock else 8)
+            if _hi:
+                st.markdown("**📰 Badi khabar → market par asar (headline se, turant)**")
+                st.dataframe(_hi, hide_index=True, width="stretch")
+        except Exception:
+            pass
+        if stt.get("status") == "running" and not table:
+            st.info("⏳ Fresh news padhi ja rahi hai (5-30 sec). Page ko mat chhedo -- neeche apne aap dikh jayega.")
+        if table:
             st.dataframe(table, hide_index=True, width="stretch")
-        st.caption("Events AI/Google-estimate hain, date-time khud verify karo; asar ek aam pattern hai, guarantee nahi. "
+            if stt.get("status") == "running":
+                st.caption("🔄 Naya check background me chal raha hai.")
+        elif stt.get("status") != "running":
+            st.caption("Abhi koi bada aane wala event nahi mila -- jo ho chuka aur jiska asar nikal chuka wo jaan-boojh kar nahi dikhaya." + (f"  ({stt['err']})" if stt.get("err") else ""))
+        if stt.get("err") and table:
+            st.caption(f"⚠️ {stt['err']}")
+        st.caption("Sirf aane wale ya abhi asar chalu events. Date/time headline se hain, AI/rule-based andaza hai -- khud verify karo, guarantee nahi. "
                    "Indian market: 09:15 open - 15:30 close (IST). Exchange holiday offline pata nahi chalta.")
     except Exception:
         pass
