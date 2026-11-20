@@ -96,7 +96,7 @@ def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
         if ttl and st["has"] and now - st["ts"] < ttl:
             return st["value"]
         fut = st["fut"]
-        if fut is None or (fut.done() and fut is not st.get("pre_fut")):     # v68: a job started early by start() is used as it is (never run twice)
+        if fut is None or fut.done():
             t0 = time.time()
 
             def _job():
@@ -131,49 +131,7 @@ def guarded(key, fn, *args, timeout=15.0, ttl=0.0, default=None, **kwargs):
         pass                                                   # the done-callback already recorded it
     with _LOCK:
         st = _STATE[key]
-        if st.get("pre_fut") is fut:
-            st["pre_fut"] = None                                   # the prefetched job has been used once
         return st["value"] if st["has"] else default
-
-
-def start(key, fn, *args, **kwargs):
-    """v68 PREFETCH: begin a data call NOW in the background and return at once.  A later guarded(<same key>, <same fn>, ...) joins that
-    running job instead of starting a second one, so independent slow sources (breadth, global news, ...) download AT THE SAME TIME
-    instead of one after the other.  Same function, same arguments, same result -- only the waiting is shared."""
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        ctx = get_script_run_ctx()
-    except Exception:
-        ctx = None
-    with _LOCK:
-        st = _STATE.setdefault(key, {"has": False, "value": None, "ts": 0.0, "fut": None, "last_ms": 0.0, "last_status": "new"})
-        fut = st["fut"]
-        if fut is not None and not fut.done():
-            return                                                  # already running
-        t0 = time.time()
-
-        def _job():
-            _attach_streamlit_ctx(ctx)
-            return fn(*args, **kwargs)
-
-        fut = _POOL.submit(_job)
-        st["fut"] = fut
-        st["pre_fut"] = fut
-
-        def _done(f, _t0=t0, _key=key):
-            ms = (time.time() - _t0) * 1000.0
-            with _LOCK:
-                s_ = _STATE[_key]
-                s_["last_ms"] = ms
-                try:
-                    s_["value"] = f.result()
-                    s_["has"] = True
-                    s_["ts"] = time.time()
-                    s_["last_status"] = "ok"
-                except Exception as exc:
-                    s_["last_status"] = f"error: {type(exc).__name__}"
-                    logger.warning("safe_io %s failed: %s", _key, exc)
-        fut.add_done_callback(_done)
 
 
 def status(key):
@@ -702,56 +660,21 @@ def _get_upstox_access_token_impl(sb):
     sb.button("🔄 Login ho gaya? Status check karo", key="upstox_check_btn")
     return None
 
+
 class _NullSidebar:
-    """Used only when Streamlit refuses a sidebar write from inside a fragment rerun: every widget call is a harmless no-op
-    (buttons read as 'not clicked'), so the token logic itself still runs to the end."""
+    """Swallows every sidebar call (used when Streamlit refuses a sidebar write from inside a fragment)."""
     def __getattr__(self, _name):
-        def _noop(*a, **k):
-            return False
-        return _noop
-
-
-def set_sidebar_slot(slot):
-    """app.py calls this on every FULL run with a `st.empty()` it has written to inside the sidebar, so Streamlit has a stable place for the
-    panel when the fragment re-runs it every 30 s.  Kept per browser session (st.session_state), never shared between users."""
-    try:
-        st.session_state["_upstox_sb_slot"] = slot
-        st.session_state.pop("_upstox_sb_box", None)
-    except Exception:
-        pass
-
-
-def sidebar_target():
-    """Where the Upstox panel is drawn: a fresh container inside the claimed slot (it REPLACES the old panel, no duplicates) or the plain
-    sidebar.  The container is remembered so app.py can add its warning to the same panel in the same run."""
-    try:
-        slot = st.session_state.get("_upstox_sb_slot")
-        if slot is not None:
-            box = slot.container()
-            st.session_state["_upstox_sb_box"] = box
-            return box
-    except Exception:
-        pass
-    return st.sidebar
-
-
-def sidebar_box():
-    """The panel container of the current run (same one the login panel was drawn into), else the sidebar."""
-    try:
-        return st.session_state.get("_upstox_sb_box") or st.sidebar
-    except Exception:
-        return st.sidebar
+        return lambda *a, **k: None
 
 
 def get_upstox_access_token():
-    """Token logic always completes.  If Streamlit raises StreamlitInvalidLayoutContextError while the panel is drawn, the same logic is
-    run again with a no-op sidebar (the panel is simply skipped for that one run)."""
+    """v68: the sidebar widgets are optional, the login / token logic is not.  Inside a fragment Streamlit may refuse the first sidebar
+    write (StreamlitInvalidLayoutContextError, seen in the logs) -> run the SAME logic once more with a no-op sidebar instead of dying."""
     try:
-        return _get_upstox_access_token_impl(sidebar_target())
-    except BaseException as _e:
+        return _get_upstox_access_token_impl(st.sidebar)
+    except Exception as _e:
         if type(_e).__name__ != "StreamlitInvalidLayoutContextError":
             raise
-        logger.warning("Upstox panel skipped for one run (fragment layout context)")
         return _get_upstox_access_token_impl(_NullSidebar())
 # @@END upstox_auth
 # @@MODULE tick_guard
@@ -853,11 +776,6 @@ MAX_HOLD_MINUTES = 120
 
 def init_db():
     conn = sqlite3.connect(DB_NAME, timeout=30)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-    except Exception:
-        pass
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS trades
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,

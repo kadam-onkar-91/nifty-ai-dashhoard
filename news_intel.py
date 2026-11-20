@@ -700,6 +700,52 @@ def best_rows(rows, now=None, limit=8):
     return [(x[3], x[4]) for x in out[:limit]]
 
 
+
+# ------------------------------------------------------------------------------------------------------------ v68: headline -> market impact (always shown)
+# Pure rules, no network, no API: the table below the news box is NEVER empty just because an LLM key / quota is missing.
+# (category regex, label, impact 3-5, "kab asar", "kitni der")
+_IMPACT_RULES = (
+    (r"\b(rbi|repo rate|monetary policy|mpc|budget)\b", "RBI / Budget", 5, "Announcement ke turant baad 5-15 min me spike; phir 1-2 ghante me direction settle", "1-2 ghante (policy din poora din volatile)"),
+    (r"\b(fed|fomc|powell|us cpi|nonfarm|jobs report|treasury yield|us inflation)\b", "US Fed / US data", 5, "Raat ko aata hai -> asar GIFT Nifty se agle din ke 09:15 gap me", "agle din ka pehla 1 ghanta"),
+    (r"\b(crude|brent|opec|oil price)\b", "Crude oil", 4, "Market chalu me turant (OMC, paint, aviation, tyre sector pe zyada)", "kuch ghante - poora din, agar crude 2%+ hila"),
+    (r"\b(fii|fpi|dii|foreign investor|institutional)\b", "FII / DII flow", 4, "Aaj ka flow aaj ki direction banata hai; data shaam ko aata hai -> asar agle din", "1-3 din ka trend"),
+    (r"\b(war|missile|attack|ceasefire|sanction|tariff|geopolit|border|iran|israel|russia|china)\b", "Geopolitics / Tariff", 4, "Global market ke saath turant; Asia open par gap", "kuch ghante se kuch din (khabar badalne tak)"),
+    (r"\b(q[1-4]\s?fy|results?|earnings|profit|net loss|revenue|ebitda|guidance)\b", "Company results", 4, "Results aksar market ke baad aate hain -> agle din 09:15 gap; pehle 15-30 min whipsaw", "pehle 30 min whipsaw, phir 1-2 din trend"),
+    (r"\b(sebi|court|supreme court|nclt|tribunal|probe|raid|fraud|penalty|ban)\b", "SEBI / Court / Regulatory", 4, "Aate hi tez move; aksar 1-3 candles (5-15 min) me reaction poora", "15-60 min (bada order ho to 1-2 din)"),
+    (r"\b(order win|bags order|wins order|contract|deal|acquisition|merger|stake|buyback|dividend|bonus|split)\b", "Order / Deal / Corporate action", 3, "Khabar aate hi us stock me; sector peers me halka asar", "1 din (record date tak halka support)"),
+    (r"\b(upgrade|downgrade|target price|brokerage|rating)\b", "Brokerage rating", 3, "Agle open / khabar aate hi us stock me", "1-2 din"),
+    (r"\b(gdp|cpi|wpi|inflation|iip|pmi|trade deficit|gst collection)\b", "India macro data", 4, "Data ~17:30 IST aata hai (market band) -> asar agle din 09:15 gap me", "agle din ka pehla 1 ghanta"),
+    (r"\b(expiry|f&o|derivative|margin)\b", "Expiry / F&O rules", 3, "Expiry din 14:00-15:30 me tez jhatke", "aakhri 1.5 ghanta"),
+)
+
+
+def headline_impacts(news_items, limit=6, now=None):
+    """Top fresh headlines -> [{"Khabar", "Sentiment", "Impact", "Category", "Market me asar kab", "Kitni der", "Umar"}] (rule-based, <1 ms)."""
+    out = []
+    for n in (news_items or [])[:25]:
+        title = (n.get("title") or "").strip()
+        if not title:
+            continue
+        age = _age_hours(n.get("published"), now)
+        if age is not None and age > 72:
+            continue
+        low = title.lower()
+        cat = next(((lab, imp, kab, dur) for rx, lab, imp, kab, dur in _IMPACT_RULES if re.search(rx, low)), None)
+        sc = _headline_score(title)
+        if cat is None and sc == 0:
+            continue                                                       # neither a known market driver nor a clear positive/negative -> noise
+        lab, imp, kab, dur = cat or ("General market news", 3, "Khabar ke hisaab se din me; confirm karne ke liye price reaction dekho", "kuch ghante")
+        if sc != 0 and abs(sc) >= 2:
+            imp = min(5, imp + 1)
+        old = age is not None and age > 24
+        out.append((-(imp if not old else imp - 1), age if age is not None else 99.0, {
+            "Khabar": title[:140], "Sentiment": "🟢 Positive" if sc > 0 else "🔴 Negative" if sc < 0 else "⚪ Neutral",
+            "Impact": _IMP.get(imp, "🟡 MEDIUM") if "_IMP" in globals() else str(imp), "Category": lab,
+            "Market me asar kab": kab if not old else "Khabar purani (>24h) -- asar zyadatar price me aa chuka hoga",
+            "Kitni der": dur, "Umar": "time unknown" if age is None else (f"{age:.0f}h" if age < 48 else f"{age/24:.0f} din")}))
+    out.sort(key=lambda x: (x[0], x[1]))
+    return [x[2] for x in out[:limit]]
+
 # ---------------------------------------------------------------------------------------------------------------------------------- render
 _BADGE = {"POSITIVE": "🟢 POSITIVE", "NEGATIVE": "🔴 NEGATIVE", "NEUTRAL": "⚪ NEUTRAL", "UNCLEAR": "⚪ UNCLEAR (data kam)"}
 _EFFECT = {"UP": "🟢 UP", "DOWN": "🔴 DOWN", "VOLATILE": "🟠 VOLATILE (tez jhatke)", "SIDEWAYS": "⚪ SIDEWAYS", "UNCLEAR": "⚪ unclear"}
@@ -772,6 +818,13 @@ def render_news(st, subject, news_items, key="x", stock=None):
         pre = [(ph, r) for ph, r in pre if event_phase(r, now) == "upcoming" and int(r.get("impact", 3)) >= 3]
         table = [_row_to_table(ph, r, now) for ph, r in (pre + shown)]
         table.sort(key=lambda x: (0 if "ABHI" in x["Kab (IST)"] else 1))
+        try:                                                                # v68: always-on, rule-based "badi khabar -> market asar" table
+            _hi = headline_impacts(news_items, limit=6 if stock else 8)
+            if _hi:
+                st.markdown("**📰 Badi khabar → market par asar (headline se, turant)**")
+                st.dataframe(_hi, hide_index=True, width="stretch")
+        except Exception:
+            pass
         if stt.get("status") == "running" and not table:
             st.info("⏳ Fresh news padhi ja rahi hai (5-30 sec). Page ko mat chhedo -- neeche apne aap dikh jayega.")
         if table:

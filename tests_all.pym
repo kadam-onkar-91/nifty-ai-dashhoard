@@ -35,7 +35,9 @@ KEYS = tl.ALL_FACTOR_KEYS
 # v62: the production stop is now wide (see ai_trade_decision.SL_ATR_MULT).  The tuned scenarios below were written for the old 20-28 pt geometry and
 # test OTHER logic (lanes, EV bar, walls), so they run with that geometry pinned; V62WideStopAndLaneGuardTests checks the real defaults.
 _SL_DEFAULTS = (atd.MIN_SL_PTS, atd.MAX_SL_PTS, atd.SL_ATR_MULT)
+_TP_DEFAULT = atd.MAX_TARGET_PTS                           # v68 production target cap, captured before the older scenarios override it
 atd.MIN_SL_PTS, atd.MAX_SL_PTS, atd.SL_ATR_MULT = 20.0, 28.0, 0.9
+atd.MAX_TARGET_PTS = 1e9                                   # older tuned scenarios predate the 40 pt target cap (TestV68TargetCap checks the production value)
 
 
 def _flags(n_true, **extra):
@@ -556,7 +558,7 @@ class OiWallTargetTests(DbCase):
         # BUY: nearest significant call wall is 24050 -> target just in front of it (46) but never beyond what price can reach:
         # 20 pt stop x MAX_TARGET_R 2.2 = 44 pts
         wall_target = 24050 - max(atd.OI_FRONT_RUN_MIN_PTS, 0.25 * 14.0)
-        self.assertAlmostEqual(out["target"], min(wall_target, 24000 + atd.MAX_TARGET_R * 20.0), places=1)
+        self.assertAlmostEqual(out["target"], min(wall_target, 24000 + min(atd.MAX_TARGET_R * 20.0, atd.MAX_TARGET_PTS)), places=1)
         self.assertLessEqual(out["target"], wall_target)
         self.assertIn("OI wall", out["target_note"])
         self.assertGreaterEqual(out["risk_reward"], 1.2)
@@ -1064,10 +1066,10 @@ if __name__ == "__main__":
     unittest.main()
 class V62WideStopAndLaneGuardTests(unittest.TestCase):
     def test_production_stop_defaults_are_wide(self):
-        self.assertEqual(_SL_DEFAULTS, (24.0, 28.0, 1.5))       # v66: stop capped at 28 pts (was 30-45)
+        self.assertEqual(_SL_DEFAULTS, (24.0, 26.0, 1.5))       # v68: stop capped at 26 pts (< 28 asked; 1.5R -> target <= 39 < 40)
         atr = 22.0
         sl = min(_SL_DEFAULTS[1], max(_SL_DEFAULTS[0], round(_SL_DEFAULTS[2] * atr, 1)))
-        self.assertEqual(sl, 28.0)          # v66: 1.5 x 22 = 33 is clamped to the 28 pt cap (v62 had 33; the original formula gave 20)
+        self.assertEqual(sl, 26.0)          # v68: 1.5 x 22 = 33 is clamped to the 26 pt cap
 
     def test_lane_guard_pauses_a_losing_relief_lane_but_never_the_base_lane(self):
         d = tempfile.mkdtemp(); old = tl.DB_NAME
@@ -3767,6 +3769,69 @@ class TestV66SidebarFragment(unittest.TestCase):
             self.assertEqual(calls, ["_Boom", "_NullSidebar"])
         finally:
             upstox_auth._get_upstox_access_token_impl = orig
+
+class TestV68TargetCap(unittest.TestCase):
+    def test_nifty_stop_below_28_and_target_never_above_40(self):
+        import tests_edge_v36 as _t36
+        lo, hi, _m = _t36._SL_DEFAULTS
+        self.assertLess(hi, 28.0)
+        self.assertLessEqual(_t36._TP_DEFAULT, 40.0)
+        self.assertLessEqual(1.5 * hi, _t36._TP_DEFAULT)          # the 1.5R floor still fits under the 40 pt cap
+
+class TestV68FundamentalsHub(unittest.TestCase):
+    _HTML = """<h1 class="margin-0">Demo Industries Ltd</h1>
+    <ul id="top-ratios"><li class="flex flex-space-between" data-source="default"><span class="name">Market Cap</span><span class="nowrap value">&#8377; <span class="number">17,19,360</span> Cr.</span></li>
+    <li class="flex flex-space-between"><span class="name">Current Price</span><span class="nowrap value">&#8377; <span class="number">1,270</span></span></li>
+    <li class="flex flex-space-between"><span class="name">Stock P/E</span><span class="nowrap value"><span class="number">27.9</span></span></li>
+    <li class="flex flex-space-between"><span class="name">Book Value</span><span class="nowrap value">&#8377; <span class="number">635</span></span></li>
+    <li class="flex flex-space-between"><span class="name">Dividend Yield</span><span class="nowrap value"><span class="number">0.40</span> %</span></li>
+    <li class="flex flex-space-between"><span class="name">ROE</span><span class="nowrap value"><span class="number">9.5</span> %</span></li></ul>
+    <table class="ranges-table"><tr><th colspan="2">Compounded Sales Growth</th></tr><tr><td>10 Years:</td><td>8%</td></tr><tr><td>TTM:</td><td>10%</td></tr></table>
+    <table class="ranges-table"><tr><th colspan="2">Compounded Profit Growth</th></tr><tr><td>3 Years:</td><td>12%</td></tr><tr><td>TTM:</td><td>-4%</td></tr></table>"""
+
+    def test_screener_page_is_parsed_into_yahoo_keys(self):
+        import fundamentals_hub as fh
+        d = fh.parse_screener(self._HTML)
+        self.assertAlmostEqual(d["marketCap"], 17_19_360 * 1e7, delta=1e6)
+        self.assertAlmostEqual(d["trailingPE"], 27.9)
+        self.assertAlmostEqual(d["priceToBook"], 2.0, places=1)
+        self.assertAlmostEqual(d["returnOnEquity"], 0.095)
+        self.assertAlmostEqual(d["dividendYield"], 0.004)
+        self.assertAlmostEqual(d["revenueGrowth"], 0.10)
+        self.assertAlmostEqual(d["earningsGrowth"], -0.04)
+        self.assertEqual(d["longName"], "Demo Industries Ltd")
+
+    def test_unreadable_page_gives_none_not_invented_numbers(self):
+        import fundamentals_hub as fh
+        d = fh.parse_screener("<html>blocked</html>")
+        self.assertTrue(all(d.get(k) is None for k in fh._NUMERIC))
+
+    def test_yahoo_breaker_opens_after_two_failures_and_stops_calls(self):
+        import fundamentals_hub as fh
+        fh._Y.update(fails=0, open_until=0.0, opens=0)
+        fh._yahoo_failed(); self.assertTrue(fh.yahoo_open())
+        fh._yahoo_failed(); self.assertFalse(fh.yahoo_open())
+        self.assertIsNone(fh._from_yahoo("TCS"))                  # no network attempt while the breaker is open
+        fh._yahoo_ok(); self.assertTrue(fh.yahoo_open())
+
+    def test_cache_is_served_without_network_and_old_copy_is_labelled(self):
+        import time
+        import fundamentals_hub as fh
+        fh._MEM["ZZTEST"] = {"ts": time.time() - 3600, "data": {"trailingPE": 20.0, "_source": "screener.in"}}
+        d = fh.get_info("ZZTEST", network=False)
+        self.assertEqual(d["trailingPE"], 20.0); self.assertGreater(d["_age_s"], 3000)
+        fh._MEM["ZZTEST"]["ts"] = time.time() - 3 * 86400
+        self.assertEqual(fh.get_info("ZZTEST", network=False)["trailingPE"], 20.0)      # stale-but-real beats nothing
+        fh._MEM.pop("ZZTEST", None)
+
+class TestV68HeadlineImpact(unittest.TestCase):
+    def test_headline_table_is_built_without_any_api(self):
+        import news_intel as ni
+        rows = ni.headline_impacts([{"title": "RBI keeps repo rate unchanged; Sensex jumps", "published": ""},
+                                    {"title": "Crude oil falls 3% as OPEC signals output hike", "published": ""}], limit=5)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["Category"] in ("RBI / Budget", "Crude oil"), True)
+        self.assertTrue(all(r["Market me asar kab"] and r["Kitni der"] for r in rows))
 
 class TestV66StopCap(unittest.TestCase):
     def test_production_stop_is_never_wider_than_28_points(self):

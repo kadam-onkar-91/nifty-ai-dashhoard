@@ -16,6 +16,7 @@ Design goals:
 from app_logging import get_logger
 logger = get_logger(__name__)
 import urllib.parse
+import re
 import requests
 import feedparser
 import pandas as pd
@@ -299,7 +300,8 @@ def _nifty50_fundamentals(limit=50, force=False):
     constituents, constituent_source = _get_nifty50_constituents()
 
     def _one(sym):
-        info=yf.Ticker(sym+'.NS').info or {}
+        import fundamentals_hub                      # v68: cache + Yahoo circuit breaker + screener.in fallback (Yahoo .info = 401 on Streamlit Cloud)
+        info=fundamentals_hub.get_info(sym) or {}
         row={'symbol':sym}
         for f in fields: row[f]=info.get(f)
         return row
@@ -310,7 +312,7 @@ def _nifty50_fundamentals(limit=50, force=False):
     try:
         for sym in syms:
             futs[sym]=ex.submit(_one,sym)
-        _fwait(list(futs.values()),timeout=45)   # hard cap: never hang the page
+        _fwait(list(futs.values()),timeout=25)   # hard cap: never hang the page (called from a background thread; cached copy shown meanwhile)
     finally:
         ex.shutdown(wait=False,cancel_futures=True)
     rows=[]
@@ -322,7 +324,7 @@ def _nifty50_fundamentals(limit=50, force=False):
             rows.append({'symbol':sym})
     if not rows:
         return {'status':'UNAVAILABLE','source':'Yahoo Finance','coverage':0,'constituents':0}
-    out={'status':'AVAILABLE','source':'Yahoo Finance constituent snapshots','method':'Equal-constituent aggregate; not official index-weighted fundamentals','constituents':len(constituents),'constituent_source':constituent_source,'coverage':sum(1 for r in rows if any(r.get(f) is not None for f in fields))}
+    out={'status':'AVAILABLE','source':'Yahoo Finance / screener.in constituent snapshots (cached)','method':'Equal-constituent aggregate; not official index-weighted fundamentals','constituents':len(constituents),'constituent_source':constituent_source,'coverage':sum(1 for r in rows if any(r.get(f) is not None for f in fields))}
     for f in fields:
         vals=[float(r[f]) for r in rows if isinstance(r.get(f),(int,float)) and np.isfinite(r[f])]
         out[f+'_mean']=float(np.mean(vals)) if vals else None
@@ -336,16 +338,43 @@ def _nifty50_fundamentals(limit=50, force=False):
 
 
 def _nifty_news(limit=8):
-    q='NIFTY 50 NSE India stock market index news'
+    """v68: 3 market queries read AT THE SAME TIME (last 1-2 days), de-duplicated, NEWEST first.  RSS is cached 5 min, a stale copy is
+    served if Google is slow, so the box is never blank because of one slow request."""
+    from email.utils import parsedate_to_datetime as _pdt
+    queries=['NIFTY 50 Sensex stock market today when:1d','India stock market RBI OR Fed OR crude OR FII when:2d','NSE Nifty Bank Nifty outlook when:2d']
+
+    def _q(q):
+        try:
+            url=f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}&hl=en-IN&gl=IN&ceid=IN:en"
+            return list(_cached_rss(url).entries[:12])
+        except Exception:
+            return []
+    ex=_TPE(max_workers=3); futs=[ex.submit(_q,q) for q in queries]
     try:
-        url=f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}&hl=en-IN&gl=IN&ceid=IN:en"
-        feed=_cached_rss(url)
-        rows=[]
-        for e in feed.entries[:limit]:
-            rows.append({'title':e.get('title',''),'published':e.get('published',''),'source':e.get('source',{}).get('title','') if isinstance(e.get('source'),dict) else '','link':e.get('link','')})
-        return rows, ('AVAILABLE' if rows else 'UNAVAILABLE')
-    except Exception:
-        return [], 'UNAVAILABLE'
+        _fwait(futs,timeout=8)
+    finally:
+        ex.shutdown(wait=False,cancel_futures=True)
+    seen,rows=set(),[]
+    for f_ in futs:
+        try:
+            ents=f_.result() if f_.done() else []
+        except Exception:
+            ents=[]
+        for e in ents:
+            title=(e.get('title','') or '').strip()
+            key=re.sub(r'\W+','',title.lower())[:60]
+            if not title or key in seen:
+                continue
+            seen.add(key)
+            pub=e.get('published','')
+            try:
+                ts=_pdt(pub).timestamp()
+            except Exception:
+                ts=0.0
+            rows.append((ts,{'title':title,'published':pub,'source':e.get('source',{}).get('title','') if isinstance(e.get('source'),dict) else '','link':e.get('link','')}))
+    rows.sort(key=lambda x:-x[0])
+    rows=[r for _,r in rows[:limit]]
+    return rows, ('AVAILABLE' if rows else 'UNAVAILABLE')
 
 
 # Public wrappers -- used directly by the main NIFTY 50 dashboard in app.py
@@ -674,10 +703,11 @@ def _fundamentals(symbol, access_token=None, isin=None):
             "competitors": up.get("competitors"),
         }
     try:
-        info = yf.Ticker(symbol + ".NS").info or {}
+        import fundamentals_hub
+        info = fundamentals_hub.get_info(symbol) or {}
         keys = ['longName','sector','industry','marketCap','trailingPE','forwardPE','priceToBook','returnOnEquity','profitMargins','revenueGrowth','earningsGrowth','debtToEquity','dividendYield','beta','52WeekChange']
         out = {k: info.get(k) for k in keys}
-        out.update({'symbol': symbol, 'source': 'Yahoo Finance fallback', 'status': 'AVAILABLE' if any(v is not None for v in out.values()) else 'UNAVAILABLE'})
+        out.update({'symbol': symbol, 'source': (info.get('_source') or 'Yahoo Finance') + ' fallback', 'status': 'AVAILABLE' if any(v is not None for v in out.values()) else 'UNAVAILABLE'})
         return out
     except Exception as e:
         return {'symbol': symbol, 'source': 'Yahoo Finance fallback', 'status': 'UNAVAILABLE', 'reason': type(e).__name__}
@@ -811,7 +841,7 @@ def analyze_stock(symbol, access_token=None):
     if fund.get("source") == "Upstox Company Fundamentals":
         company = symbol
     news,status=_news(symbol,company)
-    sector=fund.get('sector') or fund.get('industry') or 'Unknown'; nifty=_index_context(); sec=_sector_context(sector); nifty_fund=_nifty50_fundamentals(); nifty_news,nifty_news_status=_nifty_news()
+    sector=fund.get('sector') or fund.get('industry') or 'Unknown'; nifty=_index_context(); sec=_sector_context(sector); nifty_fund=(get_nifty50_fundamentals_cached()[0] or {'status':'UNAVAILABLE','source':'cache','reason':'NIFTY 50 aggregate is loading in the background','coverage':0}); nifty_news,nifty_news_status=_nifty_news()
     quote=_upstox_quote_depth(inst, access_token)
     technical=_technical_context(df, live, atr)
     option_chain=_upstox_stock_option_chain(inst, access_token, live)
