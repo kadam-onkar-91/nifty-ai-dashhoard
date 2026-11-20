@@ -25,7 +25,7 @@ import pandas as pd
 STRATEGY_VERSION = "v3_35_live_direction_consensus"
 # Walk-forward stats use the same risk convention as the live engine so the
 # displayed strategy statistics are not based on a different hidden R:R model.
-WF_SL_POINTS = 26.0      # v68: matches the live Nifty stop (24-28 pts); stocks override it per price in stock_family.scale
+WF_SL_POINTS = 20.0
 WF_RR = 1.5
 DEFAULT_HORIZON = 12
 MIN_WF_SAMPLES = 20

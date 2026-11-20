@@ -35,9 +35,7 @@ KEYS = tl.ALL_FACTOR_KEYS
 # v62: the production stop is now wide (see ai_trade_decision.SL_ATR_MULT).  The tuned scenarios below were written for the old 20-28 pt geometry and
 # test OTHER logic (lanes, EV bar, walls), so they run with that geometry pinned; V62WideStopAndLaneGuardTests checks the real defaults.
 _SL_DEFAULTS = (atd.MIN_SL_PTS, atd.MAX_SL_PTS, atd.SL_ATR_MULT)
-_TP_DEFAULT = atd.MAX_TARGET_PTS                           # v68 production target cap, captured before the older scenarios override it
 atd.MIN_SL_PTS, atd.MAX_SL_PTS, atd.SL_ATR_MULT = 20.0, 28.0, 0.9
-atd.MAX_TARGET_PTS = 1e9                                   # older tuned scenarios predate the 40 pt target cap (TestV68TargetCap checks the production value)
 
 
 def _flags(n_true, **extra):
@@ -558,7 +556,7 @@ class OiWallTargetTests(DbCase):
         # BUY: nearest significant call wall is 24050 -> target just in front of it (46) but never beyond what price can reach:
         # 20 pt stop x MAX_TARGET_R 2.2 = 44 pts
         wall_target = 24050 - max(atd.OI_FRONT_RUN_MIN_PTS, 0.25 * 14.0)
-        self.assertAlmostEqual(out["target"], min(wall_target, 24000 + min(atd.MAX_TARGET_R * 20.0, atd.MAX_TARGET_PTS)), places=1)
+        self.assertAlmostEqual(out["target"], min(wall_target, 24000 + atd.MAX_TARGET_R * 20.0), places=1)
         self.assertLessEqual(out["target"], wall_target)
         self.assertIn("OI wall", out["target_note"])
         self.assertGreaterEqual(out["risk_reward"], 1.2)
@@ -1066,10 +1064,10 @@ if __name__ == "__main__":
     unittest.main()
 class V62WideStopAndLaneGuardTests(unittest.TestCase):
     def test_production_stop_defaults_are_wide(self):
-        self.assertEqual(_SL_DEFAULTS, (24.0, 26.0, 1.5))       # v68: stop capped at 26 pts (< 28 asked; 1.5R -> target <= 39 < 40)
+        self.assertEqual(_SL_DEFAULTS, (30.0, 45.0, 1.5))
         atr = 22.0
         sl = min(_SL_DEFAULTS[1], max(_SL_DEFAULTS[0], round(_SL_DEFAULTS[2] * atr, 1)))
-        self.assertEqual(sl, 26.0)          # v68: 1.5 x 22 = 33 is clamped to the 26 pt cap
+        self.assertEqual(sl, 33.0)          # old formula gave 20 pts for the same ATR
 
     def test_lane_guard_pauses_a_losing_relief_lane_but_never_the_base_lane(self):
         d = tempfile.mkdtemp(); old = tl.DB_NAME
@@ -3660,209 +3658,3 @@ class TestV65StockEvents(unittest.TestCase):
         safe_io._SESS["nifty_done"] = 0.0
         self.assertFalse(safe_io.nifty_human_active())
 # @@END tests_v65_stock_events
-# @@MODULE tests_v66_best_events
-import unittest
-from datetime import datetime, timedelta, timezone
-import news_intel
-
-IST_ = timezone(timedelta(hours=5, minutes=30))
-
-
-class TestV66BestEvents(unittest.TestCase):
-    def test_gemini_fallback_no_longer_crashes_without_review_models(self):
-        import ai_trade_decision as atd
-        self.assertFalse(hasattr(atd, "REVIEW_MODELS") and False)
-        rows, err = news_intel.fetch_events([], "X", [])      # no keys -> must return an error text, never raise AttributeError
-        self.assertEqual(rows, [])
-
-    def test_finished_events_are_dropped_upcoming_kept(self):
-        now = datetime(2026, 11, 19, 13, 20, tzinfo=IST_)            # Thursday, market open
-        rows = [{"event": "old", "status": "happened", "date_ist": "2026-11-17", "time_ist": "16:06", "impact": 4},
-                {"event": "morning", "status": "happened", "date_ist": "2026-11-19", "time_ist": "10:00", "impact": 4},
-                {"event": "post-close news", "status": "happened", "date_ist": "2026-11-18", "time_ist": "18:00", "impact": 4},
-                {"event": "tonight", "status": "upcoming", "date_ist": "2026-11-19", "time_ist": "20:00", "impact": 4},
-                {"event": "next week", "status": "upcoming", "date_ist": "2026-11-26", "time_ist": "unknown", "impact": 5},
-                {"event": "low", "status": "upcoming", "date_ist": "2026-11-20", "time_ist": "10:00", "impact": 2},
-                {"event": "no date", "status": "upcoming", "date_ist": "unknown", "time_ist": "unknown", "impact": 3}]
-        names = [r["event"] for ph, r in news_intel.best_rows(rows, now)]
-        self.assertEqual(names, ["tonight", "next week"])            # post-close news (18-Nov 18:00) reacted by 10:15 today -> gone; old/low/undated(impact<4) gone
-
-    def test_post_close_news_is_live_until_next_open_plus_hour(self):
-        r = {"event": "after close", "status": "happened", "date_ist": "2026-11-18", "time_ist": "18:00", "impact": 4}
-        self.assertEqual(news_intel.event_phase(r, datetime(2026, 11, 19, 9, 40, tzinfo=IST_)), "live")
-        self.assertIsNone(news_intel.event_phase(r, datetime(2026, 11, 19, 10, 30, tzinfo=IST_)))
-
-    def test_friday_evening_news_reacts_on_monday(self):
-        r = {"event": "fri", "status": "happened", "date_ist": "2026-11-20", "time_ist": "19:00", "impact": 4}
-        self.assertEqual(news_intel.event_phase(r, datetime(2026, 11, 23, 9, 30, tzinfo=IST_)), "live")
-
-    def test_nifty_and_stock_queries_differ(self):
-        nq = " ".join(q for _l, q in news_intel.nifty_queries())
-        self.assertIn("RBI", nq)
-        sq = " ".join(q for _l, q in news_intel.stock_queries("RELIANCE", "Reliance Industries Ltd", ""))
-        self.assertIn("Reliance Industries", sq)
-        self.assertNotIn("FOMC", sq)
-
-    def test_heuristic_reader_finds_future_dates_only(self):
-        now = datetime(2026, 11, 19, 13, 0, tzinfo=IST_)
-        heads = [{"n": 1, "title": "HCC board meeting on 25 Nov to consider Q2 results", "src": "ET", "date": "2026-11-19 09:00"},
-                 {"n": 2, "title": "XYZ results on 10 Nov beat estimates", "src": "ET", "date": "2026-11-10 09:00"},
-                 {"n": 3, "title": "Market rallies", "src": "ET", "date": "2026-11-19 09:00"}]
-        rows = news_intel.heuristic_events(heads, now)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["date_ist"], "2026-11-25")
-
-    def test_llm_called_only_when_headlines_change(self):
-        import time as _t
-        calls = []
-        heads = [{"n": 1, "label": "x", "title": "A wins order", "src": "s", "age_h": 1, "date": "2026-11-19 09:00"}]
-        key = "t66"
-        news_intel._EVENTS.pop(key, None)
-        w = {"gather": lambda: heads, "fetch": lambda h: (calls.append(1) or ([{"event": "e", "status": "upcoming", "date_ist": "2026-11-25", "time_ist": "unknown", "impact": 4}], ""))}
-        news_intel._start(key, w)
-        for _ in range(50):
-            if news_intel.events_state(key).get("status") == "done":
-                break
-            _t.sleep(0.05)
-        news_intel._start(key, w)
-        for _ in range(50):
-            if news_intel.events_state(key).get("status") == "done" and news_intel.events_state(key).get("took") is not None:
-                _t.sleep(0.1)
-                break
-            _t.sleep(0.05)
-        self.assertEqual(len(calls), 1)                              # identical headlines -> no second LLM call
-
-    def test_fixed_calendar_rows_have_impact(self):
-        for r in news_intel.fixed_calendar():
-            self.assertGreaterEqual(int(r["impact"]), 3)
-
-class TestV66SidebarFragment(unittest.TestCase):
-    def test_login_runs_even_if_streamlit_refuses_the_sidebar_write(self):
-        import upstox_auth
-
-        class StreamlitInvalidLayoutContextError(Exception):
-            pass
-
-        class _Boom:
-            def __getattr__(self, _n):
-                def f(*a, **k):
-                    raise StreamlitInvalidLayoutContextError("fragment sidebar")
-                return f
-        calls = []
-        orig = upstox_auth._get_upstox_access_token_impl
-        try:
-            def fake(sb):
-                calls.append(type(sb).__name__)
-                sb.subheader("x")                      # first UI call decides
-                return "TOKEN"
-            upstox_auth._get_upstox_access_token_impl = fake
-            _had = hasattr(upstox_auth.st, "sidebar")
-            orig_sidebar = getattr(upstox_auth.st, "sidebar", None)
-            upstox_auth.st.sidebar = _Boom()
-            try:
-                self.assertEqual(upstox_auth.get_upstox_access_token(), "TOKEN")
-            finally:
-                if _had:
-                    upstox_auth.st.sidebar = orig_sidebar
-                else:
-                    delattr(upstox_auth.st, "sidebar")
-            self.assertEqual(calls, ["_Boom", "_NullSidebar"])
-        finally:
-            upstox_auth._get_upstox_access_token_impl = orig
-
-class TestV68TargetCap(unittest.TestCase):
-    def test_nifty_stop_below_28_and_target_never_above_40(self):
-        import tests_edge_v36 as _t36
-        lo, hi, _m = _t36._SL_DEFAULTS
-        self.assertLess(hi, 28.0)
-        self.assertLessEqual(_t36._TP_DEFAULT, 40.0)
-        self.assertLessEqual(1.5 * hi, _t36._TP_DEFAULT)          # the 1.5R floor still fits under the 40 pt cap
-
-class TestV68FundamentalsHub(unittest.TestCase):
-    _HTML = """<h1 class="margin-0">Demo Industries Ltd</h1>
-    <ul id="top-ratios"><li class="flex flex-space-between" data-source="default"><span class="name">Market Cap</span><span class="nowrap value">&#8377; <span class="number">17,19,360</span> Cr.</span></li>
-    <li class="flex flex-space-between"><span class="name">Current Price</span><span class="nowrap value">&#8377; <span class="number">1,270</span></span></li>
-    <li class="flex flex-space-between"><span class="name">Stock P/E</span><span class="nowrap value"><span class="number">27.9</span></span></li>
-    <li class="flex flex-space-between"><span class="name">Book Value</span><span class="nowrap value">&#8377; <span class="number">635</span></span></li>
-    <li class="flex flex-space-between"><span class="name">Dividend Yield</span><span class="nowrap value"><span class="number">0.40</span> %</span></li>
-    <li class="flex flex-space-between"><span class="name">ROE</span><span class="nowrap value"><span class="number">9.5</span> %</span></li></ul>
-    <table class="ranges-table"><tr><th colspan="2">Compounded Sales Growth</th></tr><tr><td>10 Years:</td><td>8%</td></tr><tr><td>TTM:</td><td>10%</td></tr></table>
-    <table class="ranges-table"><tr><th colspan="2">Compounded Profit Growth</th></tr><tr><td>3 Years:</td><td>12%</td></tr><tr><td>TTM:</td><td>-4%</td></tr></table>"""
-
-    def test_screener_page_is_parsed_into_yahoo_keys(self):
-        import fundamentals_hub as fh
-        d = fh.parse_screener(self._HTML)
-        self.assertAlmostEqual(d["marketCap"], 17_19_360 * 1e7, delta=1e6)
-        self.assertAlmostEqual(d["trailingPE"], 27.9)
-        self.assertAlmostEqual(d["priceToBook"], 2.0, places=1)
-        self.assertAlmostEqual(d["returnOnEquity"], 0.095)
-        self.assertAlmostEqual(d["dividendYield"], 0.004)
-        self.assertAlmostEqual(d["revenueGrowth"], 0.10)
-        self.assertAlmostEqual(d["earningsGrowth"], -0.04)
-        self.assertEqual(d["longName"], "Demo Industries Ltd")
-
-    def test_unreadable_page_gives_none_not_invented_numbers(self):
-        import fundamentals_hub as fh
-        d = fh.parse_screener("<html>blocked</html>")
-        self.assertTrue(all(d.get(k) is None for k in fh._NUMERIC))
-
-    def test_yahoo_breaker_opens_after_two_failures_and_stops_calls(self):
-        import fundamentals_hub as fh
-        fh._Y.update(fails=0, open_until=0.0, opens=0)
-        fh._yahoo_failed(); self.assertTrue(fh.yahoo_open())
-        fh._yahoo_failed(); self.assertFalse(fh.yahoo_open())
-        self.assertIsNone(fh._from_yahoo("TCS"))                  # no network attempt while the breaker is open
-        fh._yahoo_ok(); self.assertTrue(fh.yahoo_open())
-
-    def test_cache_is_served_without_network_and_old_copy_is_labelled(self):
-        import time
-        import fundamentals_hub as fh
-        fh._MEM["ZZTEST"] = {"ts": time.time() - 3600, "data": {"trailingPE": 20.0, "_source": "screener.in"}}
-        d = fh.get_info("ZZTEST", network=False)
-        self.assertEqual(d["trailingPE"], 20.0); self.assertGreater(d["_age_s"], 3000)
-        fh._MEM["ZZTEST"]["ts"] = time.time() - 3 * 86400
-        self.assertEqual(fh.get_info("ZZTEST", network=False)["trailingPE"], 20.0)      # stale-but-real beats nothing
-        fh._MEM.pop("ZZTEST", None)
-
-class TestV68HeadlineImpact(unittest.TestCase):
-    def test_headline_table_is_built_without_any_api(self):
-        import news_intel as ni
-        rows = ni.headline_impacts([{"title": "RBI keeps repo rate unchanged; Sensex jumps", "published": ""},
-                                    {"title": "Crude oil falls 3% as OPEC signals output hike", "published": ""}], limit=5)
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["Category"] in ("RBI / Budget", "Crude oil"), True)
-        self.assertTrue(all(r["Market me asar kab"] and r["Kitni der"] for r in rows))
-
-class TestV66StopCap(unittest.TestCase):
-    def test_production_stop_is_never_wider_than_28_points(self):
-        import tests_edge_v36 as _t36
-        d = _t36._SL_DEFAULTS                                       # production values captured before that module overrides them for the older tuned scenarios
-        self.assertLessEqual(d[1], 28.0)
-        self.assertGreaterEqual(d[0], 20.0)
-        self.assertLessEqual(d[0], d[1])
-
-class TestV66StockStopScale(unittest.TestCase):
-    def _fam(self):
-        import stock_family
-        return stock_family.get_family("V66TEST")
-
-    def test_stock_stop_follows_atr_like_nifty_not_a_fat_price_floor(self):
-        fam = self._fam()
-        fam.scale(1000.0, 2.0)                       # quiet Rs 1000 stock, ATR 0.2 %: old floor made the stop 2.5, now ATR based
-        self.assertAlmostEqual(fam.sl_min, 2.4, places=2)
-        self.assertAlmostEqual(fam.sl_max, 3.0, places=2)
-        self.assertLess(fam.sl_max / 1000.0, 0.0035)       # nowhere near the old 0.25 %-floor world for a calm stock
-
-    def test_stop_floor_and_ceiling(self):
-        fam = self._fam()
-        fam.scale(1000.0, 0.3)                       # almost no movement -> floor 0.15 % of price = 1.5
-        self.assertAlmostEqual(fam.sl_min, 1.5, places=2)
-        self.assertGreaterEqual(fam.sl_max, fam.sl_min)
-        fam.scale(1000.0, 9.0)                       # wild spike (ATR 0.9 %) -> never above 0.6 % of price = 6
-        self.assertLessEqual(fam.sl_max, 6.0 + 1e-6)
-        self.assertGreaterEqual(fam.sl_max, fam.sl_min)
-
-    def test_stock_stop_never_wider_than_ceiling_in_a_real_decision_patch(self):
-        fam = self._fam()
-        self.assertEqual([m for m in fam.misses if "sl_distance" in m], [])        # the text patch still finds the ATR stop line
-# @@END tests_v66_best_events

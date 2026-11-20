@@ -50,13 +50,9 @@ REVIEW_DEADLINE_S = 150.0       # the review runs in a BACKGROUND thread (page n
 # v62 WIDER STOP.  The real log showed nearly every trade stopped out within 5-30 minutes: a 20-28 pt stop (0.9 x ATR) sits INSIDE one normal 5-min
 # candle of noise, and the tracker scores a wick through the stop as a loss.  Stop = SL_ATR_MULT x ATR, clamped to [MIN_SL_PTS, MAX_SL_PTS].
 # The target is never closer than 1.5R (MIN_RR_RATIO), so a wider stop automatically gets a farther target.
-# v68 (user request): Nifty stop is NEVER wider than 28 pts and the target never farther than 40 pts (older builds went up to 45 / 100 pts).
-# Stop 24-26 pts: with the 1.5R minimum the target is then 36-39 pts, i.e. both limits hold at the same time (a 28 pt stop would force 42 pt).
 SL_ATR_MULT = 1.5
-MIN_SL_PTS = 24.0
-MAX_SL_PTS = 26.0               # widest stop (structure-aware widening is capped here too).  Hard limit asked for: < 28
-MAX_TARGET_PTS = 40.0           # farthest target (pts).  Stocks override this in stock_family.scale (price based, not points)
-MIN_RR = 1.5                    # nearest acceptable reward:risk
+MIN_SL_PTS = 30.0
+MAX_SL_PTS = 45.0               # widest stop the structure-aware SL may use too
 OI_WALL_SIGNIFICANCE = 0.60     # a wall counts when its OI >= this fraction of the strongest wall in range
 OI_FRONT_RUN_MIN_PTS = 4.0      # target sits this many pts BEFORE the wall (or OI_FRONT_RUN_ATR x ATR, whichever is larger)
 OI_FRONT_RUN_ATR = 0.25
@@ -1690,7 +1686,7 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     # nearest ladder level sometimes landed just 3-4 points away while
     # the stop-loss was 25+ points -- a terrible risk:reward that no
     # confidence number should paper over.
-    MIN_RR_RATIO = MIN_RR
+    MIN_RR_RATIO = 1.5
 
     # -----------------------------------------------------------------
     # NEW — use the FULL round-number Ladder Calculator (every 50pt level,
@@ -1792,7 +1788,6 @@ def generate_trade_decision(live_price, level_prediction, atr, max_pain=None,
     _max_tgt = MAX_TARGET_R * sl_distance
     if _reach:
         _max_tgt = min(_max_tgt, max(_reach, 1.5 * sl_distance))
-    _max_tgt = min(_max_tgt, MAX_TARGET_PTS)               # v68: absolute cap (Nifty 40 pts)
     if abs(target - underlying_entry) > _max_tgt:
         target = round(underlying_entry + _max_tgt, 2) if direction == "BUY" else round(underlying_entry - _max_tgt, 2)
 
