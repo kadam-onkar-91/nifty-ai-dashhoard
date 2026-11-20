@@ -51,8 +51,8 @@ REVIEW_DEADLINE_S = 150.0       # the review runs in a BACKGROUND thread (page n
 # candle of noise, and the tracker scores a wick through the stop as a loss.  Stop = SL_ATR_MULT x ATR, clamped to [MIN_SL_PTS, MAX_SL_PTS].
 # The target is never closer than 1.5R (MIN_RR_RATIO), so a wider stop automatically gets a farther target.
 SL_ATR_MULT = 1.5
-MIN_SL_PTS = 30.0
-MAX_SL_PTS = 45.0               # widest stop the structure-aware SL may use too
+MIN_SL_PTS = 24.0
+MAX_SL_PTS = 28.0               # v68: HARD cap 28 pts (structure-aware widening is capped by this too)
 OI_WALL_SIGNIFICANCE = 0.60     # a wall counts when its OI >= this fraction of the strongest wall in range
 OI_FRONT_RUN_MIN_PTS = 4.0      # target sits this many pts BEFORE the wall (or OI_FRONT_RUN_ATR x ATR, whichever is larger)
 OI_FRONT_RUN_ATR = 0.25
