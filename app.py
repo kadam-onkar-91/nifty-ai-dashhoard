@@ -401,27 +401,12 @@ def _live_dashboard_body():
         _sp.step("Market breadth (heavyweights + Nifty 50)")
         # Each source is wrapped: a slow one is skipped after `timeout` s (last good value / "unavailable") and keeps
         # loading in the background, instead of freezing the whole page.
-        # v67 SPEED: the two breadth sources are independent network calls -> fetched at the same time (same functions, same timeouts)
-        from concurrent.futures import ThreadPoolExecutor as _BreadthPool
-        try:
-            from streamlit.runtime.scriptrunner import get_script_run_ctx as _get_ctx_b
-            _ctx_b = _get_ctx_b()
-        except Exception:
-            _ctx_b = None
-
-        def _guarded_ctx(*_a, **_k):                       # the helper threads need the page's Streamlit context, exactly like safe_io.guarded's own jobs
-            try:
-                safe_io._attach_streamlit_ctx(_ctx_b)
-            except Exception:
-                pass
-            return safe_io.guarded(*_a, **_k)
-        with _BreadthPool(max_workers=2, thread_name_prefix="breadth") as _bx:
-            _bf_heavy = _bx.submit(_guarded_ctx, "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=20,
-                                   default=market_breadth.unavailable_heavyweights())
-            _bf_full = _bx.submit(_guarded_ctx, "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=20,
-                                  default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
-            df_heavyweights, advances, declines, breadth_ratio, breadth_status, heavyweights_debug = _bf_heavy.result()
-            df_full50, adv50, dec50, ratio50, breadth50_status, full50_debug = _bf_full.result()
+        df_heavyweights, advances, declines, breadth_ratio, breadth_status, heavyweights_debug = safe_io.guarded(
+            "breadth_heavy", market_breadth.get_nifty_internal_breadth, access_token, timeout=20,
+            default=market_breadth.unavailable_heavyweights())
+        df_full50, adv50, dec50, ratio50, breadth50_status, full50_debug = safe_io.guarded(
+            "breadth_full50", market_breadth.get_full_nifty50_breadth, access_token, timeout=20,
+            default=(None, None, None, None, "DATA UNAVAILABLE (timed out - retrying in background)", "timeout"))
         max_pain = option_chain.calculate_max_pain(df_option_chain)
         fii_footprint, current_pcr = option_chain.get_fii_dii_fo_footprint(df_option_chain)
         try:
@@ -2205,10 +2190,7 @@ def _live_dashboard_body():
         with st.expander("🌐 Global Market Sentiment & Regional Live News", expanded=False):
             st.info(f"**⚡ World's Strongest News Highlight (Live Today):**\n\n*{top_headline}*")
             try:
-                _sdf = df_global_sentiment.copy()
-                for _c in ("Positive News", "Negative News"):
-                    _sdf[_c] = pd.to_numeric(_sdf[_c], errors="coerce")   # "N/A" -> NaN so gradient styling does not crash
-                st.dataframe(_sdf.style.background_gradient(subset=["Positive News", "Negative News"], cmap="Blues").format(na_rep="N/A"), width="stretch")
+                st.dataframe(df_global_sentiment.style.background_gradient(subset=['Positive News', 'Negative News'], cmap='Blues'), width="stretch")
             except Exception:
                 logger.exception("Broad exception caught; fallback path executed")
                 st.dataframe(df_global_sentiment, width="stretch")
@@ -2245,10 +2227,6 @@ except Exception:
 _LIVE_CHART_ON = False
 if not ACTIVE_SYMBOL:
     _LIVE_CHART_ON = live_chart.render()   # own fast refresh; False -> old chart is used
-    try:
-        st.sidebar.empty()                 # v66: claim a stable sidebar slot in the full run, so the fragment may write to the sidebar (StreamlitInvalidLayoutContextError)
-    except Exception:
-        pass
     _live_dashboard()
 else:
     try:

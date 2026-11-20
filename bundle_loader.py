@@ -63,14 +63,6 @@ if not any(isinstance(f, _Finder) for f in sys.meta_path):
     sys.meta_path.insert(0, _Finder())
 
 
-def wf_child_init():
-    """Initializer of the walk-forward worker process (importing this module already installed the .pym finder there)."""
-    try:
-        os.nice(10)          # the page always wins the CPU against the background statistics
-    except Exception:
-        pass
-
-
 def module_names():
     return sorted(_INDEX)
 

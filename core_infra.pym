@@ -586,8 +586,8 @@ def _analytics_token():
     return tok or None
 
 
-def _get_upstox_access_token_impl(sb):
-    sb.subheader("🔐 Upstox Live Authentication")
+def get_upstox_access_token():
+    st.sidebar.subheader("🔐 Upstox Live Authentication")
     if "access_token" not in st.session_state:
         st.session_state.access_token = None
 
@@ -596,9 +596,9 @@ def _get_upstox_access_token_impl(sb):
     if creds is None:
         if _an_token:                      # data-only setup: the analytics token alone is enough
             st.session_state.access_token = _an_token
-            sb.success("🟢 Live Feed Active (Upstox Analytics token, 1 saal valid)")
+            st.sidebar.success("🟢 Live Feed Active (Upstox Analytics token, 1 saal valid)")
             return _an_token
-        sb.error("Secrets me UPSTOX_API_KEY / UPSTOX_API_SECRET / REDIRECT_URI me se kuch missing hai.")
+        st.sidebar.error("Secrets me UPSTOX_API_KEY / UPSTOX_API_SECRET / REDIRECT_URI me se kuch missing hai.")
         return None
     API_KEY, API_SECRET, REDIRECT_URI = creds
 
@@ -632,8 +632,8 @@ def _get_upstox_access_token_impl(sb):
             pass
 
     if st.session_state.access_token:
-        sb.success("🟢 Live Feed Active (Upstox connected)")
-        if sb.button("Disconnect", key="upstox_disconnect_btn"):
+        st.sidebar.success("🟢 Live Feed Active (Upstox connected)")
+        if st.sidebar.button("Disconnect", key="upstox_disconnect_btn"):
             _clear_token()
             st.session_state.access_token = None
             st.rerun()
@@ -642,41 +642,23 @@ def _get_upstox_access_token_impl(sb):
     if _an_token:
         # no (valid) OAuth login today -> the 1-year analytics token keeps the live feed on, automatically
         st.session_state.access_token = _an_token
-        sb.success("🟢 Live Feed Active (Upstox Analytics token - roz login ki zarurat nahi)")
-        sb.caption("Normal Upstox login bhi chalega (optional). Analytics token sirf data padhta hai, order nahi laga sakta.")
+        st.sidebar.success("🟢 Live Feed Active (Upstox Analytics token - roz login ki zarurat nahi)")
+        st.sidebar.caption("Normal Upstox login bhi chalega (optional). Analytics token sirf data padhta hai, order nahi laga sakta.")
         return _an_token
 
     err = st.session_state.get("upstox_login_error")
     if err:
-        sb.error(f"Login fail: {err}\n\nCheck karo: Upstox portal me Redirect URI bilkul wahi ho jo secrets me "
+        st.sidebar.error(f"Login fail: {err}\n\nCheck karo: Upstox portal me Redirect URI bilkul wahi ho jo secrets me "
                          f"REDIRECT_URI hai (`{REDIRECT_URI}`), aur API key/secret sahi ho.")
 
     encoded_redirect = urllib.parse.quote(REDIRECT_URI, safe="")
     login_url = (f"https://api.upstox.com/v2/login/authorization/dialog?response_type=code"
                  f"&client_id={API_KEY}&redirect_uri={encoded_redirect}")
-    sb.link_button("🚀 Login with Upstox", login_url)
-    sb.caption("Login naye tab me khulta hai. PIN daalne ke baad ye dashboard apne aap connect ho jayega "
+    st.sidebar.link_button("🚀 Login with Upstox", login_url)
+    st.sidebar.caption("Login naye tab me khulta hai. PIN daalne ke baad ye dashboard apne aap connect ho jayega "
                        "(agle refresh me, max 30 sec). Purana tab band kar sakte ho.")
-    sb.button("🔄 Login ho gaya? Status check karo", key="upstox_check_btn")
+    st.sidebar.button("🔄 Login ho gaya? Status check karo", key="upstox_check_btn")
     return None
-
-
-class _NullSidebar:
-    """v66: stand-in used for ONE run when Streamlit refuses a sidebar write from inside a fragment (StreamlitInvalidLayoutContextError, seen 3x in the log).
-    The token logic below still runs; only the sidebar widgets are skipped until the next full page run puts them back."""
-    def __getattr__(self, _name):
-        return lambda *a, **k: False
-
-
-def get_upstox_access_token():
-    try:
-        return _get_upstox_access_token_impl(st.sidebar)
-    except Exception as exc:
-        if type(exc).__name__ != "StreamlitInvalidLayoutContextError":
-            raise
-        return _get_upstox_access_token_impl(_NullSidebar())       # the error is raised by the very first sidebar write, before any login logic ran -> safe to run again
-
-
 # @@END upstox_auth
 # @@MODULE tick_guard
 """tick_guard.py -- stop-loss / target are checked on the LIVE PRICE every ~2 seconds.
@@ -776,12 +758,7 @@ MAX_HOLD_MINUTES = 120
 
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME, timeout=30)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")   # readers/writers don't block each other -> no "database is locked"
-        conn.execute("PRAGMA busy_timeout=30000")
-    except Exception:
-        pass
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS trades
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -825,7 +802,7 @@ def check_open_position(symbol=DEFAULT_SYMBOL):
     position independently -- an open Nifty paper trade never blocks a
     new signal on, say, RELIANCE, and vice versa.
     """
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("""SELECT id, timestamp, signal, entry_price, stop_loss, target_1, target_2
                  FROM trades WHERE status = 'OPEN' AND symbol = ? ORDER BY id DESC LIMIT 1""", (symbol,))
@@ -848,7 +825,7 @@ def log_entry_safe(signal, entry_price, sl, target_1, target_2=None, symbol=DEFA
     if check_open_position(symbol) is not None:
         return None, f"{symbol} already has an OPEN position — new signal ignored until it resolves."
 
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     c.execute("""INSERT INTO trades (timestamp, signal, entry_price, stop_loss, target_1, target_2, status, symbol)
@@ -861,7 +838,7 @@ def log_entry_safe(signal, entry_price, sl, target_1, target_2=None, symbol=DEFA
 
 
 def _close_trade(trade_id, entry_price, signal, exit_price, status):
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     if "BUY" in signal.upper() or signal == "1":
         pnl = exit_price - entry_price
@@ -881,7 +858,7 @@ def update_stop_loss(trade_id, new_sl):
     source of truth for trade state instead of a separate session_state
     system that can drift out of sync with it.
     """
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("UPDATE trades SET stop_loss = ? WHERE id = ? AND status = 'OPEN'", (new_sl, trade_id))
     conn.commit()
@@ -907,7 +884,7 @@ def check_and_update_open_trades(live_price, symbol=DEFAULT_SYMBOL):
     it's a real but coarse-grained MFE/MAE, not exchange-precision -- the
     backtest engine labels it as such rather than overclaiming precision.
     """
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("""SELECT id, timestamp, signal, entry_price, stop_loss, target_1, mfe, mae
                  FROM trades WHERE status = 'OPEN' AND symbol = ?""", (symbol,))
@@ -920,7 +897,7 @@ def check_and_update_open_trades(live_price, symbol=DEFAULT_SYMBOL):
         favorable_move = (live_price - entry_price) if is_buy else (entry_price - live_price)
         new_mfe = favorable_move if mfe is None else max(mfe, favorable_move)
         new_mae = favorable_move if mae is None else min(mae, favorable_move)
-        conn2 = sqlite3.connect(DB_NAME, timeout=30)
+        conn2 = sqlite3.connect(DB_NAME)
         conn2.cursor().execute("UPDATE trades SET mfe = ?, mae = ? WHERE id = ?",
                                 (round(new_mfe, 2), round(new_mae, 2), trade_id))
         conn2.commit()
@@ -957,7 +934,7 @@ def fetch_performance_metrics(symbol=DEFAULT_SYMBOL):
     win-rate signal); TIME_EXIT trades are reported separately since they
     were neither a clean win nor a clean loss.
     """
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='trades'")
     if c.fetchone()[0] == 0:
@@ -994,7 +971,7 @@ def fetch_all_closed_trades(symbol=DEFAULT_SYMBOL):
     means a stock's backtest/Monte Carlo/drift stats are never diluted by
     Nifty's trade history (or another stock's), and vice versa.
     """
-    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='trades'")
     if c.fetchone()[0] == 0:
